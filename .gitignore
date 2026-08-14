@@ -1,0 +1,16 @@
+# PlatformIO: cartella di build e toolchain scaricati.
+# Sono ~2 GB e si rigenerano da soli: NON vanno mai su git.
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# VS Code: si ignora tutto tranne il file dei suggerimenti estensioni
+.vscode/*
+!.vscode/extensions.json
+
+# macOS
+.DS_Store
+
+# editor
+*.swp
+*~

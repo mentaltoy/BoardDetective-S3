@@ -1,0 +1,44 @@
+name: build
+
+# Compila il firmware a ogni push. Se il codice non compila, GitHub te lo
+# dice con una X rossa accanto al commit, senza che tu debba provarlo a mano.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  firmware:
+    name: Compila per ESP32-S3
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Scarica il codice
+        uses: actions/checkout@v4
+
+      - name: Prepara Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Il toolchain ESP32 pesa ~2 GB: senza cache ogni build ci mette
+      # diversi minuti solo per riscaricarlo.
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Installa PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Compila
+        run: pio run
+
+      - name: Riepilogo dimensioni firmware
+        if: success()
+        run: pio run --target size || true
