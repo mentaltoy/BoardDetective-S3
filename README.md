@@ -1,5 +1,7 @@
 # BoardDetective S3
 
+[![build](https://github.com/mentaltoy/BoardDetective-S3/actions/workflows/build.yml/badge.svg)](https://github.com/mentaltoy/BoardDetective-S3/actions)
+
 **Capire cosa hai davvero comprato, prima di scrivere una riga di codice utile.**
 
 Le board ESP32-S3 generiche (AliExpress, Amazon, cloni vari) arrivano senza
