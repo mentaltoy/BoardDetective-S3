@@ -41,6 +41,22 @@
 #include "dotmatrix.h"
 #include "touch.h"
 #include "rtc.h"
+#include "sveglia.h"
+
+// Il logo compare come quarta scheda solo se src/logo.h esiste.
+// Lo genera scripts/logo2c.py da un'immagine qualsiasi; senza,
+// il programma resta a tre schede e compila lo stesso.
+#if __has_include("logo.h")
+#include "logo.h"
+#define HA_LOGO 1
+#else
+#define HA_LOGO 0
+#endif
+
+// Cosa scrivere sopra e sotto il logo.
+#define LOGO_ETICHETTA "MENTALTOY"
+#define LOGO_SOTTOTITOLO ""
+#define LOGO_COLORE COL_ACCESO
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -88,6 +104,27 @@
 
 #define LUMINOSITA 190   // 0-255
 
+// Il vetro ha gli angoli molto arrotondati, piu' di quanto sembri a
+// schermo spento: una cornice troppo squadrata ci finisce sotto e si
+// vede tagliata. Questi due numeri la tengono al riparo.
+#define BORDO_MARGINE 10
+#define BORDO_RAGGIO 54
+
+// Quanto stanno larghe dal bordo l'etichetta e la batteria. Con
+// angoli cosi' tondi la curva entra parecchio verso il centro: un
+// testo appoggiato all'angolo sembra schiacciato contro il vetro.
+#define PADDING 38
+
+// La barra dei comandi in fondo alla scheda dell'ora.
+#define BARRA_Y 366
+#define BARRA_SX (PADDING + 14)
+#define BARRA_DX (LCD_W - PADDING - 14)
+
+// Quanto largo e' il bersaglio di un comando. Un dito copre quasi
+// mezzo centimetro di vetro e non vede cosa sta coprendo: la zona
+// che risponde deve essere molto piu' grande del simbolo disegnato.
+#define BERSAGLIO 46
+
 // ------------------------------------------------------------
 //  COLORI
 // ------------------------------------------------------------
@@ -102,6 +139,8 @@
 #define COL_SECONDARIO 0x9CD3
 #define COL_ROSSO 0xE923    // l'unico accento
 #define COL_CORNICE 0x2124
+#define COL_SOLE 0xFE80    // giallo caldo
+#define COL_LUNA 0x7ADF    // viola-blu
 
 // ------------------------------------------------------------
 //  DISPLAY
@@ -120,10 +159,17 @@ static Arduino_Canvas *comp = new Arduino_Canvas(LCD_W, LCD_H, panel);
 //  LE SCHEDE
 // ------------------------------------------------------------
 
-#define N_SCHEDE 3
+#if HA_LOGO
+#define N_SCHEDE 5
+#else
+#define N_SCHEDE 4
+#endif
+
 #define SCHEDA_ORA 0
 #define SCHEDA_SOLE 1
 #define SCHEDA_METEO 2
+#define SCHEDA_BARO 3
+#define SCHEDA_LOGO 4
 
 // Ogni scheda ha il suo foglio di memoria, sempre pronto.
 // Sono 329 KB l'uno: con 8 MB di PSRAM ce ne stanno una ventina,
@@ -134,12 +180,44 @@ static Arduino_Canvas *scheda[N_SCHEDE] = {
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
+    new Arduino_Canvas(LCD_W, LCD_H, nullptr),
+#if HA_LOGO
+    new Arduino_Canvas(LCD_W, LCD_H, nullptr),
+#endif
 };
-static bool daRidisegnare[N_SCHEDE] = {true, true, true};
+static bool daRidisegnare[N_SCHEDE];
 
 // ------------------------------------------------------------
 //  STATO
 // ------------------------------------------------------------
+
+// ------------------------------------------------------------
+//  DOVE SI TROVA L'UTENTE
+// ------------------------------------------------------------
+//  Le schede sono cose che si guardano e si scorrono via. La
+//  sveglia e' una cosa in cui si entra e da cui si esce, quindi non
+//  e' una quinta scheda: e' una schermata che sta sopra il
+//  carosello e se lo tiene da parte finche' non hai finito.
+
+enum Vista
+{
+    VISTA_SCHEDE = 0,
+    VISTA_LISTA,      // l'elenco delle sveglie
+    VISTA_EDITOR,     // imposta un orario
+    VISTA_ALLARME     // sta suonando
+};
+
+static Vista vista = VISTA_SCHEDE;
+static bool vistaDaRidisegnare = true;
+
+static float listaScorrimento = 0;   // di quanto e' scorsa la lista, in pixel
+static int editorIndice = -1;        // quale sveglia si sta modificando, -1 = nuova
+static uint8_t editorOre = 7;
+static uint8_t editorMinuti = 0;
+static int editorCampo = 0;          // 0 = ore, 1 = minuti
+
+static int allarmeIndice = -1;
+static int allarmeUltimoMinuto = -1;
 
 static Touch touch;
 static bool touchOk = false;
@@ -156,7 +234,16 @@ static float scorrimentoPartenza = 0;
 static int16_t ditoUltimaX = 0;
 static uint32_t ditoUltimoT = 0;
 static float velocita = 0;      // pixel al millisecondo
-static bool eraTap = true;      // il dito si e' mosso poco: e' un tocco, non uno scorrimento
+static bool eraTap = true;
+static int16_t tapX = 0, tapY = 0;      // il dito si e' mosso poco: e' un tocco, non uno scorrimento
+
+// I pallini non stanno sempre accesi: compaiono quando li tocchi e
+// se ne vanno da soli. Una schermata di orologio deve essere ferma;
+// i comandi servono nel momento in cui li usi, non prima.
+#define PALLINI_ATTESA 1000   // quanto restano dopo l'ultimo tocco
+#define PALLINI_FADE 450      // quanto ci mettono a spegnersi
+static uint32_t palliniFino = 0;
+static float palliniOpacitaDisegnata = -1.0f;
 
 static bool animazioneAttiva = false;
 static float animDa = 0, animA = 0;
@@ -164,10 +251,51 @@ static uint32_t animInizio = 0;
 static uint16_t animDurata = 0;
 static int animDirezione = 0;
 
+static bool schermoAcceso = true;
+
 static bool retePresente = false;
 static bool oraSincronizzata = false;
 static int batteria = -1;
 static bool alimentato = false;
+
+// I numeri che scorrono: uno per l'ora, uno per il conto alla
+// rovescia del Sole. Ognuno si ricorda da solo che numero mostrava
+// prima, che e' tutto quello che serve per animare il cambio.
+// Quando entri nella scheda del Sole, l'astro non e' gia' li' dove
+// deve stare: parte dal capo dell'arco e ci arriva, riempiendo il
+// quadrante man mano. Vedere il percorso dice quanta giornata e'
+// passata molto meglio di un punto fermo.
+#define SORGERE_DURATA 1100
+
+// Da dove parte l'astro, in frazione di arco. Negativo vuol dire
+// sotto l'orizzonte: da li' non si vede, e comincia a spuntare solo
+// mentre sale. Un corpo celeste non compare, sorge.
+#define SORGERE_PARTENZA -0.09f
+static uint32_t sorgereInizio = 0;
+static bool sorgereAttivo = false;
+static bool sorgereArmato = true;   // pronto a partire alla prossima entrata
+
+// Il grafico del barometro si traccia da sinistra a destra, con la
+// stessa regola: si riarma solo quando la scheda esce del tutto.
+#define TRACCIA_DURATA 1100
+static uint32_t tracciaInizio = 0;
+static bool tracciaAttiva = false;
+static bool tracciaArmata = true;
+
+static DmRullo rulloOra;
+static DmRullo rulloSole;
+static DmRullo rulloBaro;
+
+// Anche i numeri della sveglia scorrono. Mentre tieni premuto pero'
+// l'animazione si spegne: a quel ritmo non farebbe in tempo a
+// finire, e si vedrebbero cifre che partono e vengono interrotte.
+static DmRullo rulloEditorOre;
+static DmRullo rulloEditorMin;
+static bool editorInRipetizione = false;
+
+// Lo alzano le funzioni di disegno quando un numero si sta ancora
+// muovendo: e' il segnale al ciclo principale che non ha finito.
+static bool numeriInMovimento = false;
 
 static int ultimoSecondo = -1;
 static int ultimoMinuto = -1;
@@ -185,6 +313,28 @@ struct Meteo
     int pioggia = 0;   // probabilita' in percentuale
 };
 static Meteo domani;
+
+// ------------------------------------------------------------
+//  BAROMETRO
+// ------------------------------------------------------------
+//  Questa scheda non ha un sensore dietro: il QMI8658 misura
+//  accelerazione e rotazione, non pressione. I valori arrivano
+//  dallo stesso servizio del meteo, che le ore passate le tiene.
+//
+//  Serve la storia, non il numero: una pressione di 1013 non dice
+//  niente da sola, mentre 1013 dopo che era 1020 dice che sta per
+//  arrivare qualcosa. E' la ragione per cui gli orologi da
+//  escursione hanno sempre avuto questo grafico.
+
+#define ORE_BARO 24
+
+struct Barometro
+{
+    bool valido = false;
+    float valori[ORE_BARO];
+    float minimo = 0, massimo = 0;
+};
+static Barometro baro;
 
 // ------------------------------------------------------------
 //  BATTERIA (AXP2101)
@@ -357,7 +507,10 @@ static bool scaricaMeteo()
     url += String(LAT, 4);
     url += "&longitude=" + String(LON, 4);
     url += "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max";
-    url += "&timezone=Europe%2FRome&forecast_days=2";
+    url += "&hourly=pressure_msl&past_days=1&forecast_days=2";
+    // Le ore come numeri invece che come date scritte: la risposta
+    // dimezza, e a noi servono solo per capire dove siamo adesso.
+    url += "&timeformat=unixtime&timezone=Europe%2FRome";
 
     HTTPClient http;
     http.setTimeout(8000);
@@ -383,7 +536,7 @@ static bool scaricaMeteo()
     String corpo = http.getString();
     http.end();
 
-    DynamicJsonDocument doc(4096);
+    DynamicJsonDocument doc(8192);
     DeserializationError err = deserializeJson(doc, corpo);
 
     if (err)
@@ -411,6 +564,39 @@ static bool scaricaMeteo()
 
     Serial.printf("[meteo] domani: codice %d, %.0f/%.0f gradi, pioggia %d%%\n",
                   domani.codice, domani.tmin, domani.tmax, domani.pioggia);
+
+    // La pressione delle ultime ventiquattro ore. Nell'elenco c'e'
+    // anche il futuro: si cerca l'ora in cui siamo e si guarda
+    // indietro.
+    JsonArray quando = doc["hourly"]["time"];
+    JsonArray valori = doc["hourly"]["pressure_msl"];
+
+    if (!quando.isNull() && !valori.isNull() && quando.size() == valori.size())
+    {
+        time_t adesso = time(nullptr);
+        int corrente = -1;
+        for (size_t i = 0; i < quando.size(); ++i)
+            if ((time_t)(quando[i].as<long>()) <= adesso)
+                corrente = (int)i;
+
+        if (corrente >= ORE_BARO - 1)
+        {
+            baro.minimo = 9999;
+            baro.massimo = -9999;
+            for (int k = 0; k < ORE_BARO; ++k)
+            {
+                float v = valori[corrente - (ORE_BARO - 1) + k] | 0.0f;
+                baro.valori[k] = v;
+                if (v < baro.minimo) baro.minimo = v;
+                if (v > baro.massimo) baro.massimo = v;
+            }
+            baro.valido = true;
+            daRidisegnare[SCHEDA_BARO] = true;
+            Serial.printf("[baro] %.0f hPa, in 24h da %.0f a %.0f\n",
+                          baro.valori[ORE_BARO - 1], baro.minimo, baro.massimo);
+        }
+    }
+
     return true;
 }
 
@@ -531,15 +717,191 @@ static const char *ICO_NEBBIA[ICONA_LATO] = {
     "...............",
 };
 
-static void disegnaIcona(Arduino_GFX *g, int16_t cx, int16_t cy,
-                         const char **griglia, int16_t passo, int16_t diam, uint16_t colore)
+// Il Sole che scorre sull'arco. Piccolo, con i raggi, cosi' si
+// distingue a colpo d'occhio dai punti del quadrante.
+#define SOLE_LATO 9
+static const char *ICO_SOLE_PICCOLO[SOLE_LATO] = {
+    "....#....",
+    "..#...#..",
+    "...###...",
+    "..#####..",
+    "#.#####.#",
+    "..#####..",
+    "...###...",
+    "..#...#..",
+    "....#....",
+};
+
+// La Luna: un disco con un morso, che e' il modo piu' corto per
+// dire "luna" con una manciata di punti.
+static const char *ICO_LUNA[SOLE_LATO] = {
+    "....##...",
+    "..####...",
+    ".####....",
+    ".###.....",
+    ".###.....",
+    ".###.....",
+    ".####....",
+    "..####...",
+    "....##...",
+};
+
+// ------------------------------------------------------------
+//  ICONE DEI COMANDI
+// ------------------------------------------------------------
+//  Nove per nove: la misura piu' piccola in cui un simbolo resta
+//  riconoscibile avendo un centro esatto, che serve per la croce e
+//  per la campana.
+
+#define ICONA_COMANDO 9
+
+static const char *ICO_CAMPANA[ICONA_COMANDO] = {
+    "....#....",
+    "...#.#...",
+    "..#...#..",
+    "..#...#..",
+    ".#.....#.",
+    ".#.....#.",
+    "#########",
+    ".........",
+    "...###...",
+};
+
+static const char *ICO_PIU[ICONA_COMANDO] = {
+    ".........",
+    "....#....",
+    "....#....",
+    "....#....",
+    ".#######.",
+    "....#....",
+    "....#....",
+    "....#....",
+    ".........",
+};
+
+static const char *ICO_MENO[ICONA_COMANDO] = {
+    ".........",
+    ".........",
+    ".........",
+    ".........",
+    ".#######.",
+    ".........",
+    ".........",
+    ".........",
+    ".........",
+};
+
+static const char *ICO_CHIUDI[ICONA_COMANDO] = {
+    ".........",
+    ".#.....#.",
+    "..#...#..",
+    "...#.#...",
+    "....#....",
+    "...#.#...",
+    "..#...#..",
+    ".#.....#.",
+    ".........",
+};
+
+static const char *ICO_SPUNTA[ICONA_COMANDO] = {
+    ".........",
+    ".......##",
+    "......##.",
+    ".....##..",
+    "##..##...",
+    ".####....",
+    "..##.....",
+    ".........",
+    ".........",
+};
+
+static const char *ICO_CESTINO[ICONA_COMANDO] = {
+    "..#####..",
+    ".#######.",
+    ".........",
+    "#########",
+    ".#.#.#.#.",
+    ".#.#.#.#.",
+    ".#.#.#.#.",
+    ".#######.",
+    ".........",
+};
+
+// Il disco pieno su cui si scava la cifra del contatore.
+static const char *ICO_DISCO[ICONA_COMANDO] = {
+    "..#####..",
+    ".#######.",
+    "#########",
+    "#########",
+    "#########",
+    "#########",
+    "#########",
+    ".#######.",
+    "..#####..",
+};
+
+// Un numero dentro un bollo, tutto fatto di punti come il resto.
+// La cifra non si disegna sopra: si tolgono i punti del disco dove
+// il carattere passa, e quello che si vede e' lo sfondo attraverso
+// il buco. Con i punti staccati e' l'unico modo perche' la cifra
+// resti netta invece di sembrare appoggiata sopra.
+static void disegnaBollo(Arduino_GFX *g, int16_t cx, int16_t cy, char cifra,
+                         int16_t passo, int16_t diam, uint16_t colore)
 {
-    int16_t x0 = cx - (ICONA_LATO * passo) / 2 + passo / 2;
-    int16_t y0 = cy - (ICONA_LATO * passo) / 2 + passo / 2;
-    for (int r = 0; r < ICONA_LATO; ++r)
-        for (int c = 0; c < ICONA_LATO; ++c)
+    uint8_t k = (uint8_t)cifra;
+    if (k < DM_FONT_FIRST || k > DM_FONT_LAST) k = 32;
+    const uint8_t *glifo = DM_FONT[k - DM_FONT_FIRST];
+
+    const int16_t x0 = cx - (ICONA_COMANDO * passo) / 2 + passo / 2;
+    const int16_t y0 = cy - (ICONA_COMANDO * passo) / 2 + passo / 2;
+
+    for (int r = 0; r < ICONA_COMANDO; ++r)
+        for (int c = 0; c < ICONA_COMANDO; ++c)
+        {
+            if (ICO_DISCO[r][c] != '#') continue;
+
+            // Il carattere sta al centro: cinque colonne per sette
+            // righe dentro una griglia di nove per nove.
+            int gc = c - 2;
+            int gr = r - 1;
+            if (gc >= 0 && gc < 5 && gr >= 0 && gr < 7 &&
+                (pgm_read_byte(&glifo[gc]) & (1 << gr)))
+                continue;   // qui passa la cifra: si lascia vuoto
+
+            dmDot(g, x0 + c * passo, y0 + r * passo, diam, colore);
+        }
+}
+
+static void disegnaGriglia(Arduino_GFX *g, int16_t cx, int16_t cy,
+                           const char **griglia, int lato,
+                           int16_t passo, int16_t diam, uint16_t colore,
+                           int16_t orizzonte = 32767)
+{
+    int16_t x0 = cx - (lato * passo) / 2 + passo / 2;
+    int16_t y0 = cy - (lato * passo) / 2 + passo / 2;
+    for (int r = 0; r < lato; ++r)
+        for (int c = 0; c < lato; ++c)
             if (griglia[r][c] == '#')
-                dmDot(g, x0 + c * passo, y0 + r * passo, diam, colore);
+            {
+                int16_t py = y0 + r * passo;
+                if (py > orizzonte) continue;   // questa parte e' ancora sotto
+                dmDot(g, x0 + c * passo, py, diam, colore);
+            }
+}
+
+// Il tondo di nero che fa spazio all'astro, tagliato all'orizzonte.
+// fillCircle non sa fermarsi a meta', quindi il cerchio si costruisce
+// una riga alla volta e le righe sotto la linea non si disegnano.
+static void spazioTondo(Arduino_GFX *g, int16_t cx, int16_t cy,
+                        int16_t raggio, int16_t orizzonte)
+{
+    for (int16_t dy = -raggio; dy <= raggio; ++dy)
+    {
+        int16_t y = cy + dy;
+        if (y > orizzonte) break;
+        int16_t dx = (int16_t)lroundf(sqrtf((float)(raggio * raggio - dy * dy)));
+        g->fillRect(cx - dx, y, 2 * dx + 1, 1, COL_SFONDO);
+    }
 }
 
 // I codici sono lo standard meteorologico WMO: 0 e' cielo sereno,
@@ -582,31 +944,55 @@ static const char *MESI[12] = {"GEN", "FEB", "MAR", "APR", "MAG", "GIU",
 static void telaio(Arduino_GFX *g, const char *etichetta)
 {
     g->fillScreen(COL_SFONDO);
-    g->drawRoundRect(6, 6, LCD_W - 12, LCD_H - 12, 26, COL_CORNICE);
+    g->drawRoundRect(BORDO_MARGINE, BORDO_MARGINE,
+                     LCD_W - 2 * BORDO_MARGINE, LCD_H - 2 * BORDO_MARGINE,
+                     BORDO_RAGGIO, COL_CORNICE);
 
     // L'etichetta in alto a sinistra, piccola e molto spaziata.
-    dmText(g, 26, 26, etichetta, 3, 2, COL_ETICHETTA, 2);
+    dmText(g, PADDING, PADDING, etichetta, 3, 2, COL_ETICHETTA, 2);
 }
 
 static void indicatoreBatteria(Arduino_GFX *g)
 {
     if (batteria < 0) return;
 
-    const int16_t x = LCD_W - 78;
-    const int16_t y = 28;
-    const int16_t larghezza = 40;
-    const int16_t altezza = 14;
+    // Anche la batteria e' una matrice: undici punti per cinque, il
+    // contorno acceso e le tacche interne che salgono con la carica.
+    // Disegnarla con dei rettangoli pieni avrebbe stonato - sarebbe
+    // stato l'unico oggetto sullo schermo a non essere fatto di punti.
+    const int16_t passo = 4;
+    const int16_t diam = 3;
+    const int16_t colonne = 11;
+    const int16_t righe = 5;
 
-    uint16_t colore = alimentato ? COL_ROSSO
-                    : (batteria <= 15 ? COL_ROSSO : COL_SPENTO);
+    // Allineata in verticale al centro dell'etichetta di sinistra.
+    const int16_t x0 = LCD_W - PADDING - colonne * passo;
+    const int16_t y0 = PADDING + 2;
 
-    g->drawRect(x, y, larghezza, altezza, colore);
-    g->fillRect(x + larghezza, y + 4, 3, altezza - 8, colore);
+    uint16_t colore = (alimentato || batteria <= 15) ? COL_ROSSO : COL_SECONDARIO;
 
-    int riempimento = (larghezza - 6) * batteria / 100;
-    if (riempimento > 0)
-        g->fillRect(x + 3, y + 3, riempimento, altezza - 6,
-                    alimentato ? COL_ROSSO : COL_SECONDARIO);
+    // Il contorno.
+    for (int c = 0; c < colonne; ++c)
+    {
+        dmDot(g, x0 + c * passo, y0, diam, colore);
+        dmDot(g, x0 + c * passo, y0 + (righe - 1) * passo, diam, colore);
+    }
+    for (int r = 1; r < righe - 1; ++r)
+    {
+        dmDot(g, x0, y0 + r * passo, diam, colore);
+        dmDot(g, x0 + (colonne - 1) * passo, y0 + r * passo, diam, colore);
+    }
+
+    // Il polo positivo, il dentino sul lato corto.
+    dmDot(g, x0 + colonne * passo, y0 + 2 * passo, diam, colore);
+
+    // Le tacche di carica: nove colonne interne.
+    const int tacche = colonne - 2;
+    int piene = (batteria * tacche + 50) / 100;
+    for (int c = 0; c < tacche; ++c)
+        for (int r = 1; r < righe - 1; ++r)
+            dmDot(g, x0 + (c + 1) * passo, y0 + r * passo, diam,
+                  c < piene ? colore : COL_SPENTO);
 }
 
 // ------------------------------------------------------------
@@ -616,13 +1002,14 @@ static void indicatoreBatteria(Arduino_GFX *g)
 static void disegnaOra(Arduino_GFX *g, const struct tm &t)
 {
     telaio(g, CITTA);
-    indicatoreBatteria(g);
 
     char buf[16];
 
     // L'ora, grande al centro.
     snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
-    dmTextCentered(g, LCD_W / 2, 120, buf, 10, 7, COL_ACCESO);
+    int16_t largoOra = dmTextWidth(buf, 10, 1);
+    if (dmRullo(g, rulloOra, buf, (LCD_W - largoOra) / 2, 128, 10, 7, COL_ACCESO))
+        numeriInMovimento = true;
 
     // I secondi come una riga di sessanta punti che si riempie.
     // Un quadrante, non un numero: si legge con la coda dell'occhio.
@@ -633,17 +1020,31 @@ static void disegnaOra(Arduino_GFX *g, const struct tm &t)
     {
         uint16_t c = (i < t.tm_sec) ? COL_SECONDARIO : COL_SPENTO;
         if (i == t.tm_sec) c = COL_ROSSO;
-        dmDot(g, x0 + i * passoSec, 232, 3, c);
+        dmDot(g, x0 + i * passoSec, 238, 3, c);
     }
 
     // La data.
     snprintf(buf, sizeof(buf), "%s %02d %s",
              GIORNI[t.tm_wday % 7], t.tm_mday, MESI[t.tm_mon % 12]);
-    dmTextCentered(g, LCD_W / 2, 280, buf, 5, 4, COL_ACCESO);
+    dmTextCentered(g, LCD_W / 2, 278, buf, 5, 4, COL_ACCESO);
 
-    // In fondo, da dove viene l'ora che stai leggendo.
+    // Da dove viene l'ora che stai leggendo. Sta sopra, appoggiata
+    // all'orario: e' una nota a margine di quel numero, non un dato
+    // per conto suo.
     const char *fonte = oraSincronizzata ? "SINCRONIZZATO" : "OROLOGIO INTERNO";
-    dmTextCentered(g, LCD_W / 2, 370, fonte, 3, 2, COL_ETICHETTA, 2);
+    dmTextCentered(g, LCD_W / 2, 84, fonte, 3, 2, COL_ETICHETTA, 2);
+
+    // La barra dei comandi: a sinistra le sveglie, a destra ne
+    // aggiungi una. Le zone toccabili sono piu' grandi dei simboli -
+    // un dito non e' un puntatore, e centrare nove punti sarebbe un
+    // esercizio di mira.
+    disegnaGriglia(g, BARRA_SX, BARRA_Y, ICO_CAMPANA, ICONA_COMANDO, 4, 3,
+                   sveglieAttive() > 0 ? COL_ACCESO : COL_SPENTO);
+
+    if (sveglieAttive() > 0)
+        disegnaBollo(g, BARRA_SX + 50, BARRA_Y, '0' + sveglieAttive(), 4, 3, COL_ACCESO);
+
+    disegnaGriglia(g, BARRA_DX, BARRA_Y, ICO_PIU, ICONA_COMANDO, 4, 3, COL_SECONDARIO);
 }
 
 // ------------------------------------------------------------
@@ -653,7 +1054,6 @@ static void disegnaOra(Arduino_GFX *g, const struct tm &t)
 static void disegnaSole(Arduino_GFX *g, const struct tm &t)
 {
     telaio(g, "SOLE");
-    indicatoreBatteria(g);
 
     float fuso = 1.0f + (t.tm_isdst > 0 ? 1.0f : 0.0f);
     int giorno = t.tm_yday + 1;
@@ -669,25 +1069,92 @@ static void disegnaSole(Arduino_GFX *g, const struct tm &t)
     }
 
     float adesso = t.tm_hour + t.tm_min / 60.0f + t.tm_sec / 3600.0f;
-    bool giorno_chiaro = (adesso >= alba && adesso <= tramonto);
+    bool giornoChiaro = (adesso >= alba && adesso <= tramonto);
 
-    // L'arco: il percorso del Sole da est a ovest. I punti accesi
-    // sono la parte di giornata gia' passata, la testa rossa e'
-    // dove sta il Sole adesso.
+    // L'arco e' la traversata del cielo, e vale tutte le ventiquattro
+    // ore: di giorno il Sole da est a ovest, di notte la Luna dal
+    // tramonto all'alba. Cosi' il quadrante racconta sempre qualcosa,
+    // invece di restare spento per meta' del tempo.
     const int16_t cx = LCD_W / 2;
-    const int16_t cy = 268;
-    const int16_t raggio = 132;
-    const int totale = 33;
+    const int16_t cy = 228;
+    const int16_t raggio = 110;
+    const int totale = 31;
 
-    float avanzamento = (adesso - alba) / (tramonto - alba);
+    float avanzamento;
+    if (giornoChiaro)
+    {
+        avanzamento = (adesso - alba) / (tramonto - alba);
+    }
+    else
+    {
+        float durataNotte = (24.0f - tramonto) + alba;
+        float trascorso = (adesso > tramonto) ? (adesso - tramonto)
+                                              : ((24.0f - tramonto) + adesso);
+        avanzamento = trascorso / durataNotte;
+    }
     if (avanzamento < 0) avanzamento = 0;
     if (avanzamento > 1) avanzamento = 1;
-    int accesi = giorno_chiaro ? (int)lroundf(avanzamento * totale) : (adesso < alba ? 0 : totale);
 
-    dmRing(g, cx, cy, raggio, totale, -90.0f, 180.0f, accesi, 5,
-           COL_SECONDARIO, COL_SPENTO, COL_ROSSO, giorno_chiaro);
+    // Dove sta l'astro in questo istante. Sono tre situazioni, e la
+    // prima e' quella che rende il movimento credibile: finche' non
+    // stai guardando questa scheda, l'astro aspetta al capo dell'arco.
+    // Se invece restasse dove il calcolo lo vuole, scorrendo lo
+    // vedresti gia' arrivato, e l'animazione sembrerebbe un
+    // ripensamento - il pianeta che sparisce e riparte.
+    float mostrato;
+    if (sorgereArmato)
+    {
+        mostrato = SORGERE_PARTENZA;
+    }
+    else if (sorgereAttivo)
+    {
+        uint32_t passato = millis() - sorgereInizio;
+        if (passato >= SORGERE_DURATA)
+        {
+            sorgereAttivo = false;
+            mostrato = avanzamento;
+        }
+        else
+        {
+            // Parte deciso e si posa dove deve: e' un corpo che
+            // scivola verso una posizione, non una ruota che scatta.
+            float t = (float)passato / (float)SORGERE_DURATA;
+            float e = 1.0f - powf(1.0f - t, 3.0f);
+            mostrato = SORGERE_PARTENZA + (avanzamento - SORGERE_PARTENZA) * e;
+            numeriInMovimento = true;
+        }
+    }
+    else
+    {
+        mostrato = avanzamento;
+    }
 
-    // Il conto alla rovescia verso la prossima transizione.
+    dmRing(g, cx, cy, raggio, totale, -90.0f, 180.0f,
+           (int)lroundf(mostrato * totale), 5,
+           COL_SECONDARIO, COL_SPENTO);
+
+    // L'astro dove sta adesso. Non salta di punto in punto: la sua
+    // posizione si calcola sull'angolo, quindi scivola lungo la curva
+    // anche fra un punto e l'altro del quadrante.
+    {
+        float angolo = (-90.0f + 180.0f * mostrato - 90.0f) * (float)M_PI / 180.0f;
+        int16_t ax = cx + (int16_t)lroundf(cosf(angolo) * raggio);
+        int16_t ay = cy + (int16_t)lroundf(sinf(angolo) * raggio);
+
+        // La linea che unisce i due capi dell'arco e' l'orizzonte:
+        // sotto quella non si disegna niente. E' cosi' che l'astro
+        // esce dal nulla invece di comparire gia' intero.
+        const int16_t orizzonte = cy;
+
+        // Si fa spazio: senza, i punti del quadrante spunterebbero da
+        // sotto e sembrerebbe sporco.
+        spazioTondo(g, ax, ay, 17, orizzonte);
+        disegnaGriglia(g, ax, ay,
+                       giornoChiaro ? ICO_SOLE_PICCOLO : ICO_LUNA, SOLE_LATO,
+                       3, 3, giornoChiaro ? COL_SOLE : COL_LUNA, orizzonte);
+    }
+
+    // Quanto manca alla prossima transizione.
     float mancano;
     const char *verso;
     if (adesso < alba)
@@ -710,19 +1177,25 @@ static void disegnaSole(Arduino_GFX *g, const struct tm &t)
     int ore = (int)mancano;
     int minuti = (int)((mancano - ore) * 60.0f);
     snprintf(buf, sizeof(buf), "%dH %02dM", ore, minuti);
-    dmTextCentered(g, cx, 150, buf, 8, 6, COL_ACCESO);
-    dmTextCentered(g, cx, 220, verso, 3, 2, COL_ETICHETTA, 2);
 
-    // Gli orari veri, ai due capi dell'arco.
+    // Il numero sotto l'arco: cosi' l'astro ha il cielo tutto per se'
+    // e si vede scorrere senza niente davanti.
+    int16_t largo = dmTextWidth(buf, 8, 1);
+    if (dmRullo(g, rulloSole, buf, (LCD_W - largo) / 2, 248, 8, 6, COL_ACCESO))
+        numeriInMovimento = true;
+
+    dmTextCentered(g, cx, 318, verso, 3, 2, COL_ETICHETTA, 2);
+
+    // Gli orari veri, ai due capi, con l'etichetta sopra.
+    dmText(g, PADDING, 344, "ALBA", 2, 2, COL_ETICHETTA, 2);
     snprintf(buf, sizeof(buf), "%02d:%02d", (int)alba, (int)((alba - (int)alba) * 60));
-    dmText(g, 40, 300, buf, 4, 3, COL_ACCESO);
-    dmText(g, 40, 340, "ALBA", 3, 2, COL_ETICHETTA, 2);
+    dmText(g, PADDING, 372, buf, 3, 3, COL_ACCESO);
 
+    int16_t w = dmTextWidth("TRAMONTO", 2, 2);
+    dmText(g, LCD_W - PADDING - w, 344, "TRAMONTO", 2, 2, COL_ETICHETTA, 2);
     snprintf(buf, sizeof(buf), "%02d:%02d", (int)tramonto, (int)((tramonto - (int)tramonto) * 60));
-    int16_t w = dmTextWidth(buf, 4, 1);
-    dmText(g, LCD_W - 40 - w, 300, buf, 4, 3, COL_ACCESO);
-    int16_t w2 = dmTextWidth("TRAMONTO", 3, 2);
-    dmText(g, LCD_W - 40 - w2, 340, "TRAMONTO", 3, 2, COL_ETICHETTA, 2);
+    w = dmTextWidth(buf, 3, 1);
+    dmText(g, LCD_W - PADDING - w, 372, buf, 3, 3, COL_ACCESO);
 }
 
 // ------------------------------------------------------------
@@ -732,7 +1205,6 @@ static void disegnaSole(Arduino_GFX *g, const struct tm &t)
 static void disegnaMeteo(Arduino_GFX *g)
 {
     telaio(g, "DOMANI");
-    indicatoreBatteria(g);
 
     if (!domani.valido)
     {
@@ -742,7 +1214,7 @@ static void disegnaMeteo(Arduino_GFX *g)
         return;
     }
 
-    disegnaIcona(g, LCD_W / 2, 130, iconaPerCodice(domani.codice), 6, 4, COL_ACCESO);
+    disegnaGriglia(g, LCD_W / 2, 130, iconaPerCodice(domani.codice), ICONA_LATO, 6, 4, COL_ACCESO);
 
     char buf[16];
 
@@ -769,6 +1241,190 @@ static void disegnaMeteo(Arduino_GFX *g)
 }
 
 // ------------------------------------------------------------
+//  SCHEDA 4: IL LOGO
+// ------------------------------------------------------------
+//  Il logo non e' un'immagine incollata sullo schermo: e' passato
+//  per la stessa griglia di tutto il resto. Il passo dei punti si
+//  calcola qui invece che fissarlo nel file generato, cosi' se un
+//  giorno rigeneri il logo piu' fitto o piu' rado si adatta da solo
+//  allo spazio che ha.
+
+#if HA_LOGO
+static void disegnaLogo(Arduino_GFX *g)
+{
+    telaio(g, LOGO_ETICHETTA);
+
+    const int16_t spazioX = LCD_W - 80;
+    const int16_t spazioY = 300;
+
+    int16_t passo = spazioX / LOGO_LARGHEZZA;
+    int16_t passoY = spazioY / LOGO_ALTEZZA;
+    if (passoY < passo) passo = passoY;
+    if (passo < 2) passo = 2;
+
+    // Punti grossi rispetto al passo: il logo deve leggersi come una
+    // forma piena, non come una nuvola di puntini staccati.
+    int16_t diam = (passo * 8) / 10;
+    if (diam < 2) diam = 2;
+
+    const int16_t x0 = (LCD_W - LOGO_LARGHEZZA * passo) / 2 + passo / 2;
+    const int16_t y0 = 96 + (spazioY - LOGO_ALTEZZA * passo) / 2;
+
+    for (int r = 0; r < LOGO_ALTEZZA; ++r)
+        for (int c = 0; c < LOGO_LARGHEZZA; ++c)
+            if (LOGO[r][c] == '#')
+                dmDot(g, x0 + c * passo, y0 + r * passo, diam, LOGO_COLORE);
+
+#if LOGO_CERCHIO
+    // Il cerchio non viene dalla griglia: e' calcolato sull'angolo,
+    // quindi i punti sono davvero equidistanti e la curva non ha
+    // gradini. Quanti punti servono lo dice la circonferenza: uno
+    // ogni passo, cosi' la spaziatura e' la stessa del resto.
+    const int16_t cx = x0 + ((LOGO_LARGHEZZA - 1) * passo) / 2;
+    const int16_t cy = y0 + ((LOGO_ALTEZZA - 1) * passo) / 2;
+    const int16_t raggio = ((LOGO_LARGHEZZA - 1) * passo) / 2;
+
+    int quanti = (int)(2.0f * (float)M_PI * raggio / passo);
+    if (quanti < 12) quanti = 12;
+
+    // L'arco si ferma poco prima del giro completo: altrimenti
+    // l'ultimo punto finirebbe esattamente sopra il primo.
+    float arco = 360.0f * (float)(quanti - 1) / (float)quanti;
+    dmRing(g, cx, cy, raggio, quanti, 0.0f, arco, quanti, diam,
+           LOGO_COLORE, LOGO_COLORE);
+#endif
+
+    if (strlen(LOGO_SOTTOTITOLO) > 0)
+        dmTextCentered(g, LCD_W / 2, 402, LOGO_SOTTOTITOLO, 3, 2, COL_ETICHETTA, 2);
+}
+#endif
+
+// ------------------------------------------------------------
+//  SCHEDA 4: IL BAROMETRO
+// ------------------------------------------------------------
+
+#define BARO_X 46
+#define BARO_LARGO 276
+#define BARO_ALTO 104
+#define BARO_BASSO 214
+#define BARO_PUNTI 47
+
+static void disegnaBaro(Arduino_GFX *g)
+{
+    telaio(g, "BAROMETRO");
+
+    if (!baro.valido)
+    {
+        dmTextCentered(g, LCD_W / 2, 190, "NO LINK", 8, 6, COL_SPENTO);
+        const char *motivo = retePresente ? "SERVER NON RAGGIUNGIBILE" : "NESSUNA RETE WIFI";
+        dmTextCentered(g, LCD_W / 2, 260, motivo, 3, 2, COL_ETICHETTA, 2);
+        return;
+    }
+
+    // La scala. Se in ventiquattro ore la pressione si e' mossa di
+    // poco, allargare tutto al massimo trasformerebbe mezzo hPa di
+    // oscillazione in una montagna: sotto una certa escursione la
+    // finestra resta fissa, e il grafico si vede giustamente piatto.
+    float minimo = baro.minimo, massimo = baro.massimo;
+    const float minimaEscursione = 6.0f;
+    if (massimo - minimo < minimaEscursione)
+    {
+        float mezzo = (massimo + minimo) / 2.0f;
+        minimo = mezzo - minimaEscursione / 2.0f;
+        massimo = mezzo + minimaEscursione / 2.0f;
+    }
+
+    float quanto = 1.0f;
+    if (tracciaArmata)
+    {
+        quanto = 0.0f;
+    }
+    else if (tracciaAttiva)
+    {
+        uint32_t passato = millis() - tracciaInizio;
+        if (passato >= TRACCIA_DURATA)
+        {
+            tracciaAttiva = false;
+        }
+        else
+        {
+            float t = (float)passato / (float)TRACCIA_DURATA;
+            quanto = 1.0f - powf(1.0f - t, 3.0f);
+            numeriInMovimento = true;
+        }
+    }
+
+    const int16_t passo = BARO_LARGO / (BARO_PUNTI - 1);
+    int fino = (int)lroundf(quanto * BARO_PUNTI);
+
+    for (int i = 0; i < fino && i < BARO_PUNTI; ++i)
+    {
+        // I campioni sono ventiquattro, i punti molti di piu': fra
+        // un'ora e l'altra il valore si interpola, altrimenti la
+        // curva sarebbe una fila di gradini.
+        float posizione = (float)i * (ORE_BARO - 1) / (float)(BARO_PUNTI - 1);
+        int a = (int)posizione;
+        int b = (a < ORE_BARO - 1) ? a + 1 : a;
+        float frazione = posizione - a;
+        float v = baro.valori[a] + (baro.valori[b] - baro.valori[a]) * frazione;
+
+        float alto = (v - minimo) / (massimo - minimo);
+        if (alto < 0) alto = 0;
+        if (alto > 1) alto = 1;
+
+        int16_t px = BARO_X + i * passo;
+        int16_t py = BARO_BASSO - (int16_t)lroundf(alto * (BARO_BASSO - BARO_ALTO));
+
+        if (i == BARO_PUNTI - 1)
+        {
+            // Adesso: un anello, non un punto piu' grosso. Ingrossare
+            // il punto lo avrebbe fatto sembrare solo un valore piu'
+            // importante; un cerchio intorno dice "sei qui", che e'
+            // un'altra cosa.
+            dmRing(g, px, py, 9, 11, 0.0f, 360.0f * 10.0f / 11.0f, 11, 3,
+                   COL_ROSSO, COL_ROSSO);
+            dmDot(g, px, py, 5, COL_ROSSO);
+        }
+        else
+        {
+            dmDot(g, px, py, 4, COL_SECONDARIO);
+        }
+    }
+
+    // Il valore di adesso.
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%d", (int)lroundf(baro.valori[ORE_BARO - 1]));
+    int16_t largo = dmTextWidth(buf, 8, 1);
+    if (dmRullo(g, rulloBaro, buf, (LCD_W - largo) / 2 - 22, 248, 8, 6, COL_ACCESO))
+        numeriInMovimento = true;
+    dmText(g, (LCD_W + largo) / 2 - 14, 274, "HPA", 3, 2, COL_ETICHETTA, 2);
+
+    // Dove sta andando. Il confronto e' con tre ore fa: piu' indietro
+    // e' storia, piu' vicino e' rumore.
+    float delta = baro.valori[ORE_BARO - 1] - baro.valori[ORE_BARO - 4];
+    const char *tendenza;
+    const char *significa;
+    if (delta > 1.0f)       { tendenza = "IN SALITA";  significa = "TEMPO IN MIGLIORAMENTO"; }
+    else if (delta < -1.0f) { tendenza = "IN CALO";    significa = "TEMPO IN PEGGIORAMENTO"; }
+    else                    { tendenza = "STABILE";    significa = "NESSUN CAMBIAMENTO"; }
+
+    dmTextCentered(g, LCD_W / 2, 314, tendenza, 4, 3,
+                   delta < -1.0f ? COL_ROSSO : COL_ACCESO);
+    dmTextCentered(g, LCD_W / 2, 348, significa, 2, 2, COL_ETICHETTA, 2);
+
+    // I due estremi della giornata, ai lati.
+    dmText(g, PADDING, 380, "MIN", 2, 2, COL_ETICHETTA, 2);
+    snprintf(buf, sizeof(buf), "%d", (int)lroundf(baro.minimo));
+    dmText(g, PADDING + 34, 378, buf, 3, 3, COL_SECONDARIO);
+
+    int16_t w = dmTextWidth("MAX", 2, 2);
+    snprintf(buf, sizeof(buf), "%d", (int)lroundf(baro.massimo));
+    int16_t wv = dmTextWidth(buf, 3, 1);
+    dmText(g, LCD_W - PADDING - wv - w - 10, 380, "MAX", 2, 2, COL_ETICHETTA, 2);
+    dmText(g, LCD_W - PADDING - wv, 378, buf, 3, 3, COL_SECONDARIO);
+}
+
+// ------------------------------------------------------------
 //  RIDISEGNO
 // ------------------------------------------------------------
 
@@ -788,6 +1444,10 @@ static void ridisegna(int i)
     case SCHEDA_ORA:   disegnaOra(scheda[i], t);  break;
     case SCHEDA_SOLE:  disegnaSole(scheda[i], t); break;
     case SCHEDA_METEO: disegnaMeteo(scheda[i]);   break;
+    case SCHEDA_BARO:  disegnaBaro(scheda[i]);   break;
+#if HA_LOGO
+    case SCHEDA_LOGO:  disegnaLogo(scheda[i]);    break;
+#endif
     }
     daRidisegnare[i] = false;
 }
@@ -799,17 +1459,252 @@ static void ridisegna(int i)
 // I pallini in basso. Quello rosso non salta da una posizione
 // all'altra: scivola insieme al contenuto, cosi' durante il
 // trascinamento sai sempre a che punto sei del passaggio.
-static void disegnaPallini(Arduino_GFX *g, float posizione)
+// Quanto sono visibili adesso: 1 mentre ci stai interagendo, poi
+// pieni per un secondo e infine in dissolvenza.
+static float palliniOpacita()
 {
+    if (ditoGiu || animazioneAttiva)
+        return 1.0f;
+
+    int32_t passato = (int32_t)(millis() - palliniFino);
+    if (passato < 0) return 1.0f;
+    if (passato >= PALLINI_FADE) return 0.0f;
+    return 1.0f - (float)passato / (float)PALLINI_FADE;
+}
+
+static void disegnaPallini(Arduino_GFX *g, float posizione, float opacita)
+{
+    if (opacita <= 0.0f) return;
+
     const int16_t passo = 26;
     const int16_t y = LCD_H - 44;
     const int16_t x0 = LCD_W / 2 - (N_SCHEDE - 1) * passo / 2;
 
     for (int i = 0; i < N_SCHEDE; ++i)
-        dmDot(g, x0 + i * passo, y, 6, COL_SPENTO);
+        dmDot(g, x0 + i * passo, y, 6, dmSfuma(COL_SPENTO, opacita));
 
     float px = x0 + posizione * passo;
-    dmDot(g, (int16_t)lroundf(px), y, 10, COL_ROSSO);
+    dmDot(g, (int16_t)lroundf(px), y, 10, dmSfuma(COL_ROSSO, opacita));
+}
+
+// ------------------------------------------------------------
+//  SCHERMATA: ELENCO DELLE SVEGLIE
+// ------------------------------------------------------------
+
+#define LISTA_ALTO 110
+#define LISTA_BASSO 372
+#define LISTA_RIGA 66
+
+// L'interruttore, disegnato a punti come tutto il resto: una
+// pillola con il cursore a sinistra o a destra. Non ha bisogno di
+// scritte, la posizione dice gia' tutto.
+static void disegnaInterruttore(Arduino_GFX *g, int16_t x, int16_t cy, bool acceso)
+{
+    const int16_t passo = 5;
+    const int16_t colonne = 8;
+    const int16_t righe = 4;
+    const int16_t y0 = cy - (righe - 1) * passo / 2;
+
+    uint16_t colore = acceso ? COL_ROSSO : COL_SPENTO;
+
+    for (int c = 0; c < colonne; ++c)
+    {
+        dmDot(g, x + c * passo, y0, 3, colore);
+        dmDot(g, x + c * passo, y0 + (righe - 1) * passo, 3, colore);
+    }
+    for (int r = 1; r < righe - 1; ++r)
+    {
+        dmDot(g, x, y0 + r * passo, 3, colore);
+        dmDot(g, x + (colonne - 1) * passo, y0 + r * passo, 3, colore);
+    }
+
+    // Il cursore: tre colonne piene, a destra se acceso.
+    int16_t base = acceso ? (colonne - 4) : 1;
+    for (int c = 0; c < 3; ++c)
+        for (int r = 1; r < righe - 1; ++r)
+            dmDot(g, x + (base + c) * passo, y0 + r * passo, 4, colore);
+}
+
+static void disegnaLista(Arduino_GFX *g)
+{
+    telaio(g, "SVEGLIE");
+
+    disegnaGriglia(g, LCD_W - PADDING - 4, PADDING + 8, ICO_CHIUDI,
+                   ICONA_COMANDO, 4, 3, COL_SECONDARIO);
+
+    if (nSveglie == 0)
+    {
+        dmTextCentered(g, LCD_W / 2, 200, "NESSUNA SVEGLIA", 4, 3, COL_SPENTO);
+        dmTextCentered(g, LCD_W / 2, 240, "TOCCA IL PIU PER AGGIUNGERE", 2, 2,
+                       COL_ETICHETTA, 2);
+    }
+
+    char buf[8];
+    for (int i = 0; i < nSveglie; ++i)
+    {
+        int16_t y = LISTA_ALTO + i * LISTA_RIGA - (int16_t)lroundf(listaScorrimento);
+        int16_t cy = y + LISTA_RIGA / 2;
+
+        // Fuori dalla finestra della lista non si disegna: le righe
+        // devono sparire sotto il bordo, non sopra l'intestazione.
+        if (cy < LISTA_ALTO - 10 || cy > LISTA_BASSO + 10)
+            continue;
+
+        snprintf(buf, sizeof(buf), "%02d:%02d", sveglie[i].ore, sveglie[i].minuti);
+        dmText(g, PADDING, cy - 17, buf, 5, 4,
+               sveglie[i].attiva ? COL_ACCESO : COL_SPENTO);
+
+        disegnaInterruttore(g, LCD_W - PADDING - 40, cy, sveglie[i].attiva);
+    }
+
+    // Il piu', in fondo al centro.
+    if (nSveglie < MAX_SVEGLIE)
+        disegnaGriglia(g, LCD_W / 2, 404, ICO_PIU, ICONA_COMANDO, 5, 4, COL_SECONDARIO);
+}
+
+// ------------------------------------------------------------
+//  SCHERMATA: IMPOSTA UN ORARIO
+// ------------------------------------------------------------
+
+#define EDITOR_ORE_X 40
+#define EDITOR_MIN_X 220
+#define EDITOR_Y 150
+#define EDITOR_PASSO 10
+
+static void disegnaEditor(Arduino_GFX *g)
+{
+    telaio(g, editorIndice < 0 ? "NUOVA SVEGLIA" : "MODIFICA");
+
+    disegnaGriglia(g, LCD_W - PADDING - 4, PADDING + 8, ICO_CHIUDI,
+                   ICONA_COMANDO, 4, 3, COL_SECONDARIO);
+
+    // Il campo scelto lampeggia. Non e' decorazione: e' il modo in
+    // cui l'oggetto dice "sto ascoltando questo", ed e' l'unico
+    // segnale possibile quando non c'e' un cursore da mostrare.
+    bool acceso = ((millis() / 420) % 2) == 0;
+
+    char buf[4];
+    bool anima = !editorInRipetizione;
+
+    snprintf(buf, sizeof(buf), "%02d", editorOre);
+    uint16_t colOre = (editorCampo == 0 && !acceso) ? COL_SPENTO : COL_ACCESO;
+    if (dmRullo(g, rulloEditorOre, buf, EDITOR_ORE_X, EDITOR_Y, EDITOR_PASSO, 7,
+                colOre, 1, 380, 70, anima))
+        vistaDaRidisegnare = true;
+
+    dmText(g, EDITOR_ORE_X + 2 * 6 * EDITOR_PASSO, EDITOR_Y, ":", EDITOR_PASSO, 7, COL_ACCESO);
+
+    snprintf(buf, sizeof(buf), "%02d", editorMinuti);
+    uint16_t colMin = (editorCampo == 1 && !acceso) ? COL_SPENTO : COL_ACCESO;
+    if (dmRullo(g, rulloEditorMin, buf, EDITOR_MIN_X, EDITOR_Y, EDITOR_PASSO, 7,
+                colMin, 1, 380, 70, anima))
+        vistaDaRidisegnare = true;
+
+    dmTextCentered(g, LCD_W / 2, 236, editorCampo == 0 ? "ORE" : "MINUTI",
+                   2, 2, COL_ETICHETTA, 2);
+
+    // Meno e piu'.
+    disegnaGriglia(g, 90, 290, ICO_MENO, ICONA_COMANDO, 6, 5, COL_ACCESO);
+    disegnaGriglia(g, LCD_W - 90, 290, ICO_PIU, ICONA_COMANDO, 6, 5, COL_ACCESO);
+
+    // Salva, e se stai modificando anche elimina.
+    disegnaGriglia(g, LCD_W / 2, 384, ICO_SPUNTA, ICONA_COMANDO, 6, 5, COL_ROSSO);
+    if (editorIndice >= 0)
+        disegnaGriglia(g, PADDING + 10, 384, ICO_CESTINO, ICONA_COMANDO, 4, 3, COL_SPENTO);
+}
+
+// ------------------------------------------------------------
+//  SCHERMATA: STA SUONANDO
+// ------------------------------------------------------------
+
+static void disegnaAllarme(Arduino_GFX *g, const struct tm &t)
+{
+    bool acceso = ((millis() / 420) % 2) == 0;
+
+    g->fillScreen(COL_SFONDO);
+
+    disegnaGriglia(g, LCD_W / 2, 110, ICO_CAMPANA, ICONA_COMANDO, 7, 6,
+                   acceso ? COL_ROSSO : COL_SPENTO);
+
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
+    dmTextCentered(g, LCD_W / 2, 200, buf, 10, 7, acceso ? COL_ACCESO : COL_SPENTO);
+
+    dmTextCentered(g, LCD_W / 2, 300, "SVEGLIA", 4, 3, COL_ROSSO);
+    dmTextCentered(g, LCD_W / 2, 370, "TOCCA PER SPEGNERE", 2, 2, COL_ETICHETTA, 2);
+}
+
+// ------------------------------------------------------------
+//  QUANDO UNA SCHEDA ESCE DI SCENA
+// ------------------------------------------------------------
+//  Regola generale del progetto: le animazioni d'ingresso di una
+//  scheda si riarmano solo quando di quella scheda non e' rimasto
+//  visibile nemmeno un pixel.
+//
+//  Il motivo e' che un'animazione d'ingresso racconta un arrivo. Se
+//  fai uno scorrimento a meta' e torni indietro non sei mai andato
+//  da nessuna parte, e rivederla sarebbe come se l'oggetto si fosse
+//  dimenticato di dove stava. Legare il riarmo alla visibilita'
+//  invece che al cambio di scheda dice esattamente questo, e vale
+//  per qualunque animazione aggiungeremo in futuro.
+
+static bool schedaVisibile(int i)
+{
+    if (i == schedaCorrente) return true;
+
+    int off = (int)lroundf(scorrimento);
+    if (off > 0 && i == schedaCorrente + 1) return true;
+    if (off < 0 && i == schedaCorrente - 1) return true;
+    return false;
+}
+
+static void riarmaAnimazioni(int i)
+{
+    if (i == SCHEDA_SOLE)
+    {
+        sorgereAttivo = false;
+        sorgereArmato = true;
+        daRidisegnare[SCHEDA_SOLE] = true;
+    }
+    else if (i == SCHEDA_BARO)
+    {
+        tracciaAttiva = false;
+        tracciaArmata = true;
+        daRidisegnare[SCHEDA_BARO] = true;
+    }
+}
+
+// Chiamata quando una scheda diventa quella in vista: se ha
+// un'animazione d'ingresso pronta, parte adesso.
+static void avviaAnimazioniIngresso()
+{
+    if (schedaCorrente == SCHEDA_SOLE && sorgereArmato)
+    {
+        sorgereArmato = false;
+        sorgereAttivo = true;
+        sorgereInizio = millis();
+        ridisegna(SCHEDA_SOLE);
+    }
+    else if (schedaCorrente == SCHEDA_BARO && tracciaArmata)
+    {
+        tracciaArmata = false;
+        tracciaAttiva = true;
+        tracciaInizio = millis();
+        ridisegna(SCHEDA_BARO);
+    }
+}
+
+static void aggiornaVisibilita()
+{
+    static bool eraVisibile[N_SCHEDE] = {false};
+
+    for (int i = 0; i < N_SCHEDE; ++i)
+    {
+        bool ora = schedaVisibile(i);
+        if (eraVisibile[i] && !ora)
+            riarmaAnimazioni(i);
+        eraVisibile[i] = ora;
+    }
 }
 
 static void componi()
@@ -837,8 +1732,20 @@ static void componi()
 
     comp->draw16bitRGBBitmap(-off, 0, scheda[schedaCorrente]->getFramebuffer(), LCD_W, LCD_H);
 
-    disegnaPallini(comp, schedaCorrente + scorrimento / (float)LCD_W);
+    // La batteria e i pallini si disegnano qui, dopo che le schede
+    // sono state affiancate: non appartengono a nessuna scheda in
+    // particolare, sono l'involucro. Cosi' durante lo scorrimento
+    // restano fermi mentre il contenuto scivola sotto - che e' anche
+    // il modo in cui l'occhio capisce quali sono i comandi
+    // dell'oggetto e quali il contenuto.
+    indicatoreBatteria(comp);
+
+    float opacita = palliniOpacita();
+    disegnaPallini(comp, schedaCorrente + scorrimento / (float)LCD_W, opacita);
+    palliniOpacitaDisegnata = opacita;
     comp->flush();
+
+    aggiornaVisibilita();
 }
 
 static void avviaAnimazione(int direzione)
@@ -865,6 +1772,16 @@ static void aggiornaAnimazione()
         scorrimento = 0;
         animazioneAttiva = false;
         animDirezione = 0;
+        palliniFino = millis() + PALLINI_ATTESA;
+
+        // Prima si prende atto di chi e' appena uscito di scena: e'
+        // quello che riarma le animazioni. Solo dopo si guarda se la
+        // scheda arrivata ne ha una pronta da far partire.
+        aggiornaVisibilita();
+
+        // Subito, o per un istante si vedrebbe gia' arrivata.
+        avviaAnimazioniIngresso();
+
         componi();
         return;
     }
@@ -877,10 +1794,306 @@ static void aggiornaAnimazione()
     componi();
 }
 
+// ------------------------------------------------------------
+//  DOVE HAI TOCCATO
+// ------------------------------------------------------------
+
+static bool dentro(int16_t x, int16_t y, int16_t cx, int16_t cy, int16_t raggio)
+{
+    return (abs(x - cx) <= raggio) && (abs(y - cy) <= raggio);
+}
+
+static void apriLista()
+{
+    vista = VISTA_LISTA;
+    listaScorrimento = 0;
+    vistaDaRidisegnare = true;
+}
+
+static void apriEditor(int indice)
+{
+    editorIndice = indice;
+    if (indice >= 0)
+    {
+        editorOre = sveglie[indice].ore;
+        editorMinuti = sveglie[indice].minuti;
+    }
+    else
+    {
+        // Una sveglia nuova parte dall'ora che e' adesso: e' quasi
+        // sempre piu' vicina a quella che vuoi di un valore fisso.
+        struct tm t;
+        oraCorrente(t);
+        editorOre = t.tm_hour;
+        editorMinuti = t.tm_min;
+    }
+    editorCampo = 0;
+    // Azzerati: aprendo la schermata i numeri sono gia' quelli
+    // giusti, non devono arrivarci scorrendo.
+    rulloEditorOre.testo[0] = '\0';
+    rulloEditorMin.testo[0] = '\0';
+    editorInRipetizione = false;
+    vista = VISTA_EDITOR;
+    vistaDaRidisegnare = true;
+}
+
+// Il tocco secco sulla barra in fondo alla scheda dell'ora.
+static void tapNelleSchede()
+{
+    if (schedaCorrente != SCHEDA_ORA) return;
+
+    if (dentro(tapX, tapY, BARRA_SX, BARRA_Y, BERSAGLIO))
+        apriLista();
+    else if (dentro(tapX, tapY, BARRA_DX, BARRA_Y, BERSAGLIO))
+        apriEditor(-1);
+}
+
+// ------------------------------------------------------------
+//  IL TOCCO NELLE SCHERMATE DELLA SVEGLIA
+// ------------------------------------------------------------
+//  Qui non c'e' il carosello: i gesti sono due, il tocco secco sui
+//  comandi e lo scorrimento verticale dell'elenco.
+
+static void modificaCampo(int verso)
+{
+    if (editorCampo == 0)
+        editorOre = (editorOre + 24 + verso) % 24;
+    else
+        editorMinuti = (editorMinuti + 60 + verso) % 60;
+    vistaDaRidisegnare = true;
+}
+
+static void tapNellEditor()
+{
+    if (dentro(tapX, tapY, LCD_W - PADDING - 4, PADDING + 8, BERSAGLIO))
+    {
+        apriLista();   // annulla e torna all'elenco
+        return;
+    }
+
+    // I due campi dell'orario: toccare quello che vuoi cambiare e'
+    // piu' diretto che tenere premuto per selezionarlo, che nelle
+    // sveglie di una volta era l'unica strada perche' i tasti erano
+    // due e fissi.
+    if (tapY >= EDITOR_Y - 20 && tapY <= EDITOR_Y + 7 * EDITOR_PASSO + 20)
+    {
+        if (tapX < LCD_W / 2 - 10) { editorCampo = 0; vistaDaRidisegnare = true; return; }
+        if (tapX > LCD_W / 2 + 10) { editorCampo = 1; vistaDaRidisegnare = true; return; }
+    }
+
+    if (dentro(tapX, tapY, 90, 290, BERSAGLIO)) { modificaCampo(-1); return; }
+    if (dentro(tapX, tapY, LCD_W - 90, 290, BERSAGLIO)) { modificaCampo(+1); return; }
+
+    if (dentro(tapX, tapY, LCD_W / 2, 384, BERSAGLIO))
+    {
+        if (editorIndice >= 0)
+        {
+            sveglie[editorIndice].ore = editorOre;
+            sveglie[editorIndice].minuti = editorMinuti;
+            sveglie[editorIndice].attiva = true;
+            sveglieSalva();
+        }
+        else
+        {
+            sveglieAggiungi(editorOre, editorMinuti);
+        }
+        daRidisegnare[SCHEDA_ORA] = true;
+        apriLista();
+        return;
+    }
+
+    if (editorIndice >= 0 && dentro(tapX, tapY, PADDING + 10, 384, BERSAGLIO))
+    {
+        sveglieRimuovi(editorIndice);
+        daRidisegnare[SCHEDA_ORA] = true;
+        apriLista();
+    }
+}
+
+static void tapNellaLista()
+{
+    if (dentro(tapX, tapY, LCD_W - PADDING - 4, PADDING + 8, BERSAGLIO))
+    {
+        vista = VISTA_SCHEDE;
+        daRidisegnare[SCHEDA_ORA] = true;
+        componi();
+        return;
+    }
+
+    if (nSveglie < MAX_SVEGLIE && dentro(tapX, tapY, LCD_W / 2, 404, BERSAGLIO))
+    {
+        apriEditor(-1);
+        return;
+    }
+
+    for (int i = 0; i < nSveglie; ++i)
+    {
+        int16_t cy = LISTA_ALTO + i * LISTA_RIGA - (int16_t)lroundf(listaScorrimento)
+                     + LISTA_RIGA / 2;
+        if (tapY < cy - LISTA_RIGA / 2 || tapY > cy + LISTA_RIGA / 2) continue;
+        if (cy < LISTA_ALTO - 10 || cy > LISTA_BASSO + 10) continue;
+
+        // Meta' destra: accendi o spegni. Meta' sinistra: apri.
+        if (tapX > LCD_W - PADDING - 70)
+        {
+            sveglie[i].attiva = !sveglie[i].attiva;
+            sveglieSalva();
+            daRidisegnare[SCHEDA_ORA] = true;
+            vistaDaRidisegnare = true;
+        }
+        else
+        {
+            apriEditor(i);
+        }
+        return;
+    }
+}
+
+static void gestisciToccoModale()
+{
+    static bool giu = false;
+    static int16_t partenzaY = 0;
+    static float scorrimentoPartenzaY = 0;
+    static bool mosso = false;
+    static uint32_t ripetiDa = 0;
+    static uint32_t ripetiUltima = 0;
+
+    TouchPoint tp = touch.leggi();
+    uint32_t adesso = millis();
+
+    if (tp.premuto && !giu)
+    {
+        giu = true;
+        mosso = false;
+        tapX = tp.x;
+        tapY = tp.y;
+        partenzaY = tp.y;
+        scorrimentoPartenzaY = listaScorrimento;
+
+        if (vista == VISTA_EDITOR)
+            ripetiDa = adesso + 450;   // da qui in poi tenere premuto ripete
+    }
+    else if (tp.premuto && giu)
+    {
+        if (abs(tp.y - partenzaY) > 8 || abs(tp.x - tapX) > 8)
+            mosso = true;
+
+        if (vista == VISTA_LISTA && mosso)
+        {
+            float massimo = (float)(nSveglie * LISTA_RIGA) - (LISTA_BASSO - LISTA_ALTO);
+            if (massimo < 0) massimo = 0;
+            listaScorrimento = scorrimentoPartenzaY + (partenzaY - tp.y);
+            if (listaScorrimento < 0) listaScorrimento = 0;
+            if (listaScorrimento > massimo) listaScorrimento = massimo;
+            vistaDaRidisegnare = true;
+        }
+
+        // Tenere premuto su piu' o meno fa scorrere i numeri, come su
+        // qualunque sveglia: toccare sessanta volte per mezz'ora non
+        // e' un'interazione, e' una penitenza.
+        if (vista == VISTA_EDITOR && !mosso && adesso > ripetiDa &&
+            (adesso - ripetiUltima) > 110)
+        {
+            ripetiUltima = adesso;
+            if (dentro(tapX, tapY, 90, 290, BERSAGLIO))
+            {
+                editorInRipetizione = true;
+                modificaCampo(-1);
+            }
+            else if (dentro(tapX, tapY, LCD_W - 90, 290, BERSAGLIO))
+            {
+                editorInRipetizione = true;
+                modificaCampo(+1);
+            }
+        }
+    }
+    else if (!tp.premuto && giu)
+    {
+        giu = false;
+        editorInRipetizione = false;
+        if (mosso) return;
+
+        switch (vista)
+        {
+        case VISTA_ALLARME:
+            vista = VISTA_SCHEDE;
+            daRidisegnare[SCHEDA_ORA] = true;
+            componi();
+            break;
+        case VISTA_LISTA:  tapNellaLista(); break;
+        case VISTA_EDITOR: tapNellEditor(); break;
+        default: break;
+        }
+    }
+}
+
+static void disegnaVista()
+{
+    struct tm t;
+    oraCorrente(t);
+
+    // Si azzera PRIMA di disegnare. E' durante il disegno che un
+    // numero ancora in movimento rialza la richiesta per dire "non
+    // ho finito": azzerarla dopo la cancellerebbe ogni volta, e
+    // l'animazione avanzerebbe solo quando qualcos'altro obbliga a
+    // ridisegnare.
+    vistaDaRidisegnare = false;
+
+    switch (vista)
+    {
+    case VISTA_LISTA:   disegnaLista(comp); break;
+    case VISTA_EDITOR:  disegnaEditor(comp); break;
+    case VISTA_ALLARME: disegnaAllarme(comp, t); break;
+    default: return;
+    }
+    comp->flush();
+}
+
+// ------------------------------------------------------------
+//  QUANDO SCATTA UNA SVEGLIA
+// ------------------------------------------------------------
+
+static void controllaSveglie(const struct tm &t)
+{
+    if (vista == VISTA_ALLARME) return;
+
+    // Un minuto solo per ogni scatto: senza questo la sveglia
+    // ripartirebbe di continuo per tutti i sessanta secondi, anche
+    // subito dopo che l'hai spenta.
+    int minuto = t.tm_hour * 60 + t.tm_min;
+    if (minuto == allarmeUltimoMinuto) return;
+
+    for (int i = 0; i < nSveglie; ++i)
+    {
+        if (!sveglie[i].attiva) continue;
+        if (sveglie[i].ore != t.tm_hour || sveglie[i].minuti != t.tm_min) continue;
+
+        allarmeUltimoMinuto = minuto;
+        allarmeIndice = i;
+        vista = VISTA_ALLARME;
+        vistaDaRidisegnare = true;
+
+        // Se lo schermo dormiva, una sveglia muta e nera non
+        // servirebbe a niente.
+        if (!schermoAcceso)
+        {
+            schermoAcceso = true;
+            panel->displayOn();
+            panel->setBrightness(LUMINOSITA);
+        }
+
+        Serial.printf("[sveglia] scattata: %02d:%02d\n", sveglie[i].ore, sveglie[i].minuti);
+        return;
+    }
+}
+
 static void gestisciTocco()
 {
     TouchPoint tp = touch.leggi();
     uint32_t adesso = millis();
+
+    if (tp.premuto)
+        palliniFino = adesso + PALLINI_ATTESA;
 
     if (tp.premuto && !ditoGiu)
     {
@@ -891,6 +2104,8 @@ static void gestisciTocco()
         animazioneAttiva = false;
         animDirezione = 0;
         ditoPartenzaX = tp.x;
+        tapX = tp.x;
+        tapY = tp.y;
         scorrimentoPartenza = scorrimento;
         ditoUltimaX = tp.x;
         ditoUltimoT = adesso;
@@ -943,10 +2158,12 @@ static void gestisciTocco()
 
         if (eraTap)
         {
-            // Un tocco secco non cambia scheda: rimette solo a
-            // posto eventuali pixel di scarto.
+            // Un tocco secco non cambia scheda: rimette a posto
+            // eventuali pixel di scarto e guarda se hai centrato
+            // uno dei comandi.
             scorrimento = 0;
             componi();
+            tapNelleSchede();
             return;
         }
 
@@ -969,6 +2186,52 @@ static void gestisciTocco()
 
         avviaAnimazione(direzione);
     }
+}
+
+// ------------------------------------------------------------
+//  IL PULSANTE
+// ------------------------------------------------------------
+//  Su questa scheda non c'e' un tasto di accensione utilizzabile:
+//  il PWR e' cablato al chip dell'alimentazione e una pressione
+//  lunga spegne tutto. Il BOOT invece serve al chip solo nei primi
+//  istanti dopo l'accensione: da li' in poi e' un pulsante libero,
+//  e lo usiamo per mettere in standby lo schermo.
+//
+//  displayOff() non abbassa la luminosita': manda proprio il
+//  pannello a dormire. Su un AMOLED significa che i pixel non
+//  emettono piu' niente, che e' l'unico modo di spegnerlo davvero.
+
+static void gestisciPulsante()
+{
+    static bool precedente = HIGH;
+    static uint32_t ultimoCambio = 0;
+
+    bool ora = digitalRead(BTN_BOOT);
+
+    // I contatti di un pulsante, nel momento in cui si chiudono,
+    // rimbalzano per qualche millisecondo: senza questa attesa un
+    // colpo solo verrebbe letto come venti, e lo schermo
+    // lampeggerebbe invece di cambiare stato.
+    if (precedente == HIGH && ora == LOW && (millis() - ultimoCambio) > 300)
+    {
+        ultimoCambio = millis();
+        schermoAcceso = !schermoAcceso;
+
+        if (schermoAcceso)
+        {
+            panel->displayOn();
+            panel->setBrightness(LUMINOSITA);
+            componi();
+            Serial.println("[schermo] acceso");
+        }
+        else
+        {
+            panel->displayOff();
+            Serial.println("[schermo] in standby (premi BOOT per riaccendere)");
+        }
+    }
+
+    precedente = ora;
 }
 
 // ------------------------------------------------------------
@@ -1019,6 +2282,9 @@ void setup()
     aggiornaBatteria();
     Serial.printf("[batteria] %d%%%s\n", batteria, alimentato ? " (cavo collegato)" : "");
 
+    sveglieCarica();
+    Serial.printf("[sveglie] %d salvate, %d attive\n", nSveglie, sveglieAttive());
+
     // Schermata di attesa: la rete puo' prendersi qualche secondo
     // e uno schermo nero sembrerebbe un blocco.
     comp->fillScreen(COL_SFONDO);
@@ -1061,6 +2327,46 @@ void setup()
 
 void loop()
 {
+    struct tm adesso;
+    oraCorrente(adesso);
+
+    // Prima di tutto il resto, e comunque: una sveglia che non
+    // suona perche' l'utente stava guardando un'altra schermata
+    // non e' una sveglia.
+    controllaSveglie(adesso);
+
+    // A schermo spento non c'e' niente da calcolare: si ascolta
+    // solo il pulsante. Ridisegnare un'immagine che nessuno vede
+    // terrebbe sveglio il chip per nulla.
+    if (!schermoAcceso)
+    {
+        gestisciPulsante();
+        delay(20);
+        return;
+    }
+
+    // Nelle schermate della sveglia il carosello e' sospeso.
+    if (vista != VISTA_SCHEDE)
+    {
+        gestisciToccoModale();
+
+        // Il campo scelto e la campana dell'allarme lampeggiano: si
+        // ridisegna quando cambia lo stato, non a ritmo fisso.
+        static bool ultimoLampeggio = false;
+        bool lampeggia = (vista == VISTA_EDITOR || vista == VISTA_ALLARME);
+        bool ora = ((millis() / 420) % 2) == 0;
+
+        if (vistaDaRidisegnare || (lampeggia && ora != ultimoLampeggio))
+        {
+            ultimoLampeggio = ora;
+            disegnaVista();
+        }
+
+        gestisciPulsante();
+        delay(5);
+        return;
+    }
+
     if (animazioneAttiva)
     {
         aggiornaAnimazione();
@@ -1087,8 +2393,7 @@ void loop()
 
     // Da qui in giu' si entra solo a schermo fermo.
 
-    struct tm t;
-    oraCorrente(t);
+    const struct tm &t = adesso;
 
     if (t.tm_sec != ultimoSecondo)
     {
@@ -1113,28 +2418,20 @@ void loop()
 
     // Si ridisegna solo quella che stai guardando: le altre
     // aspettano il momento in cui cominci a scorrere.
-    if (daRidisegnare[schedaCorrente])
+    if (daRidisegnare[schedaCorrente] || numeriInMovimento)
     {
-        ridisegna(schedaCorrente);
+        numeriInMovimento = false;
+        ridisegna(schedaCorrente);   // se un numero scorre ancora, lo rialza
+        componi();
+    }
+    else if (fabsf(palliniOpacita() - palliniOpacitaDisegnata) > 0.02f)
+    {
+        // I pallini si stanno spegnendo: basta ricomporre, le schede
+        // sono gia' pronte e non serve ridisegnare niente.
         componi();
     }
 
-    // Il pulsante BOOT come riserva, nel caso il touch faccia i
-    // capricci: un colpo e si passa alla scheda successiva.
-    static bool bottonePremuto = false;
-    bool giu = (digitalRead(BTN_BOOT) == LOW);
-    if (giu && !bottonePremuto)
-    {
-        bottonePremuto = true;
-        int prossima = (schedaCorrente + 1) % N_SCHEDE;
-        if (daRidisegnare[prossima]) ridisegna(prossima);
-        if (prossima > schedaCorrente) avviaAnimazione(1);
-        else { schedaCorrente = 0; scorrimento = 0; componi(); }
-    }
-    else if (!giu)
-    {
-        bottonePremuto = false;
-    }
+    gestisciPulsante();
 
     delay(5);
 }

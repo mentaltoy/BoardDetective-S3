@@ -108,6 +108,31 @@ static const uint8_t DM_FONT[][5] PROGMEM = {
 };
 
 // ------------------------------------------------------------
+//  DISSOLVENZA
+// ------------------------------------------------------------
+//  Il display non sa disegnare "mezzo trasparente": ogni pixel ha
+//  un colore e basta. Ma lo sfondo qui e' sempre nero, e allora
+//  sbiadire verso il nero da' lo stesso risultato: si scalano le
+//  tre componenti e il colore si spegne.
+//
+//  Il formato tiene 5 bit per il rosso, 6 per il verde e 5 per il
+//  blu dentro sedici bit. Al verde ne tocca uno in piu' perche'
+//  l'occhio distingue molte piu' gradazioni di verde che di blu.
+
+static inline uint16_t dmSfuma(uint16_t colore, float quanto)
+{
+    if (quanto >= 1.0f) return colore;
+    if (quanto <= 0.0f) return 0;
+    uint16_t r = (colore >> 11) & 0x1F;
+    uint16_t g = (colore >> 5) & 0x3F;
+    uint16_t b = colore & 0x1F;
+    r = (uint16_t)(r * quanto);
+    g = (uint16_t)(g * quanto);
+    b = (uint16_t)(b * quanto);
+    return (r << 11) | (g << 5) | b;
+}
+
+// ------------------------------------------------------------
 //  IL PUNTO
 // ------------------------------------------------------------
 //  Sotto i 3 pixel di diametro un cerchio non e' piu' un cerchio:
@@ -148,6 +173,157 @@ static inline int16_t dmTextWidth(const char *s, int16_t passo, int16_t gap = 1)
 static inline int16_t dmTextHeight(int16_t passo)
 {
     return 7 * passo;
+}
+
+// Disegna un solo carattere, saltando i punti che escono da una
+// finestra verticale. Il ritaglio serve al rullo: la cifra che
+// scorre deve sparire dietro il bordo, non uscire a invadere la
+// riga sopra. Un punto o e' dentro o e' fuori, non si dissolve:
+// e' una matrice di led, non una sfumatura.
+static void dmCharClip(Arduino_GFX *g, int16_t xSinistra, int16_t yAlto, char c,
+                       int16_t passo, int16_t diam, uint16_t colore,
+                       int16_t finestraAlto, int16_t finestraBasso)
+{
+    uint8_t k = (uint8_t)c;
+    if (k >= 'a' && k <= 'z') k -= 32;
+    if (k < DM_FONT_FIRST || k > DM_FONT_LAST) k = 32;
+
+    const uint8_t *glifo = DM_FONT[k - DM_FONT_FIRST];
+    const int16_t px0 = xSinistra + (passo >> 1);
+    const int16_t py0 = yAlto + (passo >> 1);
+
+    for (int col = 0; col < 5; ++col)
+    {
+        uint8_t colonna = pgm_read_byte(&glifo[col]);
+        if (!colonna) continue;
+        for (int riga = 0; riga < 7; ++riga)
+        {
+            if (!(colonna & (1 << riga))) continue;
+            int16_t py = py0 + riga * passo;
+            if (py < finestraAlto || py > finestraBasso) continue;
+            dmDot(g, px0 + col * passo, py, diam, colore);
+        }
+    }
+}
+
+// ------------------------------------------------------------
+//  IL RULLO
+// ------------------------------------------------------------
+//  Come i contatori meccanici: le cifre stanno su una ruota che
+//  gira dietro una finestrella. Quando il numero cambia, la cifra
+//  vecchia scorre via verso l'alto e la nuova sale da sotto.
+//
+//  Solo le cifre che cambiano davvero si muovono. In un orologio,
+//  quando scatta il minuto, le ore restano ferme: se ruotasse
+//  tutto sembrerebbe un tabellone che si ricarica, non un
+//  meccanismo.
+
+struct DmRullo
+{
+    char testo[20];
+    char precedente[20];
+    uint32_t inizio;
+    uint8_t cambiate;   // quante cifre si stanno muovendo in questo giro
+    bool attivo;
+};
+
+// Aggiorna il rullo con il nuovo testo e lo disegna allo stato in
+// cui si trova adesso. Torna true finche' si sta muovendo: a quel
+// punto chi chiama sa che deve ridisegnare ancora.
+static bool dmRullo(Arduino_GFX *g, DmRullo &r, const char *nuovo,
+                    int16_t x, int16_t y, int16_t passo, int16_t diam,
+                    uint16_t colore, int16_t gap = 1, uint16_t durata = 800,
+                    uint16_t ritardo = 80, bool animare = true)
+{
+    if (strncmp(r.testo, nuovo, sizeof(r.testo) - 1) != 0)
+    {
+        // Alla primissima volta non c'e' niente da cui scorrere.
+        bool primo = (r.testo[0] == '\0');
+        strncpy(r.precedente, r.testo, sizeof(r.precedente) - 1);
+        r.precedente[sizeof(r.precedente) - 1] = '\0';
+        strncpy(r.testo, nuovo, sizeof(r.testo) - 1);
+        r.testo[sizeof(r.testo) - 1] = '\0';
+
+        int vecchie = strlen(r.precedente);
+        r.cambiate = 0;
+        for (int i = 0; r.testo[i]; ++i)
+        {
+            char v = (i < vecchie) ? r.precedente[i] : ' ';
+            if (r.testo[i] != v) ++r.cambiate;
+        }
+
+        r.inizio = millis();
+        r.attivo = animare && !primo && r.cambiate > 0;
+    }
+
+    const int16_t altezza = 7 * passo;
+    const int16_t corsa = altezza + passo;   // il passo extra e' lo stacco fra due cifre sulla ruota
+    const int16_t finestraAlto = y + (passo >> 1);
+    const int16_t finestraBasso = y + altezza - (passo >> 1);
+
+    uint32_t passato = 0;
+    if (r.attivo)
+    {
+        passato = millis() - r.inizio;
+        // Finisce quando ha finito l'ultima, non la prima.
+        uint32_t totale = durata + (uint32_t)(r.cambiate > 0 ? r.cambiate - 1 : 0) * ritardo;
+        if (passato >= totale)
+            r.attivo = false;
+    }
+
+    int16_t penna = x;
+    int ordine = 0;   // la quantesima cifra che cambia, da sinistra
+    int vecchie = strlen(r.precedente);
+
+    for (int i = 0; r.testo[i]; ++i)
+    {
+        char nuovoC = r.testo[i];
+        char vecchioC = (i < vecchie) ? r.precedente[i] : ' ';
+
+        if (!r.attivo || nuovoC == vecchioC)
+        {
+            dmCharClip(g, penna, y, nuovoC, passo, diam, colore,
+                       finestraAlto, finestraBasso);
+        }
+        else
+        {
+            // Ogni cifra parte un po' dopo la precedente. In un
+            // contatore vero le ruote non scattano all'unisono: e'
+            // quel minimo sfasamento a farlo sembrare un meccanismo
+            // invece di un tabellone che si aggiorna.
+            uint32_t mio = (uint32_t)ordine * ritardo;
+            ++ordine;
+
+            float p = 0.0f;
+            if (passato > mio)
+            {
+                float t = (float)(passato - mio) / (float)durata;
+                if (t >= 1.0f)
+                {
+                    p = 1.0f;
+                }
+                else
+                {
+                    // Piano all'inizio, veloce in mezzo, piano alla
+                    // fine. Una ruota vera e' ferma e deve vincere la
+                    // propria inerzia: partire subito a tutta
+                    // velocita' e frenare da' uno strappo, perche'
+                    // nessun oggetto con una massa si comporta cosi'.
+                    p = (t < 0.5f) ? (4.0f * t * t * t)
+                                   : (1.0f - powf(-2.0f * t + 2.0f, 3.0f) / 2.0f);
+                }
+            }
+
+            int16_t scorso = (int16_t)lroundf(p * corsa);
+            dmCharClip(g, penna, y - scorso, vecchioC, passo, diam, colore,
+                       finestraAlto, finestraBasso);
+            dmCharClip(g, penna, y + corsa - scorso, nuovoC, passo, diam, colore,
+                       finestraAlto, finestraBasso);
+        }
+        penna += (5 + gap) * passo;
+    }
+
+    return r.attivo;
 }
 
 // Disegna a partire dall'angolo in alto a sinistra della griglia.
