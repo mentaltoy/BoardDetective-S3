@@ -42,6 +42,8 @@
 #include "touch.h"
 #include "rtc.h"
 #include "sveglia.h"
+#include "audio.h"
+#include "imu.h"
 
 // Il logo compare come quarta scheda solo se src/logo.h esiste.
 // Lo genera scripts/logo2c.py da un'immagine qualsiasi; senza,
@@ -117,13 +119,33 @@
 
 // La barra dei comandi in fondo alla scheda dell'ora.
 #define BARRA_Y 366
-#define BARRA_SX (PADDING + 14)
-#define BARRA_DX (LCD_W - PADDING - 14)
+// Il centro di un'icona sta a mezza icona dal margine, non sul
+// margine: e' il suo bordo che deve rispettare il padding, non il
+// suo centro. Nove punti a passo quattro fanno 36 pixel, quindi 18.
+#define MEZZA_ICONA 18
+#define BARRA_SX (PADDING + MEZZA_ICONA)
+#define BARRA_DX (LCD_W - PADDING - MEZZA_ICONA)
 
 // Quanto largo e' il bersaglio di un comando. Un dito copre quasi
 // mezzo centimetro di vetro e non vede cosa sta coprendo: la zona
 // che risponde deve essere molto piu' grande del simbolo disegnato.
 #define BERSAGLIO 46
+
+// ------------------------------------------------------------
+//  IL PASSO DEI QUADRANTI
+// ------------------------------------------------------------
+//  Lo detta la scheda dell'ora, e tutte le altre si adeguano.
+//  Trenta tacche perche' e' il massimo che sta nel margine senza
+//  infittire i punti al punto da non sembrare piu' una matrice di
+//  led: sessanta vorrebbero cinque pixel di passo, e a quella
+//  distanza i punti si fondono in una riga continua.
+//
+//  Il marcatore pero' avanza ogni secondo lo stesso, muovendosi di
+//  mezza tacca alla volta: a secondi pari sta sopra un punto, a
+//  secondi dispari fra due. Un orologio deve battere il secondo,
+//  e questo e' il modo di farlo senza tradire la griglia.
+#define TACCHE_MINUTO 30
+#define PASSO_QUADRANTE ((LCD_W - 2 * PADDING) / (TACCHE_MINUTO - 1))
 
 // ------------------------------------------------------------
 //  COLORI
@@ -141,6 +163,7 @@
 #define COL_CORNICE 0x2124
 #define COL_SOLE 0xFE80    // giallo caldo
 #define COL_LUNA 0x7ADF    // viola-blu
+#define COL_BOLLA 0xED07   // ambra
 
 // ------------------------------------------------------------
 //  DISPLAY
@@ -160,16 +183,17 @@ static Arduino_Canvas *comp = new Arduino_Canvas(LCD_W, LCD_H, panel);
 // ------------------------------------------------------------
 
 #if HA_LOGO
-#define N_SCHEDE 5
+#define N_SCHEDE 6
 #else
-#define N_SCHEDE 4
+#define N_SCHEDE 5
 #endif
 
 #define SCHEDA_ORA 0
 #define SCHEDA_SOLE 1
 #define SCHEDA_METEO 2
 #define SCHEDA_BARO 3
-#define SCHEDA_LOGO 4
+#define SCHEDA_ARIA 4
+#define SCHEDA_LOGO 5
 
 // Ogni scheda ha il suo foglio di memoria, sempre pronto.
 // Sono 329 KB l'uno: con 8 MB di PSRAM ce ne stanno una ventina,
@@ -177,6 +201,7 @@ static Arduino_Canvas *comp = new Arduino_Canvas(LCD_W, LCD_H, panel);
 // L'output e' nullptr perche' questi fogli non vanno mai a
 // schermo da soli: passano sempre da "comp".
 static Arduino_Canvas *scheda[N_SCHEDE] = {
+    new Arduino_Canvas(LCD_W, LCD_H, nullptr),
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
@@ -282,9 +307,23 @@ static uint32_t tracciaInizio = 0;
 static bool tracciaAttiva = false;
 static bool tracciaArmata = true;
 
+// Le bollicine dell'aria: all'ingresso salgono dal fondo, poi
+// continuano a muoversi finche' resti a guardarle.
+// L'icona del meteo si condensa un punto alla volta.
+#define ICONA_DURATA 1200
+static uint32_t iconaInizio = 0;
+static bool iconaAttiva = false;
+static bool iconaArmata = true;
+
+#define BOLLE_DURATA 1100
+static uint32_t bolleInizio = 0;
+static bool bolleAttive = false;
+static bool bolleArmate = true;
+
 static DmRullo rulloOra;
 static DmRullo rulloSole;
 static DmRullo rulloBaro;
+static DmRullo rulloAria;
 
 // Anche i numeri della sveglia scorrono. Mentre tieni premuto pero'
 // l'animazione si spegne: a quel ritmo non farebbe in tempo a
@@ -335,6 +374,23 @@ struct Barometro
     float minimo = 0, massimo = 0;
 };
 static Barometro baro;
+
+// ------------------------------------------------------------
+//  QUALITA' DELL'ARIA
+// ------------------------------------------------------------
+//  L'indice europeo mette insieme cinque inquinanti e ne restituisce
+//  uno solo, tarato in modo che il numero sia confrontabile fra
+//  paesi diversi. Zero e' aria pulita, cento e' aria da restare in
+//  casa.
+
+struct Aria
+{
+    bool valido = false;
+    int indice = 0;
+    float pm25 = 0;
+    float pm10 = 0;
+};
+static Aria aria;
 
 // ------------------------------------------------------------
 //  BATTERIA (AXP2101)
@@ -600,6 +656,51 @@ static bool scaricaMeteo()
     return true;
 }
 
+static bool scaricaAria()
+{
+    if (!retePresente) return false;
+
+    String url = "http://air-quality-api.open-meteo.com/v1/air-quality?latitude=";
+    url += String(LAT, 4);
+    url += "&longitude=" + String(LON, 4);
+    url += "&current=european_aqi,pm2_5,pm10&timezone=Europe%2FRome";
+
+    HTTPClient http;
+    http.setTimeout(8000);
+    if (!http.begin(url)) return false;
+
+    int codice = http.GET();
+    if (codice != 200)
+    {
+        Serial.printf("[aria] risposta http %d\n", codice);
+        http.end();
+        return false;
+    }
+
+    String corpo = http.getString();
+    http.end();
+
+    DynamicJsonDocument doc(2048);
+    if (deserializeJson(doc, corpo))
+    {
+        Serial.println("[aria] json illeggibile");
+        return false;
+    }
+
+    JsonObject c = doc["current"];
+    if (c.isNull()) return false;
+
+    aria.indice = c["european_aqi"] | 0;
+    aria.pm25 = c["pm2_5"] | 0.0f;
+    aria.pm10 = c["pm10"] | 0.0f;
+    aria.valido = true;
+    daRidisegnare[SCHEDA_ARIA] = true;
+
+    Serial.printf("[aria] indice %d, pm2.5 %.1f, pm10 %.1f\n",
+                  aria.indice, aria.pm25, aria.pm10);
+    return true;
+}
+
 // ------------------------------------------------------------
 //  ICONE METEO
 // ------------------------------------------------------------
@@ -746,6 +847,21 @@ static const char *ICO_LUNA[SOLE_LATO] = {
     "....##...",
 };
 
+// Numeri sparsi ma sempre gli stessi. Moltiplicare l'indice e
+// prendere il resto - che e' quello che facevo prima - non basta:
+// resta una progressione, e all'occhio le bolle risultavano
+// allineate. Qui i bit vengono rimescolati fra loro finche' due
+// indici vicini non hanno piu' niente in comune.
+static uint32_t mescola(uint32_t x)
+{
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
 // ------------------------------------------------------------
 //  ICONE DEI COMANDI
 // ------------------------------------------------------------
@@ -872,6 +988,43 @@ static void disegnaBollo(Arduino_GFX *g, int16_t cx, int16_t cy, char cifra,
         }
 }
 
+// La stessa griglia, ma che si accende un punto alla volta in ordine
+// sparso. Ogni punto ha il suo momento, ricavato dalla sua posizione,
+// e non si accende di scatto: sale di luminosita' in una frazione di
+// secondo. Accenderli tutti insieme sarebbe stato un lampo, in fila
+// una scansione: sparsi sembra che l'immagine si condensi.
+static void disegnaGrigliaComparsa(Arduino_GFX *g, int16_t cx, int16_t cy,
+                                   const char **griglia, int lato,
+                                   int16_t passo, int16_t diam, uint16_t colore,
+                                   float progresso)
+{
+    int16_t x0 = cx - (lato * passo) / 2 + passo / 2;
+    int16_t y0 = cy - (lato * passo) / 2 + passo / 2;
+
+    for (int r = 0; r < lato; ++r)
+        for (int c = 0; c < lato; ++c)
+        {
+            if (griglia[r][c] != '#') continue;
+
+            uint32_t seme = mescola((uint32_t)(r * 131 + c * 17 + 7));
+            float mio = (float)(seme % 1000) / 1000.0f * 0.62f;
+
+            float quanto = (progresso - mio) / 0.38f;
+            if (quanto <= 0.0f) continue;
+            if (quanto > 1.0f) quanto = 1.0f;
+
+            // Non si accende sul posto: arriva da sopra mentre si
+            // accende, e si posa dove deve stare. Il movimento e'
+            // breve, tre quarti di passo della griglia: quel tanto
+            // che basta perche' l'occhio veda una discesa invece di
+            // un'apparizione.
+            float scesa = (1.0f - quanto) * (float)passo * 3.5f;
+
+            dmDot(g, x0 + c * passo, y0 + r * passo - (int16_t)scesa, diam,
+                  dmSfuma(colore, quanto));
+        }
+}
+
 static void disegnaGriglia(Arduino_GFX *g, int16_t cx, int16_t cy,
                            const char **griglia, int lato,
                            int16_t passo, int16_t diam, uint16_t colore,
@@ -893,12 +1046,14 @@ static void disegnaGriglia(Arduino_GFX *g, int16_t cx, int16_t cy,
 // fillCircle non sa fermarsi a meta', quindi il cerchio si costruisce
 // una riga alla volta e le righe sotto la linea non si disegnano.
 static void spazioTondo(Arduino_GFX *g, int16_t cx, int16_t cy,
-                        int16_t raggio, int16_t orizzonte)
+                        int16_t raggio, int16_t orizzonte,
+                        int16_t alto = -32000)
 {
     for (int16_t dy = -raggio; dy <= raggio; ++dy)
     {
         int16_t y = cy + dy;
         if (y > orizzonte) break;
+        if (y < alto) continue;
         int16_t dx = (int16_t)lroundf(sqrtf((float)(raggio * raggio - dy * dy)));
         g->fillRect(cx - dx, y, 2 * dx + 1, 1, COL_SFONDO);
     }
@@ -950,6 +1105,41 @@ static void telaio(Arduino_GFX *g, const char *etichetta)
 
     // L'etichetta in alto a sinistra, piccola e molto spaziata.
     dmText(g, PADDING, PADDING, etichetta, 3, 2, COL_ETICHETTA, 2);
+}
+
+// Centra un testo garantendo il margine. Se non ci sta, rimpicciolisce
+// finche' non entra, invece di sbordare.
+//
+// E' una regola del progetto: niente tocca i bordi piu' di PADDING.
+// Applicarla qui, una volta, invece che controllare a occhio ogni
+// scritta, significa che vale anche per quelle che aggiungeremo
+// domani - e che nessuna potra' dimenticarsela.
+static void testoCentrato(Arduino_GFX *g, int16_t y, const char *s,
+                          int16_t passo, int16_t diam, uint16_t colore,
+                          int16_t gap = 1)
+{
+    const int16_t utile = LCD_W - 2 * PADDING;
+    while (passo > 1 && dmTextWidth(s, passo, gap) > utile)
+    {
+        --passo;
+        diam = (passo * 7) / 10;
+        if (diam < 2) diam = 2;
+    }
+    dmTextCentered(g, LCD_W / 2, y, s, passo, diam, colore, gap);
+}
+
+// Come testoCentrato, ma dentro una colonna e allineato a sinistra.
+static void testoInColonna(Arduino_GFX *g, int16_t x, int16_t y, const char *s,
+                           int16_t passo, int16_t diam, uint16_t colore,
+                           int16_t gap, int16_t larghezza)
+{
+    while (passo > 1 && dmTextWidth(s, passo, gap) > larghezza)
+    {
+        --passo;
+        diam = (passo * 7) / 10;
+        if (diam < 2) diam = 2;
+    }
+    dmText(g, x, y, s, passo, diam, colore, gap);
 }
 
 static void indicatoreBatteria(Arduino_GFX *g)
@@ -1011,28 +1201,41 @@ static void disegnaOra(Arduino_GFX *g, const struct tm &t)
     if (dmRullo(g, rulloOra, buf, (LCD_W - largoOra) / 2, 128, 10, 7, COL_ACCESO))
         numeriInMovimento = true;
 
-    // I secondi come una riga di sessanta punti che si riempie.
-    // Un quadrante, non un numero: si legge con la coda dell'occhio.
-    const int16_t passoSec = 5;
-    const int16_t larghezza = 60 * passoSec;
-    const int16_t x0 = (LCD_W - larghezza) / 2 + passoSec / 2;
-    for (int i = 0; i < 60; ++i)
+    // I secondi come un quadrante che si riempie, non come un numero:
+    // si legge con la coda dell'occhio.
+    //
+    // Il passo e' quello di tutti gli altri quadranti - l'arco del
+    // Sole, la curva del barometro - perche' e' una regola del
+    // progetto. Ne viene una conseguenza: sessanta punti a questa
+    // distanza sarebbero settecento pixel, il doppio dello schermo.
+    // Quindi un punto ogni due secondi. Meglio trenta punti che si
+    // leggono come parte della stessa famiglia che sessanta punti
+    // fitti che sembrano un'altra cosa.
+    const int16_t x0 = PADDING;
+    const int16_t larghezza = (TACCHE_MINUTO - 1) * PASSO_QUADRANTE;
+
+    // Il marcatore scorre sulla linea con sessanta posizioni, una per
+    // secondo: cade sopra un punto o esattamente in mezzo a due.
+    const int16_t xMarcatore = x0 + (int16_t)((int32_t)t.tm_sec * larghezza / 59);
+
+    for (int i = 0; i < TACCHE_MINUTO; ++i)
     {
-        uint16_t c = (i < t.tm_sec) ? COL_SECONDARIO : COL_SPENTO;
-        if (i == t.tm_sec) c = COL_ROSSO;
-        dmDot(g, x0 + i * passoSec, 238, 3, c);
+        int16_t px = x0 + i * PASSO_QUADRANTE;
+        dmDot(g, px, 238, 5, px <= xMarcatore ? COL_SECONDARIO : COL_SPENTO);
     }
+
+    dmMarcatore(g, xMarcatore, 238, 8, 5, COL_ROSSO);
 
     // La data.
     snprintf(buf, sizeof(buf), "%s %02d %s",
              GIORNI[t.tm_wday % 7], t.tm_mday, MESI[t.tm_mon % 12]);
-    dmTextCentered(g, LCD_W / 2, 278, buf, 5, 4, COL_ACCESO);
+    testoCentrato(g, 278, buf, 5, 4, COL_ACCESO);
 
     // Da dove viene l'ora che stai leggendo. Sta sopra, appoggiata
     // all'orario: e' una nota a margine di quel numero, non un dato
     // per conto suo.
     const char *fonte = oraSincronizzata ? "SINCRONIZZATO" : "OROLOGIO INTERNO";
-    dmTextCentered(g, LCD_W / 2, 84, fonte, 3, 2, COL_ETICHETTA, 2);
+    testoCentrato(g, 84, fonte, 3, 2, COL_ETICHETTA, 2);
 
     // La barra dei comandi: a sinistra le sveglie, a destra ne
     // aggiungi una. Le zone toccabili sono piu' grandi dei simboli -
@@ -1064,7 +1267,7 @@ static void disegnaSole(Arduino_GFX *g, const struct tm &t)
 
     if (!okAlba || !okTram)
     {
-        dmTextCentered(g, LCD_W / 2, 200, "NON CALCOLABILE", 4, 3, COL_SPENTO);
+        testoCentrato(g, 200, "NON CALCOLABILE", 4, 3, COL_SPENTO);
         return;
     }
 
@@ -1078,7 +1281,9 @@ static void disegnaSole(Arduino_GFX *g, const struct tm &t)
     const int16_t cx = LCD_W / 2;
     const int16_t cy = 228;
     const int16_t raggio = 110;
-    const int totale = 31;
+    // Tanti punti quanti ne servono per avere lo stesso passo degli
+    // altri quadranti lungo la curva.
+    const int totale = (int)((float)M_PI * raggio / PASSO_QUADRANTE) + 1;
 
     float avanzamento;
     if (giornoChiaro)
@@ -1184,7 +1389,7 @@ static void disegnaSole(Arduino_GFX *g, const struct tm &t)
     if (dmRullo(g, rulloSole, buf, (LCD_W - largo) / 2, 248, 8, 6, COL_ACCESO))
         numeriInMovimento = true;
 
-    dmTextCentered(g, cx, 318, verso, 3, 2, COL_ETICHETTA, 2);
+    testoCentrato(g, 318, verso, 3, 2, COL_ETICHETTA, 2);
 
     // Gli orari veri, ai due capi, con l'etichetta sopra.
     dmText(g, PADDING, 344, "ALBA", 2, 2, COL_ETICHETTA, 2);
@@ -1208,25 +1413,43 @@ static void disegnaMeteo(Arduino_GFX *g)
 
     if (!domani.valido)
     {
-        dmTextCentered(g, LCD_W / 2, 190, "NO LINK", 8, 6, COL_SPENTO);
+        testoCentrato(g, 190, "NO LINK", 8, 6, COL_SPENTO);
         const char *motivo = retePresente ? "SERVER NON RAGGIUNGIBILE" : "NESSUNA RETE WIFI";
-        dmTextCentered(g, LCD_W / 2, 260, motivo, 3, 2, COL_ETICHETTA, 2);
+        testoCentrato(g, 260, motivo, 3, 2, COL_ETICHETTA, 2);
         return;
     }
 
-    disegnaGriglia(g, LCD_W / 2, 130, iconaPerCodice(domani.codice), ICONA_LATO, 6, 4, COL_ACCESO);
+    float quanto = 1.0f;
+    if (iconaArmata)
+    {
+        quanto = 0.0f;
+    }
+    else if (iconaAttiva)
+    {
+        uint32_t passato = millis() - iconaInizio;
+        if (passato >= ICONA_DURATA)
+            iconaAttiva = false;
+        else
+        {
+            quanto = (float)passato / (float)ICONA_DURATA;
+            numeriInMovimento = true;
+        }
+    }
+
+    disegnaGrigliaComparsa(g, LCD_W / 2, 130, iconaPerCodice(domani.codice),
+                           ICONA_LATO, 6, 4, COL_ACCESO, quanto);
 
     char buf[16];
 
     // La massima, grande. Il segno di grado e' il carattere ^ del
     // font: a matrice di punti un cerchietto e' un quadratino 3x3.
     snprintf(buf, sizeof(buf), "%d^", (int)lroundf(domani.tmax));
-    dmTextCentered(g, LCD_W / 2, 218, buf, 11, 8, COL_ACCESO);
+    testoCentrato(g, 218, buf, 11, 8, COL_ACCESO);
 
     snprintf(buf, sizeof(buf), "MIN %d^", (int)lroundf(domani.tmin));
-    dmTextCentered(g, LCD_W / 2, 300, buf, 4, 3, COL_SECONDARIO);
+    testoCentrato(g, 300, buf, 4, 3, COL_SECONDARIO);
 
-    dmTextCentered(g, LCD_W / 2, 344, descrizionePerCodice(domani.codice), 3, 2, COL_ETICHETTA, 2);
+    testoCentrato(g, 344, descrizionePerCodice(domani.codice), 3, 2, COL_ETICHETTA, 2);
 
     // La probabilita' di pioggia come barra di punti.
     const int totale = 20;
@@ -1237,7 +1460,7 @@ static void disegnaMeteo(Arduino_GFX *g)
         dmDot(g, x0 + i * passo, 386, 5, i < accesi ? COL_ROSSO : COL_SPENTO);
 
     snprintf(buf, sizeof(buf), "%d%% PIOGGIA", domani.pioggia);
-    dmTextCentered(g, LCD_W / 2, 402, buf, 2, 2, COL_ETICHETTA, 2);
+    testoCentrato(g, 402, buf, 2, 2, COL_ETICHETTA, 2);
 }
 
 // ------------------------------------------------------------
@@ -1249,10 +1472,300 @@ static void disegnaMeteo(Arduino_GFX *g)
 //  giorno rigeneri il logo piu' fitto o piu' rado si adatta da solo
 //  allo spazio che ha.
 
+// ------------------------------------------------------------
+//  IL LOGO CHE SI SFALDA
+// ------------------------------------------------------------
+//  Tocca il logo e i suoi punti smettono di essere un disegno:
+//  diventano oggetti con una massa, che cadono da dove si trovano
+//  e si accumulano sul fondo. Inclinando la board scivolano, e
+//  siccome sono tanti e si spingono a vicenda si comportano come
+//  un liquido invece che come palline separate.
+//
+//  Non c'e' niente di simulato in senso stretto: ogni punto ha
+//  una posizione e una velocita', la gravita' cambia la velocita'
+//  e la velocita' cambia la posizione. Il comportamento da liquido
+//  non e' programmato da nessuna parte - esce da solo dal fatto che
+//  due punti non possono stare nello stesso posto.
+
+#if HA_LOGO
+
+#define MAX_PARTICELLE 340
+// Il raggio con cui i punti si fanno spazio a vicenda: uguale a
+// quello con cui sono disegnati. Farlo piu' largo alzava il mucchio,
+// ma faceva sembrare che i punti crescessero nel momento in cui li
+// tocchi - e un pezzo di logo che cade deve restare lo stesso
+// pezzo di logo.
+#define PART_RAGGIO 4.0f
+#define GRAVITA 2000.0f      // pixel al secondo quadrato, con la board in verticale
+#define ATTRITO 0.992f
+#define RIMBALZO 0.35f
+#define RIPOSO 7.0f          // sotto questa velocita' un punto e' fermo
+
+// Come si mappa il sensore sullo schermo. Girare un segno specchia
+// quella direzione.
+#define SEGNO_ORIZZONTALE (-1.0f)
+#define SEGNO_VERTICALE (+1.0f)
+
+// I bordi della vasca: dentro la cornice, non contro il vetro.
+#define VASCA_SX 26
+#define VASCA_DX (LCD_W - 26)
+#define VASCA_ALTO 26
+#define VASCA_BASSO (LCD_H - 26)
+
+struct Particella
+{
+    float x, y, vx, vy;
+};
+
+// La griglia che evita i confronti inutili. Le caselle sono larghe
+// quanto il raggio d'azione di un punto: piu' piccole e servirebbe
+// guardare piu' lontano, piu' grandi e ogni casella ne conterrebbe
+// troppi.
+#define CELLA 16
+#define GRIGLIA_W ((VASCA_DX - VASCA_SX) / CELLA + 2)
+#define GRIGLIA_H ((VASCA_BASSO - VASCA_ALTO) / CELLA + 2)
+#define PER_CELLA 12
+
+static uint8_t cellaQuante[GRIGLIA_W * GRIGLIA_H];
+static uint16_t cellaChi[GRIGLIA_W * GRIGLIA_H][PER_CELLA];
+
+static Particella particelle[MAX_PARTICELLE];
+static int nParticelle = 0;
+static bool fisicaAttiva = false;
+static uint32_t fisicaUltimo = 0;
+
+// Dove stanno i punti del logo quando e' fermo. Serve sia a
+// disegnarlo sia a sapere da dove far partire i pezzi.
+static void logoGeometria(int16_t &passo, int16_t &diam, int16_t &x0, int16_t &y0)
+{
+    const int16_t spazioX = LCD_W - 80;
+    const int16_t spazioY = 300;
+
+    passo = spazioX / LOGO_LARGHEZZA;
+    int16_t passoY = spazioY / LOGO_ALTEZZA;
+    if (passoY < passo) passo = passoY;
+    if (passo < 2) passo = 2;
+
+    diam = (passo * 8) / 10;
+    if (diam < 2) diam = 2;
+
+    x0 = (LCD_W - LOGO_LARGHEZZA * passo) / 2 + passo / 2;
+    y0 = 96 + (spazioY - LOGO_ALTEZZA * passo) / 2;
+}
+
+static void fisicaAvvia()
+{
+    int16_t passo, diam, x0, y0;
+    logoGeometria(passo, diam, x0, y0);
+
+    nParticelle = 0;
+
+    for (int r = 0; r < LOGO_ALTEZZA && nParticelle < MAX_PARTICELLE; ++r)
+        for (int c = 0; c < LOGO_LARGHEZZA && nParticelle < MAX_PARTICELLE; ++c)
+            if (LOGO[r][c] == '#')
+            {
+                particelle[nParticelle].x = x0 + c * passo;
+                particelle[nParticelle].y = y0 + r * passo;
+                particelle[nParticelle].vx = 0;
+                particelle[nParticelle].vy = 0;
+                ++nParticelle;
+            }
+
+#if LOGO_CERCHIO
+    const int16_t cx = x0 + ((LOGO_LARGHEZZA - 1) * passo) / 2;
+    const int16_t cy = y0 + ((LOGO_ALTEZZA - 1) * passo) / 2;
+    const int16_t raggio = ((LOGO_LARGHEZZA - 1) * passo) / 2;
+    int quanti = (int)(2.0f * (float)M_PI * raggio / passo);
+
+    for (int i = 0; i < quanti && nParticelle < MAX_PARTICELLE; ++i)
+    {
+        float a = 2.0f * (float)M_PI * i / quanti;
+        particelle[nParticelle].x = cx + cosf(a) * raggio;
+        particelle[nParticelle].y = cy + sinf(a) * raggio;
+        particelle[nParticelle].vx = 0;
+        particelle[nParticelle].vy = 0;
+        ++nParticelle;
+    }
+#endif
+
+    fisicaAttiva = true;
+    fisicaUltimo = millis();
+    Serial.printf("[fisica] %d punti in caduta\n", nParticelle);
+}
+
+static void fisicaPasso()
+{
+    uint32_t adesso = millis();
+    float dt = (adesso - fisicaUltimo) / 1000.0f;
+    fisicaUltimo = adesso;
+
+    // Un fotogramma lungo - per esempio dopo una pausa - farebbe
+    // attraversare i muri a tutto quanto. Meglio rallentare il tempo
+    // che far esplodere la scena.
+    if (dt > 0.033f) dt = 0.033f;
+    if (dt <= 0) return;
+
+    float ax = 0, ay = 0, az = 0;
+    imuLeggi(&ax, &ay, &az);
+
+    // Il sensore e' montato girato di un quarto rispetto allo
+    // schermo: quello che per lui e' l'asse X, per chi guarda e'
+    // l'alto-basso. La livella non lo faceva vedere perche' si usa
+    // appoggiata in piano, dove nessuno dei due assi domina.
+    //
+    // Se un giorno la direzione risultasse specchiata, sono questi
+    // due segni da girare e nient'altro.
+    float gx = SEGNO_ORIZZONTALE * ay * GRAVITA;
+    float gy = SEGNO_VERTICALE * ax * GRAVITA;
+
+    // Un occhio ai numeri grezzi, una volta al secondo: se la
+    // direzione non torna, e' da qui che si capisce quale asse sta
+    // facendo cosa.
+    static uint32_t ultimoLog = 0;
+    static int fotogrammi = 0;
+    ++fotogrammi;
+    if (adesso - ultimoLog > 1000)
+    {
+        Serial.printf("[fisica] %d punti, %d al secondo, ax %+.2f ay %+.2f az %+.2f\n",
+                      nParticelle, fotogrammi, ax, ay, az);
+        ultimoLog = adesso;
+        fotogrammi = 0;
+    }
+
+    for (int i = 0; i < nParticelle; ++i)
+    {
+        Particella &p = particelle[i];
+        p.vx = (p.vx + gx * dt) * ATTRITO;
+        p.vy = (p.vy + gy * dt) * ATTRITO;
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+
+        if (p.x < VASCA_SX + PART_RAGGIO) { p.x = VASCA_SX + PART_RAGGIO; p.vx = -p.vx * RIMBALZO; }
+        if (p.x > VASCA_DX - PART_RAGGIO) { p.x = VASCA_DX - PART_RAGGIO; p.vx = -p.vx * RIMBALZO; }
+        if (p.y < VASCA_ALTO + PART_RAGGIO) { p.y = VASCA_ALTO + PART_RAGGIO; p.vy = -p.vy * RIMBALZO; }
+        if (p.y > VASCA_BASSO - PART_RAGGIO) { p.y = VASCA_BASSO - PART_RAGGIO; p.vy = -p.vy * RIMBALZO; }
+
+        // Sotto una certa lentezza un punto e' fermo, e insistere a
+        // muoverlo di frazioni di pixel produce solo tremolio. Un
+        // oggetto vero, appoggiato, sta appoggiato.
+        if (fabsf(p.vx) < RIPOSO && fabsf(p.vy) < RIPOSO)
+        {
+            p.vx = 0;
+            p.vy = 0;
+        }
+    }
+
+    // Due punti non possono stare nello stesso posto: quando si
+    // sovrappongono si spingono via a meta' strada l'uno dell'altro.
+    // E' tutta la "fisica del liquido" che c'e' qui dentro - il resto
+    // e' una conseguenza.
+    //
+    // Confrontare ogni punto con ogni altro sarebbero cinquantamila
+    // coppie a fotogramma, e la stragrande maggioranza fra punti che
+    // stanno ai due capi opposti dello schermo. Invece si divide
+    // l'area in caselle grandi quanto il raggio d'azione: due punti
+    // possono toccarsi solo se stanno nella stessa casella o in una
+    // delle otto accanto, e tutte le altre coppie non vengono
+    // nemmeno guardate.
+    const float minimo = PART_RAGGIO * 2.0f;
+    const float minimo2 = minimo * minimo;
+
+    memset(cellaQuante, 0, sizeof(cellaQuante));
+
+    for (int i = 0; i < nParticelle; ++i)
+    {
+        int cx = (int)((particelle[i].x - VASCA_SX) / CELLA);
+        int cy = (int)((particelle[i].y - VASCA_ALTO) / CELLA);
+        if (cx < 0) cx = 0; else if (cx >= GRIGLIA_W) cx = GRIGLIA_W - 1;
+        if (cy < 0) cy = 0; else if (cy >= GRIGLIA_H) cy = GRIGLIA_H - 1;
+
+        int k = cy * GRIGLIA_W + cx;
+        if (cellaQuante[k] < PER_CELLA)
+            cellaChi[k][cellaQuante[k]++] = i;
+    }
+
+    for (int cy = 0; cy < GRIGLIA_H; ++cy)
+        for (int cx = 0; cx < GRIGLIA_W; ++cx)
+        {
+            int k = cy * GRIGLIA_W + cx;
+            for (int a = 0; a < cellaQuante[k]; ++a)
+            {
+                int i = cellaChi[k][a];
+
+                for (int dy = 0; dy <= 1; ++dy)
+                    for (int dx = (dy == 0 ? 0 : -1); dx <= 1; ++dx)
+                    {
+                        int nx2 = cx + dx, ny2 = cy + dy;
+                        if (nx2 < 0 || nx2 >= GRIGLIA_W || ny2 >= GRIGLIA_H) continue;
+
+                        int k2 = ny2 * GRIGLIA_W + nx2;
+                        for (int b = (k2 == k ? a + 1 : 0); b < cellaQuante[k2]; ++b)
+                        {
+                            int j = cellaChi[k2][b];
+
+                            float ddx = particelle[j].x - particelle[i].x;
+                            float ddy = particelle[j].y - particelle[i].y;
+                            float d2 = ddx * ddx + ddy * ddy;
+                            if (d2 >= minimo2 || d2 < 0.0001f) continue;
+
+                            float d = sqrtf(d2);
+                            float spinta = (minimo - d) * 0.5f;
+                            float nnx = ddx / d, nny = ddy / d;
+
+                            particelle[i].x -= nnx * spinta;
+                            particelle[i].y -= nny * spinta;
+                            particelle[j].x += nnx * spinta;
+                            particelle[j].y += nny * spinta;
+
+                            // Separare le posizioni non basta: se la
+                            // velocita' resta quella di prima, al
+                            // fotogramma dopo i due si rientrano
+                            // dentro e vengono rispinti fuori, e cosi'
+                            // via - ed e' quel rimbalzo continuo che
+                            // si vede come un friggere. Qui si toglie
+                            // la parte di velocita' con cui si stanno
+                            // andando addosso, lasciando intatta
+                            // quella con cui scivolano di fianco.
+                            float vrel = (particelle[j].vx - particelle[i].vx) * nnx +
+                                         (particelle[j].vy - particelle[i].vy) * nny;
+                            if (vrel < 0)
+                            {
+                                float togli = vrel * 0.5f;
+                                particelle[i].vx += nnx * togli;
+                                particelle[i].vy += nny * togli;
+                                particelle[j].vx -= nnx * togli;
+                                particelle[j].vy -= nny * togli;
+                            }
+                        }
+                    }
+            }
+        }
+}
+
+#endif // HA_LOGO
+
 #if HA_LOGO
 static void disegnaLogo(Arduino_GFX *g)
 {
     telaio(g, LOGO_ETICHETTA);
+
+    if (fisicaAttiva)
+    {
+        // Stesso diametro dei punti del logo fermo, preso dalla
+        // stessa funzione che lo disegna. Disegnarli anche solo due
+        // pixel piu' grossi faceva sembrare che si accendessero nel
+        // momento del tocco.
+        int16_t passoL, diamL, xL, yL;
+        logoGeometria(passoL, diamL, xL, yL);
+
+        for (int i = 0; i < nParticelle; ++i)
+            dmDot(g, (int16_t)particelle[i].x, (int16_t)particelle[i].y, diamL, LOGO_COLORE);
+
+        testoCentrato(g, LCD_H - 62, "INCLINA LA BOARD", 2, 2, COL_ETICHETTA, 2);
+        if (schedaCorrente == SCHEDA_LOGO)
+            numeriInMovimento = true;
+        return;
+    }
 
     const int16_t spazioX = LCD_W - 80;
     const int16_t spazioY = 300;
@@ -1295,7 +1808,9 @@ static void disegnaLogo(Arduino_GFX *g)
 #endif
 
     if (strlen(LOGO_SOTTOTITOLO) > 0)
-        dmTextCentered(g, LCD_W / 2, 402, LOGO_SOTTOTITOLO, 3, 2, COL_ETICHETTA, 2);
+        testoCentrato(g, 402, LOGO_SOTTOTITOLO, 3, 2, COL_ETICHETTA, 2);
+    else
+        testoCentrato(g, 402, "TOCCA", 2, 2, COL_ETICHETTA, 2);
 }
 #endif
 
@@ -1303,11 +1818,15 @@ static void disegnaLogo(Arduino_GFX *g)
 //  SCHEDA 4: IL BAROMETRO
 // ------------------------------------------------------------
 
-#define BARO_X 46
-#define BARO_LARGO 276
+#define BARO_X PADDING
+#define BARO_LARGO (LCD_W - 2 * PADDING)
 #define BARO_ALTO 104
 #define BARO_BASSO 214
-#define BARO_PUNTI 47
+// Un punto per ogni ora, con lo stesso passo e la stessa grandezza
+// dei punti dell'arco del Sole. E' una regola del progetto: i
+// quadranti parlano tutti la stessa lingua, altrimenti ogni scheda
+// sembra disegnata da una persona diversa.
+#define BARO_PUNTI TACCHE_MINUTO
 
 static void disegnaBaro(Arduino_GFX *g)
 {
@@ -1315,9 +1834,9 @@ static void disegnaBaro(Arduino_GFX *g)
 
     if (!baro.valido)
     {
-        dmTextCentered(g, LCD_W / 2, 190, "NO LINK", 8, 6, COL_SPENTO);
+        testoCentrato(g, 190, "NO LINK", 8, 6, COL_SPENTO);
         const char *motivo = retePresente ? "SERVER NON RAGGIUNGIBILE" : "NESSUNA RETE WIFI";
-        dmTextCentered(g, LCD_W / 2, 260, motivo, 3, 2, COL_ETICHETTA, 2);
+        testoCentrato(g, 260, motivo, 3, 2, COL_ETICHETTA, 2);
         return;
     }
 
@@ -1354,7 +1873,7 @@ static void disegnaBaro(Arduino_GFX *g)
         }
     }
 
-    const int16_t passo = BARO_LARGO / (BARO_PUNTI - 1);
+    const int16_t passo = PASSO_QUADRANTE;
     int fino = (int)lroundf(quanto * BARO_PUNTI);
 
     for (int i = 0; i < fino && i < BARO_PUNTI; ++i)
@@ -1376,19 +1895,9 @@ static void disegnaBaro(Arduino_GFX *g)
         int16_t py = BARO_BASSO - (int16_t)lroundf(alto * (BARO_BASSO - BARO_ALTO));
 
         if (i == BARO_PUNTI - 1)
-        {
-            // Adesso: un anello, non un punto piu' grosso. Ingrossare
-            // il punto lo avrebbe fatto sembrare solo un valore piu'
-            // importante; un cerchio intorno dice "sei qui", che e'
-            // un'altra cosa.
-            dmRing(g, px, py, 9, 11, 0.0f, 360.0f * 10.0f / 11.0f, 11, 3,
-                   COL_ROSSO, COL_ROSSO);
-            dmDot(g, px, py, 5, COL_ROSSO);
-        }
+            dmMarcatore(g, px, py, 8, 5, COL_ROSSO);
         else
-        {
-            dmDot(g, px, py, 4, COL_SECONDARIO);
-        }
+            dmDot(g, px, py, 5, COL_SECONDARIO);
     }
 
     // Il valore di adesso.
@@ -1408,9 +1917,9 @@ static void disegnaBaro(Arduino_GFX *g)
     else if (delta < -1.0f) { tendenza = "IN CALO";    significa = "TEMPO IN PEGGIORAMENTO"; }
     else                    { tendenza = "STABILE";    significa = "NESSUN CAMBIAMENTO"; }
 
-    dmTextCentered(g, LCD_W / 2, 314, tendenza, 4, 3,
+    testoCentrato(g, 314, tendenza, 4, 3,
                    delta < -1.0f ? COL_ROSSO : COL_ACCESO);
-    dmTextCentered(g, LCD_W / 2, 348, significa, 2, 2, COL_ETICHETTA, 2);
+    testoCentrato(g, 348, significa, 2, 2, COL_ETICHETTA, 2);
 
     // I due estremi della giornata, ai lati.
     dmText(g, PADDING, 380, "MIN", 2, 2, COL_ETICHETTA, 2);
@@ -1422,6 +1931,178 @@ static void disegnaBaro(Arduino_GFX *g)
     int16_t wv = dmTextWidth(buf, 3, 1);
     dmText(g, LCD_W - PADDING - wv - w - 10, 380, "MAX", 2, 2, COL_ETICHETTA, 2);
     dmText(g, LCD_W - PADDING - wv, 378, buf, 3, 3, COL_SECONDARIO);
+}
+
+// ------------------------------------------------------------
+//  SCHEDA 5: LA QUALITA' DELL'ARIA
+// ------------------------------------------------------------
+//  Un contenitore con dentro delle bollicine: quante sono dipende
+//  da quanto e' sporca l'aria. Un numero da solo non dice se 23 sia
+//  tanto o poco, mentre un bicchiere quasi vuoto o pieno di
+//  particelle si capisce senza sapere cosa sia un microgrammo.
+
+// Due colonne di larghezza uguale con un corridoio in mezzo: il
+// bicchiere a sinistra, i numeri a destra allineati fra loro.
+#define ARIA_CORRIDOIO 24
+#define ARIA_COLONNA ((LCD_W - 2 * PADDING - ARIA_CORRIDOIO) / 2)
+#define ARIA_SX PADDING
+#define ARIA_DX (PADDING + ARIA_COLONNA)
+#define ARIA_TESTO (ARIA_DX + ARIA_CORRIDOIO)
+#define ARIA_ALTO 96
+#define ARIA_BASSO 382
+
+static const char *qualitaAria(int i)
+{
+    if (i <= 20) return "BUONA";
+    if (i <= 40) return "DISCRETA";
+    if (i <= 60) return "MEDIA";
+    if (i <= 80) return "SCARSA";
+    if (i <= 100) return "CATTIVA";
+    return "PESSIMA";
+}
+
+static void disegnaAria(Arduino_GFX *g)
+{
+    telaio(g, "ARIA");
+
+    if (!aria.valido)
+    {
+        testoCentrato(g, 190, "NO LINK", 8, 6, COL_SPENTO);
+        const char *motivo = retePresente ? "SERVER NON RAGGIUNGIBILE" : "NESSUNA RETE WIFI";
+        testoCentrato(g, 260, motivo, 3, 2, COL_ETICHETTA, 2);
+        return;
+    }
+
+    // Il contenitore: aperto in alto, come un bicchiere.
+    const int16_t passo = 8;
+    for (int16_t y = ARIA_ALTO; y <= ARIA_BASSO; y += passo)
+    {
+        dmDot(g, ARIA_SX, y, 4, COL_ACCESO);
+        dmDot(g, ARIA_DX, y, 4, COL_ACCESO);
+    }
+    for (int16_t x = ARIA_SX; x <= ARIA_DX; x += passo)
+        dmDot(g, x, ARIA_BASSO, 4, COL_ACCESO);
+
+    // Quante bollicine. Aria pulita: quattro che salgono piano. Aria
+    // pessima: il contenitore ne e' pieno.
+    int quante = 4 + (aria.indice * 26) / 100;
+    if (quante > 30) quante = 30;
+
+    float quanto = 1.0f;
+    if (bolleArmate)
+    {
+        quanto = 0.0f;
+    }
+    else if (bolleAttive)
+    {
+        uint32_t passato = millis() - bolleInizio;
+        if (passato >= BOLLE_DURATA)
+            bolleAttive = false;
+        else
+            quanto = 1.0f - powf(1.0f - (float)passato / (float)BOLLE_DURATA, 3.0f);
+    }
+
+    // Finche' sei su questa scheda le bolle si muovono: e' l'unica
+    // del gruppo che non sta mai ferma.
+    if (schedaCorrente == SCHEDA_ARIA)
+        numeriInMovimento = true;
+
+    int fino = (quanto > 0.0f) ? quante : 0;
+
+    // La corsa comincia sotto il fondo e finisce sopra il bordo: le
+    // bolle non nascono ne' muoiono a mezz'aria, entrano ed escono
+    // dal contenitore.
+    const float corsa = (ARIA_BASSO + 24) - (ARIA_ALTO - 24);
+
+    // Il tempo si conta dall'ingresso nella scheda, non
+    // dall'accensione: cosi' rientrando l'animazione riparte davvero
+    // da capo invece di riprendere dove sarebbe stata.
+    float t = (millis() - bolleInizio) / 1000.0f;
+
+    for (int i = 0; i < fino; ++i)
+    {
+        // I parametri di ogni bolla nascono da un rimescolamento dei
+        // bit del suo numero d'ordine. Moltiplicare l'indice e
+        // prendere il resto - che facevo prima - lascia una
+        // progressione, e le bolle risultavano allineate.
+        uint32_t seme = mescola(i * 2654435761U + 12345U);
+
+        // La velocita' varia poco fra una bolla e l'altra. Con
+        // intervalli ampi si desincronizzano in fretta e finiscono
+        // per ammucchiarsi tutte nello stesso tratto: piu' casuale
+        // sulla carta, peggiore a vedersi.
+        float velocita = 24.0f + (float)(seme % 22);
+        float ondaAmp = 4.0f + (float)((seme >> 18) % 8);
+        float ondaVel = 1.2f + (float)((seme >> 24) % 20) / 10.0f;
+
+        // Le bolle non partono da altezze diverse: partono tutte dal
+        // fondo, ma in momenti diversi. Sfasare la posizione le
+        // teneva staccate, pero' entrando nella scheda ne trovavi
+        // gia' meta' a mezz'aria - e una bolla che era gia' li'
+        // prima che tu arrivassi non e' una bolla.
+        //
+        // Lo sfasamento e' su un paio di secondi: piu' lungo e
+        // l'ultima entrerebbe dopo dieci, piu' corto e uscirebbero
+        // tutte in blocco. A distanziarle da li' in poi ci pensano
+        // le velocita' diverse.
+        float scarto = (float)((seme >> 8) % 100) / 100.0f;
+        float ritardo = ((float)i + 0.6f * scarto) / (float)quante;
+        float partenza = ritardo * 2.2f;
+
+        if (t < partenza) continue;
+
+        float percorso = (t - partenza) * velocita;
+        float y = (ARIA_BASSO + 24) - fmodf(percorso, corsa);
+
+        // A ogni risalita riparte da una colonna diversa: con la
+        // colonna fissa per sempre ripassava sempre nello stesso
+        // punto, e la scia si leggeva come una riga verticale.
+        uint32_t giro = (uint32_t)(percorso / corsa);
+        uint32_t semeGiro = mescola(seme + giro * 7919U);
+
+        // Le bolle vere non salgono dritte: la scia che si lasciano
+        // dietro le fa oscillare da un lato all'altro.
+        float onda = sinf(t * ondaVel + ritardo * 6.28f) * ondaAmp;
+
+        const int16_t utile = ARIA_DX - ARIA_SX - 40;
+        int16_t x = ARIA_SX + 20 + (int16_t)(semeGiro % utile) + (int16_t)onda;
+
+        // Un disco di nero pieno dietro ogni bolla, largo abbastanza
+        // da coprirla tutta e un po' oltre. Disegnandolo bolla per
+        // bolla, quella che passa dopo ritaglia un morso in quella
+        // gia' disegnata - ed e' il morso a dire quale delle due sta
+        // davanti, invece di lasciarle fondere in una macchia sola.
+        spazioTondo(g, x, (int16_t)y, 15, ARIA_BASSO - 2, ARIA_ALTO + 2);
+
+        // Della stessa materia dei marcatori degli altri quadranti:
+        // un punto centrale con sei intorno.
+        dmMarcatore(g, x, (int16_t)y, 8, 5, COL_BOLLA,
+                    ARIA_ALTO + 2, ARIA_BASSO - 2);
+    }
+
+    char buf[16];
+
+    // La colonna di destra: tutto incolonnato sullo stesso bordo, che
+    // e' quello che rende leggibile un elenco di dati diversi.
+    snprintf(buf, sizeof(buf), "%d", aria.indice);
+    if (dmRullo(g, rulloAria, buf, ARIA_TESTO, 100, 10, 7, COL_ACCESO))
+        numeriInMovimento = true;
+
+    testoInColonna(g, ARIA_TESTO, 186, "INDICE", 2, 2, COL_ETICHETTA, 2, ARIA_COLONNA);
+    testoInColonna(g, ARIA_TESTO, 204, "EUROPEO", 2, 2, COL_ETICHETTA, 2, ARIA_COLONNA);
+
+    testoInColonna(g, ARIA_TESTO, 244, qualitaAria(aria.indice), 4, 3,
+                   aria.indice > 60 ? COL_ROSSO : COL_ACCESO, 1, ARIA_COLONNA);
+
+    // Le due polveri sottili. Il numero grande le riassume insieme ad
+    // altri tre inquinanti, ma sono queste che trovi sui bollettini.
+    dmText(g, ARIA_TESTO, 300, "PM2.5", 2, 2, COL_ETICHETTA, 2);
+    snprintf(buf, sizeof(buf), "%d", (int)lroundf(aria.pm25));
+    dmText(g, ARIA_TESTO, 318, buf, 3, 3, COL_SECONDARIO);
+
+    dmText(g, ARIA_TESTO, 348, "PM10", 2, 2, COL_ETICHETTA, 2);
+    snprintf(buf, sizeof(buf), "%d", (int)lroundf(aria.pm10));
+    dmText(g, ARIA_TESTO, 366, buf, 3, 3, COL_SECONDARIO);
 }
 
 // ------------------------------------------------------------
@@ -1445,6 +2126,7 @@ static void ridisegna(int i)
     case SCHEDA_SOLE:  disegnaSole(scheda[i], t); break;
     case SCHEDA_METEO: disegnaMeteo(scheda[i]);   break;
     case SCHEDA_BARO:  disegnaBaro(scheda[i]);   break;
+    case SCHEDA_ARIA:  disegnaAria(scheda[i]);   break;
 #if HA_LOGO
     case SCHEDA_LOGO:  disegnaLogo(scheda[i]);    break;
 #endif
@@ -1492,7 +2174,7 @@ static void disegnaPallini(Arduino_GFX *g, float posizione, float opacita)
 // ------------------------------------------------------------
 
 #define LISTA_ALTO 110
-#define LISTA_BASSO 372
+#define LISTA_BASSO (LCD_H - PADDING - 56)
 #define LISTA_RIGA 66
 
 // L'interruttore, disegnato a punti come tutto il resto: una
@@ -1529,13 +2211,13 @@ static void disegnaLista(Arduino_GFX *g)
 {
     telaio(g, "SVEGLIE");
 
-    disegnaGriglia(g, LCD_W - PADDING - 4, PADDING + 8, ICO_CHIUDI,
+    disegnaGriglia(g, LCD_W - PADDING - MEZZA_ICONA, PADDING + 8, ICO_CHIUDI,
                    ICONA_COMANDO, 4, 3, COL_SECONDARIO);
 
     if (nSveglie == 0)
     {
-        dmTextCentered(g, LCD_W / 2, 200, "NESSUNA SVEGLIA", 4, 3, COL_SPENTO);
-        dmTextCentered(g, LCD_W / 2, 240, "TOCCA IL PIU PER AGGIUNGERE", 2, 2,
+        testoCentrato(g, 200, "NESSUNA SVEGLIA", 4, 3, COL_SPENTO);
+        testoCentrato(g, 240, "TOCCA IL PIU PER AGGIUNGERE", 2, 2,
                        COL_ETICHETTA, 2);
     }
 
@@ -1559,7 +2241,7 @@ static void disegnaLista(Arduino_GFX *g)
 
     // Il piu', in fondo al centro.
     if (nSveglie < MAX_SVEGLIE)
-        disegnaGriglia(g, LCD_W / 2, 404, ICO_PIU, ICONA_COMANDO, 5, 4, COL_SECONDARIO);
+        disegnaGriglia(g, LCD_W / 2, LCD_H - PADDING - 24, ICO_PIU, ICONA_COMANDO, 5, 4, COL_SECONDARIO);
 }
 
 // ------------------------------------------------------------
@@ -1575,7 +2257,7 @@ static void disegnaEditor(Arduino_GFX *g)
 {
     telaio(g, editorIndice < 0 ? "NUOVA SVEGLIA" : "MODIFICA");
 
-    disegnaGriglia(g, LCD_W - PADDING - 4, PADDING + 8, ICO_CHIUDI,
+    disegnaGriglia(g, LCD_W - PADDING - MEZZA_ICONA, PADDING + 8, ICO_CHIUDI,
                    ICONA_COMANDO, 4, 3, COL_SECONDARIO);
 
     // Il campo scelto lampeggia. Non e' decorazione: e' il modo in
@@ -1600,7 +2282,7 @@ static void disegnaEditor(Arduino_GFX *g)
                 colMin, 1, 380, 70, anima))
         vistaDaRidisegnare = true;
 
-    dmTextCentered(g, LCD_W / 2, 236, editorCampo == 0 ? "ORE" : "MINUTI",
+    testoCentrato(g, 236, editorCampo == 0 ? "ORE" : "MINUTI",
                    2, 2, COL_ETICHETTA, 2);
 
     // Meno e piu'.
@@ -1608,9 +2290,10 @@ static void disegnaEditor(Arduino_GFX *g)
     disegnaGriglia(g, LCD_W - 90, 290, ICO_PIU, ICONA_COMANDO, 6, 5, COL_ACCESO);
 
     // Salva, e se stai modificando anche elimina.
-    disegnaGriglia(g, LCD_W / 2, 384, ICO_SPUNTA, ICONA_COMANDO, 6, 5, COL_ROSSO);
+    disegnaGriglia(g, LCD_W / 2, LCD_H - PADDING - 28, ICO_SPUNTA, ICONA_COMANDO, 6, 5, COL_ROSSO);
     if (editorIndice >= 0)
-        disegnaGriglia(g, PADDING + 10, 384, ICO_CESTINO, ICONA_COMANDO, 4, 3, COL_SPENTO);
+        disegnaGriglia(g, PADDING + MEZZA_ICONA, LCD_H - PADDING - 28, ICO_CESTINO,
+                       ICONA_COMANDO, 4, 3, COL_SPENTO);
 }
 
 // ------------------------------------------------------------
@@ -1628,10 +2311,10 @@ static void disegnaAllarme(Arduino_GFX *g, const struct tm &t)
 
     char buf[8];
     snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
-    dmTextCentered(g, LCD_W / 2, 200, buf, 10, 7, acceso ? COL_ACCESO : COL_SPENTO);
+    testoCentrato(g, 200, buf, 10, 7, acceso ? COL_ACCESO : COL_SPENTO);
 
-    dmTextCentered(g, LCD_W / 2, 300, "SVEGLIA", 4, 3, COL_ROSSO);
-    dmTextCentered(g, LCD_W / 2, 370, "TOCCA PER SPEGNERE", 2, 2, COL_ETICHETTA, 2);
+    testoCentrato(g, 300, "SVEGLIA", 4, 3, COL_ROSSO);
+    testoCentrato(g, 370, "TOCCA PER SPEGNERE", 2, 2, COL_ETICHETTA, 2);
 }
 
 // ------------------------------------------------------------
@@ -1672,6 +2355,29 @@ static void riarmaAnimazioni(int i)
         tracciaArmata = true;
         daRidisegnare[SCHEDA_BARO] = true;
     }
+    else if (i == SCHEDA_METEO)
+    {
+        iconaAttiva = false;
+        iconaArmata = true;
+        daRidisegnare[SCHEDA_METEO] = true;
+    }
+    else if (i == SCHEDA_ARIA)
+    {
+        bolleAttive = false;
+        bolleArmate = true;
+        daRidisegnare[SCHEDA_ARIA] = true;
+    }
+#if HA_LOGO
+    else if (i == SCHEDA_LOGO && fisicaAttiva)
+    {
+        // Il logo si ricompone da solo appena esci di scena. Ritrovare
+        // il mucchio di punti dove l'avevi lasciato sarebbe stato
+        // divertente una volta e fastidioso tutte le altre: quella
+        // scheda deve essere prima di tutto il logo.
+        fisicaAttiva = false;
+        daRidisegnare[SCHEDA_LOGO] = true;
+    }
+#endif
 }
 
 // Chiamata quando una scheda diventa quella in vista: se ha
@@ -1691,6 +2397,20 @@ static void avviaAnimazioniIngresso()
         tracciaAttiva = true;
         tracciaInizio = millis();
         ridisegna(SCHEDA_BARO);
+    }
+    else if (schedaCorrente == SCHEDA_METEO && iconaArmata)
+    {
+        iconaArmata = false;
+        iconaAttiva = true;
+        iconaInizio = millis();
+        ridisegna(SCHEDA_METEO);
+    }
+    else if (schedaCorrente == SCHEDA_ARIA && bolleArmate)
+    {
+        bolleArmate = false;
+        bolleAttive = true;
+        bolleInizio = millis();
+        ridisegna(SCHEDA_ARIA);
     }
 }
 
@@ -1840,6 +2560,15 @@ static void apriEditor(int indice)
 // Il tocco secco sulla barra in fondo alla scheda dell'ora.
 static void tapNelleSchede()
 {
+#if HA_LOGO
+    if (schedaCorrente == SCHEDA_LOGO && !fisicaAttiva)
+    {
+        fisicaAvvia();
+        daRidisegnare[SCHEDA_LOGO] = true;
+        return;
+    }
+#endif
+
     if (schedaCorrente != SCHEDA_ORA) return;
 
     if (dentro(tapX, tapY, BARRA_SX, BARRA_Y, BERSAGLIO))
@@ -1865,7 +2594,7 @@ static void modificaCampo(int verso)
 
 static void tapNellEditor()
 {
-    if (dentro(tapX, tapY, LCD_W - PADDING - 4, PADDING + 8, BERSAGLIO))
+    if (dentro(tapX, tapY, LCD_W - PADDING - MEZZA_ICONA, PADDING + 8, BERSAGLIO))
     {
         apriLista();   // annulla e torna all'elenco
         return;
@@ -1884,7 +2613,7 @@ static void tapNellEditor()
     if (dentro(tapX, tapY, 90, 290, BERSAGLIO)) { modificaCampo(-1); return; }
     if (dentro(tapX, tapY, LCD_W - 90, 290, BERSAGLIO)) { modificaCampo(+1); return; }
 
-    if (dentro(tapX, tapY, LCD_W / 2, 384, BERSAGLIO))
+    if (dentro(tapX, tapY, LCD_W / 2, LCD_H - PADDING - 28, BERSAGLIO))
     {
         if (editorIndice >= 0)
         {
@@ -1902,7 +2631,7 @@ static void tapNellEditor()
         return;
     }
 
-    if (editorIndice >= 0 && dentro(tapX, tapY, PADDING + 10, 384, BERSAGLIO))
+    if (editorIndice >= 0 && dentro(tapX, tapY, PADDING + MEZZA_ICONA, LCD_H - PADDING - 28, BERSAGLIO))
     {
         sveglieRimuovi(editorIndice);
         daRidisegnare[SCHEDA_ORA] = true;
@@ -1912,7 +2641,7 @@ static void tapNellEditor()
 
 static void tapNellaLista()
 {
-    if (dentro(tapX, tapY, LCD_W - PADDING - 4, PADDING + 8, BERSAGLIO))
+    if (dentro(tapX, tapY, LCD_W - PADDING - MEZZA_ICONA, PADDING + 8, BERSAGLIO))
     {
         vista = VISTA_SCHEDE;
         daRidisegnare[SCHEDA_ORA] = true;
@@ -1920,7 +2649,7 @@ static void tapNellaLista()
         return;
     }
 
-    if (nSveglie < MAX_SVEGLIE && dentro(tapX, tapY, LCD_W / 2, 404, BERSAGLIO))
+    if (nSveglie < MAX_SVEGLIE && dentro(tapX, tapY, LCD_W / 2, LCD_H - PADDING - 24, BERSAGLIO))
     {
         apriEditor(-1);
         return;
@@ -2016,6 +2745,7 @@ static void gestisciToccoModale()
         switch (vista)
         {
         case VISTA_ALLARME:
+            audioFerma();
             vista = VISTA_SCHEDE;
             daRidisegnare[SCHEDA_ORA] = true;
             componi();
@@ -2082,6 +2812,7 @@ static void controllaSveglie(const struct tm &t)
             panel->setBrightness(LUMINOSITA);
         }
 
+        audioAvvia();
         Serial.printf("[sveglia] scattata: %02d:%02d\n", sveglie[i].ore, sveglie[i].minuti);
         return;
     }
@@ -2285,11 +3016,14 @@ void setup()
     sveglieCarica();
     Serial.printf("[sveglie] %d salvate, %d attive\n", nSveglie, sveglieAttive());
 
+    audioBegin();
+    imuBegin();
+
     // Schermata di attesa: la rete puo' prendersi qualche secondo
     // e uno schermo nero sembrerebbe un blocco.
     comp->fillScreen(COL_SFONDO);
-    dmTextCentered(comp, LCD_W / 2, 200, "AVVIO", 8, 6, COL_ACCESO);
-    dmTextCentered(comp, LCD_W / 2, 270, "CONNESSIONE", 3, 2, COL_ETICHETTA, 2);
+    testoCentrato(comp, 200, "AVVIO", 8, 6, COL_ACCESO);
+    testoCentrato(comp, 270, "CONNESSIONE", 3, 2, COL_ETICHETTA, 2);
     comp->flush();
 
     // L'ora dell'RTC vale subito: se poi arriva quella di rete,
@@ -2313,6 +3047,7 @@ void setup()
     connettiWifi();
     sincronizzaOra();
     prossimoMeteo = millis() + (scaricaMeteo() ? 30UL * 60UL * 1000UL : 2UL * 60UL * 1000UL);
+    scaricaAria();
 
     for (int i = 0; i < N_SCHEDE; ++i)
         ridisegna(i);
@@ -2348,6 +3083,12 @@ void loop()
     // Nelle schermate della sveglia il carosello e' sospeso.
     if (vista != VISTA_SCHEDE)
     {
+        // Il suono viene prima del disegno: se il bus resta a secco
+        // si sente un buco, mentre un fotogramma in ritardo non lo
+        // nota nessuno.
+        if (vista == VISTA_ALLARME)
+            audioAggiorna();
+
         gestisciToccoModale();
 
         // Il campo scelto e la campana dell'allarme lampeggiano: si
@@ -2414,10 +3155,16 @@ void loop()
         // minuti: un buco di rete non deve lasciare la scheda vuota
         // per tutto quel tempo.
         prossimoMeteo = millis() + (scaricaMeteo() ? 30UL * 60UL * 1000UL : 2UL * 60UL * 1000UL);
+        scaricaAria();
     }
 
     // Si ridisegna solo quella che stai guardando: le altre
     // aspettano il momento in cui cominci a scorrere.
+#if HA_LOGO
+    if (fisicaAttiva && schedaCorrente == SCHEDA_LOGO)
+        fisicaPasso();
+#endif
+
     if (daRidisegnare[schedaCorrente] || numeriInMovimento)
     {
         numeriInMovimento = false;

@@ -157,6 +157,43 @@ static inline void dmDot(Arduino_GFX *g, int16_t cx, int16_t cy, int16_t diam, u
 }
 
 // ------------------------------------------------------------
+//  IL MARCATORE
+// ------------------------------------------------------------
+//  Il punto che dice "sei qui" sui quadranti: l'ora nei secondi,
+//  l'adesso sulla curva del barometro.
+//
+//  Ingrandire e basta il punto non funzionava: diventava l'unica
+//  cosa a schermo a non essere fatta di punti, e in mezzo a una
+//  matrice di led un disco liscio si legge come un corpo estraneo.
+//  Qui invece e' un punto centrale con altri sei intorno, che a
+//  distanza si legge come una macchia tonda ma da vicino resta
+//  chiaramente della stessa materia del resto.
+//
+//  Sei e non otto: sei punti equidistanti dal centro sono anche
+//  equidistanti fra loro, e il contorno viene regolare senza
+//  addensarsi negli angoli.
+
+// I due limiti servono a farlo entrare e uscire da dietro un bordo
+// invece di comparire e sparire di colpo: i punti oltre la finestra
+// semplicemente non si disegnano.
+static void dmMarcatore(Arduino_GFX *g, int16_t cx, int16_t cy,
+                        int16_t raggio, int16_t diam, uint16_t colore,
+                        int16_t finestraAlto = -32000,
+                        int16_t finestraBasso = 32000)
+{
+    if (cy >= finestraAlto && cy <= finestraBasso)
+        dmDot(g, cx, cy, diam, colore);
+
+    for (int k = 0; k < 6; ++k)
+    {
+        float a = (float)k * (float)M_PI / 3.0f;
+        int16_t py = cy + (int16_t)lroundf(sinf(a) * raggio);
+        if (py < finestraAlto || py > finestraBasso) continue;
+        dmDot(g, cx + (int16_t)lroundf(cosf(a) * raggio), py, diam, colore);
+    }
+}
+
+// ------------------------------------------------------------
 //  TESTO
 // ------------------------------------------------------------
 //  "gap" e' quante colonne vuote lasciare fra una lettera e la
