@@ -36,6 +36,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <esp_sntp.h>
 #include <math.h>
 
 #include "dotmatrix.h"
@@ -44,6 +45,7 @@
 #include "sveglia.h"
 #include "audio.h"
 #include "imu.h"
+#include "web.h"
 
 // Il logo compare come quarta scheda solo se src/logo.h esiste.
 // Lo genera scripts/logo2c.py da un'immagine qualsiasi; senza,
@@ -105,6 +107,13 @@
 #define AXP_ADDR 0x34
 
 #define LUMINOSITA 190   // 0-255
+
+// Lo specchio nel browser: metti 1 per accenderlo, 0 per spegnerlo.
+// Misurato, non rallenta il disegno - vive sull'altro core - ma
+// tiene il WiFi sveglio, e su un oggetto a batteria quello si paga.
+// Quando e' spento il codice resta tutto al suo posto: cambia solo
+// questo numero.
+#define SPECCHIO 0
 
 // Il vetro ha gli angoli molto arrotondati, piu' di quanto sembri a
 // schermo spento: una cornice troppo squadrata ci finisce sotto e si
@@ -520,6 +529,17 @@ static void connettiWifi()
         Serial.println("[wifi] non riuscita: si va avanti con l'ora dell'RTC");
 }
 
+// Il server chiama questa quando l'ora e' arrivata davvero. E'
+// l'unico segnale affidabile: chiedere "lo stato della
+// sincronizzazione" su questo core non riporta mai il
+// completamento, anche quando l'ora viene corretta eccome.
+static volatile bool ntpArrivato = false;
+
+static void ntpNotifica(struct timeval *)
+{
+    ntpArrivato = true;
+}
+
 static void sincronizzaOra()
 {
     if (!retePresente) return;
@@ -527,18 +547,27 @@ static void sincronizzaOra()
     // configTzTime fa due cose insieme: dice a che server chiedere
     // l'ora e in che fuso siamo. Da quel momento localtime() tiene
     // conto dell'ora legale da solo.
+    // La notifica va messa prima di far partire il client, o il
+    // primo aggiornamento passerebbe inosservato.
+    ntpArrivato = false;
+    sntp_set_time_sync_notification_cb(ntpNotifica);
+
     configTzTime(FUSO, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
 
+    // Aspettare che "l'ora sia plausibile" non basterebbe: una
+    // plausibile ce l'ha gia' data l'orologio interno, il controllo
+    // passerebbe subito e la risposta del server arriverebbe dopo,
+    // spostando l'ora di sorpresa. Qui si aspetta che sia arrivata.
     Serial.print("[ora] sincronizzazione");
-    uint32_t limite = millis() + 10000;
-    while (time(nullptr) < 1700000000 && millis() < limite)
+    uint32_t limite = millis() + 12000;
+    while (!ntpArrivato && millis() < limite)
     {
         delay(250);
         Serial.print(".");
     }
     Serial.println();
 
-    oraSincronizzata = (time(nullptr) >= 1700000000);
+    oraSincronizzata = ntpArrivato && (time(nullptr) >= 1700000000);
     if (oraSincronizzata)
     {
         time_t adesso = time(nullptr);
@@ -1059,6 +1088,21 @@ static void spazioTondo(Arduino_GFX *g, int16_t cx, int16_t cy,
     }
 }
 
+// Il marcatore con il suo vuoto intorno. Sono sempre andati insieme:
+// senza il disco di nero sotto, i punti del quadrante spuntano da
+// dentro il marcatore e si vede un pallino bianco affiorare da sotto
+// quello rosso. Tenerli in una funzione sola vuol dire che nessun
+// quadrante puo' dimenticarsi il secondo pezzo.
+#define ALONE 14
+
+static void marcatoreConAlone(Arduino_GFX *g, int16_t cx, int16_t cy,
+                              uint16_t colore,
+                              int16_t alto = -32000, int16_t basso = 32000)
+{
+    spazioTondo(g, cx, cy, ALONE, basso, alto);
+    dmMarcatore(g, cx, cy, 8, 5, colore, alto, basso);
+}
+
 // I codici sono lo standard meteorologico WMO: 0 e' cielo sereno,
 // e piu' il numero sale piu' il tempo peggiora.
 static const char **iconaPerCodice(int c)
@@ -1140,6 +1184,40 @@ static void testoInColonna(Arduino_GFX *g, int16_t x, int16_t y, const char *s,
         if (diam < 2) diam = 2;
     }
     dmText(g, x, y, s, passo, diam, colore, gap);
+}
+
+// ------------------------------------------------------------
+//  IL BATTITO DELLA RETE
+// ------------------------------------------------------------
+//  Un pallino che si accende e si spegne una volta al secondo.
+//  Nessuna dissolvenza: sfumare vorrebbe dire rifare lo schermo
+//  piu' volte al secondo, e ogni fotogramma intero costa 36
+//  millisecondi. Cosi' invece non costa niente - l'orologio si
+//  ridisegna comunque a ogni scatto di secondo, e il pallino
+//  cambia insieme a lui.
+//
+//  Non si spegne fino a sparire: passa al grigio dei punti spenti,
+//  lo stesso di tutti gli altri quadranti. Un pallino che sparisce
+//  del tutto sembrerebbe la rete che cade.
+
+#define BATT_CX (LCD_W - PADDING - 11 * 4 - 26)
+#define BATT_CY (PADDING + 10)
+
+static void indicatoreRete(Arduino_GFX *g, int16_t cx, int16_t cy)
+{
+    if (!retePresente)
+    {
+        // Senza rete non pulsa e resta sbarrato. Un pallino
+        // semplicemente spento potrebbe essere il battito colto nel
+        // momento di riposo; una sbarra no.
+        dmMarcatore(g, cx, cy, 6, 3, COL_SPENTO);
+        for (int k = -3; k <= 3; ++k)
+            dmDot(g, cx + k * 3, cy - k * 3, 3, COL_ACCESO);
+        return;
+    }
+
+    bool acceso = (time(nullptr) % 2) == 0;
+    dmMarcatore(g, cx, cy, 6, 3, acceso ? COL_ACCESO : COL_SPENTO);
 }
 
 static void indicatoreBatteria(Arduino_GFX *g)
@@ -1224,7 +1302,7 @@ static void disegnaOra(Arduino_GFX *g, const struct tm &t)
         dmDot(g, px, 238, 5, px <= xMarcatore ? COL_SECONDARIO : COL_SPENTO);
     }
 
-    dmMarcatore(g, xMarcatore, 238, 8, 5, COL_ROSSO);
+    marcatoreConAlone(g, xMarcatore, 238, COL_ROSSO);
 
     // La data.
     snprintf(buf, sizeof(buf), "%s %02d %s",
@@ -1895,7 +1973,7 @@ static void disegnaBaro(Arduino_GFX *g)
         int16_t py = BARO_BASSO - (int16_t)lroundf(alto * (BARO_BASSO - BARO_ALTO));
 
         if (i == BARO_PUNTI - 1)
-            dmMarcatore(g, px, py, 8, 5, COL_ROSSO);
+            marcatoreConAlone(g, px, py, COL_ROSSO);
         else
             dmDot(g, px, py, 5, COL_SECONDARIO);
     }
@@ -2072,12 +2150,10 @@ static void disegnaAria(Arduino_GFX *g)
         // bolla, quella che passa dopo ritaglia un morso in quella
         // gia' disegnata - ed e' il morso a dire quale delle due sta
         // davanti, invece di lasciarle fondere in una macchia sola.
-        spazioTondo(g, x, (int16_t)y, 15, ARIA_BASSO - 2, ARIA_ALTO + 2);
-
-        // Della stessa materia dei marcatori degli altri quadranti:
-        // un punto centrale con sei intorno.
-        dmMarcatore(g, x, (int16_t)y, 8, 5, COL_BOLLA,
-                    ARIA_ALTO + 2, ARIA_BASSO - 2);
+        // Stessa cosa dei marcatori degli altri quadranti, tagliata
+        // ai due bordi del contenitore.
+        marcatoreConAlone(g, x, (int16_t)y, COL_BOLLA,
+                          ARIA_ALTO + 2, ARIA_BASSO - 2);
     }
 
     char buf[16];
@@ -2459,11 +2535,14 @@ static void componi()
     // il modo in cui l'occhio capisce quali sono i comandi
     // dell'oggetto e quali il contenuto.
     indicatoreBatteria(comp);
+    indicatoreRete(comp, BATT_CX, BATT_CY);
 
     float opacita = palliniOpacita();
     disegnaPallini(comp, schedaCorrente + scorrimento / (float)LCD_W, opacita);
     palliniOpacitaDisegnata = opacita;
     comp->flush();
+    ++webVersione;
+
 
     aggiornaVisibilita();
 }
@@ -2777,6 +2856,7 @@ static void disegnaVista()
     default: return;
     }
     comp->flush();
+    ++webVersione;
 }
 
 // ------------------------------------------------------------
@@ -3053,6 +3133,13 @@ void setup()
         ridisegna(i);
     componi();
 
+#if SPECCHIO
+    // Lo specchio guarda lo stesso foglio che finisce a schermo.
+    webBegin(comp->getFramebuffer(), LCD_W, LCD_H);
+#else
+    Serial.println("[web] specchio spento (SPECCHIO 0 in main.cpp)");
+#endif
+
     Serial.println("[pronto] scorri con il dito per cambiare scheda");
 }
 
@@ -3171,7 +3258,7 @@ void loop()
         ridisegna(schedaCorrente);   // se un numero scorre ancora, lo rialza
         componi();
     }
-    else if (fabsf(palliniOpacita() - palliniOpacitaDisegnata) > 0.02f)
+    if (fabsf(palliniOpacita() - palliniOpacitaDisegnata) > 0.02f)
     {
         // I pallini si stanno spegnendo: basta ricomporre, le schede
         // sono gia' pronte e non serve ridisegnare niente.
