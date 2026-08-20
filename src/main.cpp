@@ -512,6 +512,7 @@ static void connettiWifi()
 
     Serial.printf("[wifi] connessione a \"%s\"", WIFI_SSID);
     WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);   // se cade, ci riprova da solo
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
     uint32_t limite = millis() + 15000;
@@ -598,7 +599,10 @@ static bool scaricaMeteo()
     url += "&timeformat=unixtime&timezone=Europe%2FRome";
 
     HTTPClient http;
-    http.setTimeout(8000);
+    // Corto: questa chiamata blocca il ciclo, e un server che non
+    // risponde non deve congelare lo schermo per otto secondi.
+    http.setTimeout(4000);
+    http.setConnectTimeout(3000);
     if (!http.begin(url))
     {
         Serial.println("[meteo] url non valido");
@@ -695,7 +699,8 @@ static bool scaricaAria()
     url += "&current=european_aqi,pm2_5,pm10&timezone=Europe%2FRome";
 
     HTTPClient http;
-    http.setTimeout(8000);
+    http.setTimeout(4000);
+    http.setConnectTimeout(3000);
     if (!http.begin(url)) return false;
 
     int codice = http.GET();
@@ -3227,6 +3232,27 @@ void loop()
     {
         ultimoSecondo = t.tm_sec;
         daRidisegnare[SCHEDA_ORA] = true;
+
+        // Se la rete c'e' ancora si controlla di continuo, non una
+        // volta sola all'avvio. Crederla presente quando non c'e'
+        // significa continuare a bussare a un server irraggiungibile
+        // e restare appesi ogni volta.
+        bool adessoCe = (WiFi.status() == WL_CONNECTED);
+        if (adessoCe != retePresente)
+        {
+            retePresente = adessoCe;
+            Serial.printf("[wifi] rete %s\n", adessoCe ? "tornata" : "persa");
+
+            // Cambia l'indicatore, e le schede dei dati passano a
+            // "NO LINK": vanno rifatte tutte.
+            for (int i = 0; i < N_SCHEDE; ++i)
+                daRidisegnare[i] = true;
+
+            // Appena torna, i dati si riprendono subito invece di
+            // aspettare il prossimo giro di mezz'ora.
+            if (adessoCe)
+                prossimoMeteo = millis();
+        }
         if (t.tm_min != ultimoMinuto)
         {
             ultimoMinuto = t.tm_min;
