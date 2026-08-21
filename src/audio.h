@@ -157,6 +157,23 @@ static bool audioBegin()
     return true;
 }
 
+// Il convertitore acceso a vuoto consuma qualche milliampere: di
+// notte, quando non deve suonare niente, tanto vale spegnerlo.
+static void audioRiposo()
+{
+    if (!audioPronto) return;
+    digitalWrite(AUDIO_PA, LOW);
+    esScrivi(0x12, 0x02);   // convertitore giu'
+    esScrivi(0x0E, 0x00);   // parte analogica giu'
+}
+
+static void audioRisveglio()
+{
+    if (!audioPronto) return;
+    esScrivi(0x0E, 0x02);
+    esScrivi(0x12, 0x00);
+}
+
 // ------------------------------------------------------------
 //  IL TONO DELLA SVEGLIA
 // ------------------------------------------------------------

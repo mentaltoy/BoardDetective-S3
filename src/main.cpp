@@ -38,6 +38,8 @@
 #include <time.h>
 #include <esp_sntp.h>
 #include <math.h>
+#include <esp_sleep.h>
+#include <driver/gpio.h>
 
 #include "dotmatrix.h"
 #include "touch.h"
@@ -2865,6 +2867,117 @@ static void disegnaVista()
 }
 
 // ------------------------------------------------------------
+//  ENTRARE E USCIRE DALLO STANDBY
+// ------------------------------------------------------------
+//  A schermo spento restano vivi solo l'orologio e le sveglie: e'
+//  tutto quello che serve di notte, ed e' tutto quello che deve
+//  consumare.
+//
+//  La voce cara e' la radio. Un ESP32 con il wifi associato beve
+//  quasi cento milliampere anche mentre non trasmette nulla, contro
+//  i pochi di tutto il resto messo insieme: su una batteria di
+//  questa taglia sono poche ore. E di notte non serve a niente -
+//  l'ora la tiene l'orologio interno, che va avanti per conto suo, e
+//  la sveglia non ha bisogno di internet per suonare.
+//
+//  Il processore poi non ha motivo di correre a 240 MHz per
+//  guardare un pulsante: a 80 fa la stessa cosa consumando meno di
+//  un terzo. Torna veloce appena riaccendi, e comunque prima che
+//  suoni una sveglia - l'audio ha bisogno di tutta la velocita'.
+
+static void entraInStandby()
+{
+    schermoAcceso = false;
+    panel->displayOff();
+    audioRiposo();
+
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    retePresente = false;
+
+    // L'accelerometro serve solo al gioco delle particelle.
+    qmiWrite(QMI_CTRL7, 0x00);
+
+    setCpuFrequencyMhz(80);
+
+    Serial.println("[standby] schermo spento, radio spenta, processore al minimo");
+}
+
+// ------------------------------------------------------------
+//  DORMIRE FRA UN SECONDO E L'ALTRO
+// ------------------------------------------------------------
+//  A schermo spento il programma ha una cosa sola da fare: guardare
+//  che ora e' e se e' il momento di suonare. Ci mette qualche
+//  millesimo di secondo, e per i restanti 995 millesimi non c'e'
+//  nessuna ragione di restare accesi.
+//
+//  Nel sonno leggero il chip stacca quasi tutto ma tiene la
+//  memoria: al risveglio il programma riprende esattamente da dove
+//  era, con le schede gia' disegnate e niente da ricostruire. Si
+//  passa da una ventina di milliampere a due o tre.
+//
+//  Due cose lo svegliano: il tempo, dopo un secondo, e il pulsante,
+//  subito. Cosi' l'orologio resta immediato al tocco pur avendo
+//  dormito fino a un attimo prima.
+//
+//  Con il cavo attaccato non dorme: non serve risparmiare, e il
+//  sonno interromperebbe il collegamento seriale rendendo cieco
+//  chiunque stia guardando i messaggi.
+
+static void dormiFinoAlProssimoSecondo()
+{
+    static uint32_t prossimoControlloAlimentazione = 0;
+    if ((int32_t)(millis() - prossimoControlloAlimentazione) >= 0)
+    {
+        prossimoControlloAlimentazione = millis() + 30000UL;
+        aggiornaBatteria();
+    }
+
+    if (alimentato)
+    {
+        delay(50);
+        return;
+    }
+
+    // La memoria esterna deve restare alimentata: senza, al risveglio
+    // il programma troverebbe spazzatura al posto delle schede.
+    esp_sleep_pd_config(ESP_PD_DOMAIN_VDDSDIO, ESP_PD_OPTION_ON);
+
+    esp_sleep_enable_timer_wakeup(1000000ULL);
+    gpio_wakeup_enable((gpio_num_t)BTN_BOOT, GPIO_INTR_LOW_LEVEL);
+    esp_sleep_enable_gpio_wakeup();
+
+    esp_light_sleep_start();
+}
+
+static void esciDaStandby()
+{
+    // Prima la velocita': tutto il resto la vuole gia' piena.
+    setCpuFrequencyMhz(240);
+    audioRisveglio();
+
+    qmiWrite(QMI_CTRL7, 0x01);
+
+    panel->displayOn();
+    panel->setBrightness(LUMINOSITA);
+    schermoAcceso = true;
+
+    // La riconnessione non blocca: parte e va per conto suo, e
+    // l'indicatore si accorgera' da solo quando la rete e' tornata.
+    if (strlen(WIFI_SSID) > 0)
+    {
+        WiFi.mode(WIFI_STA);
+        WiFi.setAutoReconnect(true);
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    }
+
+    for (int i = 0; i < N_SCHEDE; ++i)
+        daRidisegnare[i] = true;
+
+    Serial.println("[standby] sveglio");
+}
+
+// ------------------------------------------------------------
 //  QUANDO SCATTA UNA SVEGLIA
 // ------------------------------------------------------------
 
@@ -2889,13 +3002,10 @@ static void controllaSveglie(const struct tm &t)
         vistaDaRidisegnare = true;
 
         // Se lo schermo dormiva, una sveglia muta e nera non
-        // servirebbe a niente.
+        // servirebbe a niente. E il processore deve tornare veloce
+        // prima di provare a generare un suono.
         if (!schermoAcceso)
-        {
-            schermoAcceso = true;
-            panel->displayOn();
-            panel->setBrightness(LUMINOSITA);
-        }
+            esciDaStandby();
 
         audioAvvia();
         Serial.printf("[sveglia] scattata: %02d:%02d\n", sveglie[i].ore, sveglie[i].minuti);
@@ -3035,15 +3145,16 @@ static void gestisciPulsante()
 
         if (schermoAcceso)
         {
-            panel->displayOn();
-            panel->setBrightness(LUMINOSITA);
+            // schermoAcceso e' gia' stato invertito: si rimette com'era
+            // e si lascia decidere alla funzione.
+            schermoAcceso = false;
+            esciDaStandby();
             componi();
-            Serial.println("[schermo] acceso");
         }
         else
         {
-            panel->displayOff();
-            Serial.println("[schermo] in standby (premi BOOT per riaccendere)");
+            schermoAcceso = true;
+            entraInStandby();
         }
     }
 
@@ -3168,7 +3279,7 @@ void loop()
     if (!schermoAcceso)
     {
         gestisciPulsante();
-        delay(20);
+        dormiFinoAlProssimoSecondo();
         return;
     }
 
