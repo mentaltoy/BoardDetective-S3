@@ -48,6 +48,7 @@
 #include "audio.h"
 #include "imu.h"
 #include "web.h"
+#include "clima.h"
 
 // Il logo compare come quarta scheda solo se src/logo.h esiste.
 // Lo genera scripts/logo2c.py da un'immagine qualsiasi; senza,
@@ -194,9 +195,9 @@ static Arduino_Canvas *comp = new Arduino_Canvas(LCD_W, LCD_H, panel);
 // ------------------------------------------------------------
 
 #if HA_LOGO
-#define N_SCHEDE 6
+#define N_SCHEDE 7
 #else
-#define N_SCHEDE 5
+#define N_SCHEDE 6
 #endif
 
 #define SCHEDA_ORA 0
@@ -204,7 +205,8 @@ static Arduino_Canvas *comp = new Arduino_Canvas(LCD_W, LCD_H, panel);
 #define SCHEDA_METEO 2
 #define SCHEDA_BARO 3
 #define SCHEDA_ARIA 4
-#define SCHEDA_LOGO 5
+#define SCHEDA_CLIMA 5
+#define SCHEDA_LOGO 6
 
 // Ogni scheda ha il suo foglio di memoria, sempre pronto.
 // Sono 329 KB l'uno: con 8 MB di PSRAM ce ne stanno una ventina,
@@ -212,6 +214,7 @@ static Arduino_Canvas *comp = new Arduino_Canvas(LCD_W, LCD_H, panel);
 // L'output e' nullptr perche' questi fogli non vanno mai a
 // schermo da soli: passano sempre da "comp".
 static Arduino_Canvas *scheda[N_SCHEDE] = {
+    new Arduino_Canvas(LCD_W, LCD_H, nullptr),
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
@@ -335,6 +338,7 @@ static DmRullo rulloOra;
 static DmRullo rulloSole;
 static DmRullo rulloBaro;
 static DmRullo rulloAria;
+static DmRullo rulloClima;
 
 // Anche i numeri della sveglia scorrono. Mentre tieni premuto pero'
 // l'animazione si spegne: a quel ritmo non farebbe in tempo a
@@ -350,6 +354,7 @@ static bool numeriInMovimento = false;
 static int ultimoSecondo = -1;
 static int ultimoMinuto = -1;
 static uint32_t prossimoMeteo = 0;
+static uint32_t prossimoClima = 0;
 
 // ------------------------------------------------------------
 //  METEO
@@ -2189,6 +2194,128 @@ static void disegnaAria(Arduino_GFX *g)
 }
 
 // ------------------------------------------------------------
+//  SCHEDA 6: IL CONDIZIONATORE
+// ------------------------------------------------------------
+//  La prima scheda che non guarda soltanto: da qui si comanda.
+//
+//  La ventola gira davvero quando la macchina e' accesa, e sta
+//  ferma e grigia quando e' spenta. Non e' decorazione: e' il modo
+//  piu' immediato di sapere se sta funzionando senza leggere una
+//  parola.
+
+#define CLIMA_CX (LCD_W / 2)
+#define CLIMA_CY 150
+#define CLIMA_RAGGIO 64
+
+static void disegnaVentola(Arduino_GFX *g, int16_t cx, int16_t cy,
+                           int16_t raggio, float angolo, uint16_t colore)
+{
+    // Tre pale, curve. Ogni pala e' una fila di punti che si allarga
+    // dal centro ruotando: dritta sembrerebbe un'elica di carta,
+    // piegata sembra una ventola.
+    for (int pala = 0; pala < 3; ++pala)
+    {
+        float base = angolo + pala * (2.0f * (float)M_PI / 3.0f);
+        for (int16_t r = 10; r <= raggio - 12; r += 7)
+        {
+            float a = base + (float)r * 0.016f;
+            dmDot(g, cx + (int16_t)lroundf(cosf(a) * r),
+                     cy + (int16_t)lroundf(sinf(a) * r), 5, colore);
+        }
+    }
+
+    // Il mozzo e la griglia intorno.
+    dmMarcatore(g, cx, cy, 6, 4, colore);
+
+    int quanti = (int)(2.0f * (float)M_PI * raggio / PASSO_QUADRANTE);
+    dmRing(g, cx, cy, raggio, quanti, 0.0f, 360.0f * (quanti - 1) / quanti,
+           quanti, 4, COL_SPENTO, COL_SPENTO);
+}
+
+static void disegnaClima(Arduino_GFX *g)
+{
+    telaio(g, CLIMA_NOME);
+
+    if (!clima.valido)
+    {
+        testoCentrato(g, 190, "NO LINK", 8, 6, COL_SPENTO);
+        const char *motivo = retePresente ? "CONDIZIONATORE NON TROVATO" : "NESSUNA RETE WIFI";
+        testoCentrato(g, 260, motivo, 3, 2, COL_ETICHETTA, 2);
+        return;
+    }
+
+    // Gira solo se e' acceso, e piano: una ventola che sfreccia
+    // sembrerebbe un caricamento in corso.
+    // L'angolo si accumula invece di essere ricavato dall'orologio:
+    // calcolandolo dal tempo assoluto, cambiare la durata del giro
+    // faceva saltare la pala in un'altra posizione. E la velocita'
+    // insegue quella richiesta invece di adottarla di colpo - una
+    // ventola ha una massa, prende giri e li perde.
+    static float angolo = 0;
+    static float velocita = 0;
+    static uint32_t ultimoGiro = 0;
+
+    uint32_t adesso = millis();
+    float dt = (adesso - ultimoGiro) / 1000.0f;
+    ultimoGiro = adesso;
+    if (dt > 0.2f) dt = 0.2f;
+
+    float bersaglio = clima.acceso
+                          ? (2.0f * (float)M_PI) / (climaGiroMs() / 1000.0f)
+                          : 0.0f;
+
+    velocita += (bersaglio - velocita) * fminf(1.0f, dt * 1.6f);
+    angolo += velocita * dt;
+    if (angolo > 2.0f * (float)M_PI) angolo -= 2.0f * (float)M_PI;
+
+    // Finche' gira - anche mentre sta rallentando fino a fermarsi -
+    // la scheda va ridisegnata.
+    if (schedaCorrente == SCHEDA_CLIMA && (clima.acceso || velocita > 0.02f))
+        numeriInMovimento = true;
+
+    disegnaVentola(g, CLIMA_CX, CLIMA_CY, CLIMA_RAGGIO, angolo,
+                   clima.acceso ? COL_ACCESO : COL_SPENTO);
+
+    // I comandi della ventola, ai suoi lati.
+    disegnaGriglia(g, 52, CLIMA_CY, ICO_MENO, ICONA_COMANDO, 5, 4,
+                   clima.acceso ? COL_SECONDARIO : COL_SPENTO);
+    disegnaGriglia(g, LCD_W - 52, CLIMA_CY, ICO_PIU, ICONA_COMANDO, 5, 4,
+                   clima.acceso ? COL_SECONDARIO : COL_SPENTO);
+
+    testoCentrato(g, 222, climaNomeVelocita(clima.ventola), 2, 2,
+                  clima.acceso ? COL_ETICHETTA : COL_SPENTO, 2);
+
+    // La temperatura che hai chiesto.
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d^", (int)lroundf(clima.impostata));
+    int16_t largo = dmTextWidth(buf, 9, 1);
+    if (dmRullo(g, rulloClima, buf, (LCD_W - largo) / 2, 248, 9, 7,
+                clima.acceso ? COL_ACCESO : COL_SPENTO))
+        numeriInMovimento = true;
+
+    // La modalita' e' anche un comando: toccandola si passa alla
+    // successiva. Il rosso la faceva gia' sembrare la cosa viva della
+    // scheda, tanto vale che lo sia.
+    testoCentrato(g, 322, clima.acceso ? climaModo(clima.modo) : "SPENTO", 3, 3,
+                  clima.acceso ? COL_ROSSO : COL_SPENTO, 2);
+
+    // Quella che c'e' davvero, dentro e fuori.
+    dmText(g, PADDING, 346, "IN CASA", 2, 2, COL_ETICHETTA, 2);
+    snprintf(buf, sizeof(buf), "%d^", (int)lroundf(clima.interna));
+    dmText(g, PADDING, 372, buf, 3, 3, COL_SECONDARIO);
+
+    int16_t w = dmTextWidth("FUORI", 2, 2);
+    dmText(g, LCD_W - PADDING - w, 346, "FUORI", 2, 2, COL_ETICHETTA, 2);
+    snprintf(buf, sizeof(buf), "%d^", (int)lroundf(clima.esterna));
+    w = dmTextWidth(buf, 3, 1);
+    dmText(g, LCD_W - PADDING - w, 372, buf, 3, 3, COL_SECONDARIO);
+
+    // I comandi, ai lati della temperatura.
+    disegnaGriglia(g, 52, 274, ICO_MENO, ICONA_COMANDO, 5, 4, COL_SECONDARIO);
+    disegnaGriglia(g, LCD_W - 52, 274, ICO_PIU, ICONA_COMANDO, 5, 4, COL_SECONDARIO);
+}
+
+// ------------------------------------------------------------
 //  RIDISEGNO
 // ------------------------------------------------------------
 
@@ -2210,6 +2337,7 @@ static void ridisegna(int i)
     case SCHEDA_METEO: disegnaMeteo(scheda[i]);   break;
     case SCHEDA_BARO:  disegnaBaro(scheda[i]);   break;
     case SCHEDA_ARIA:  disegnaAria(scheda[i]);   break;
+    case SCHEDA_CLIMA: disegnaClima(scheda[i]);  break;
 #if HA_LOGO
     case SCHEDA_LOGO:  disegnaLogo(scheda[i]);    break;
 #endif
@@ -2654,6 +2782,35 @@ static void tapNelleSchede()
         return;
     }
 #endif
+
+    if (schedaCorrente == SCHEDA_CLIMA && clima.valido)
+    {
+        // Meno e piu' ai lati, e il resto della scheda accende o
+        // spegne: il bersaglio piu' grande per il gesto piu' comune.
+        int v = climaIndiceVelocita();
+
+        if (dentro(tapX, tapY, 52, CLIMA_CY, BERSAGLIO))
+        {
+            if (v > 0) climaComanda(clima.acceso, clima.impostata, CLIMA_VELOCITA[v - 1], clima.modo);
+        }
+        else if (dentro(tapX, tapY, LCD_W - 52, CLIMA_CY, BERSAGLIO))
+        {
+            if (v < CLIMA_N_VELOCITA - 1) climaComanda(clima.acceso, clima.impostata, CLIMA_VELOCITA[v + 1], clima.modo);
+        }
+        else if (dentro(tapX, tapY, 52, 274, BERSAGLIO))
+            climaComanda(clima.acceso, clima.impostata - 1, clima.ventola, clima.modo);
+        else if (dentro(tapX, tapY, LCD_W - 52, 274, BERSAGLIO))
+            climaComanda(clima.acceso, clima.impostata + 1, clima.ventola, clima.modo);
+        else if (clima.acceso && dentro(tapX, tapY, CLIMA_CX, 332, 26))
+            climaComanda(true, clima.impostata, clima.ventola, climaProssimoModo());
+        else if (dentro(tapX, tapY, CLIMA_CX, CLIMA_CY, CLIMA_RAGGIO))
+            climaComanda(!clima.acceso, clima.impostata, clima.ventola, clima.modo);
+        else
+            return;
+
+        daRidisegnare[SCHEDA_CLIMA] = true;
+        return;
+    }
 
     if (schedaCorrente != SCHEDA_ORA) return;
 
@@ -3245,6 +3402,14 @@ void setup()
     prossimoMeteo = millis() + (scaricaMeteo() ? 30UL * 60UL * 1000UL : 2UL * 60UL * 1000UL);
     scaricaAria();
 
+    if (climaLeggi())
+        Serial.printf("[clima] %s, %s, chiesti %.0f gradi, in casa %.0f, fuori %.0f\n",
+                      clima.acceso ? "acceso" : "spento", climaModo(clima.modo),
+                      clima.impostata, clima.interna, clima.esterna);
+    else
+        Serial.println("[clima] condizionatore non raggiungibile");
+    prossimoClima = millis() + 30000UL;
+
     for (int i = 0; i < N_SCHEDE; ++i)
         ridisegna(i);
     componi();
@@ -3371,6 +3536,18 @@ void loop()
             aggiornaBatteria();
             daRidisegnare[SCHEDA_METEO] = true;   // per l'indicatore di carica
         }
+    }
+
+    // Il condizionatore sta in casa: la risposta arriva in pochi
+    // millesimi, e chiederglielo spesso non costa niente. Ma si evita
+    // mentre il dito e' sullo schermo, o l'attesa si sentirebbe.
+    if (retePresente && (int32_t)(millis() - prossimoClima) >= 0)
+    {
+        prossimoClima = millis() + 30000UL;
+        bool prima = clima.acceso;
+        float gradiPrima = clima.impostata;
+        if (climaLeggi() && (prima != clima.acceso || gradiPrima != clima.impostata))
+            daRidisegnare[SCHEDA_CLIMA] = true;
     }
 
     if (retePresente && (int32_t)(millis() - prossimoMeteo) >= 0)
