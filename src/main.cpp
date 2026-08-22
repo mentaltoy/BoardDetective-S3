@@ -1517,7 +1517,11 @@ static void cronoTrama(Arduino_GFX *g)
     const int16_t passo = 10;
     // Fin quasi alle tacche: prima si fermava trenta pixel prima e
     // fra la trama e il bordo restava un anello vuoto.
-    const int16_t limite = CRONO_RAGGIO - 14;
+    // Fin quasi alle tacche, ma non addosso: a quattordici pixel i
+    // punti della trama arrivavano a mescolarsi con quelli delle
+    // tacche corte, e le tacche perdevano il loro stacco. Diciotto
+    // lascia il respiro che serve a leggerle come cose diverse.
+    const int16_t limite = CRONO_RAGGIO - 18;
     const int32_t limite2 = (int32_t)limite * limite;
 
     for (int16_t dy = -limite; dy <= limite; dy += passo)
@@ -1666,7 +1670,7 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
     // Il foro al centro: sugli orologi veri e' il buco in cui si
     // infila l'asse, e senza, il perno sembra una goccia appoggiata
     // invece di un pezzo montato su qualcosa.
-    dmDot(g, CRONO_CX, CRONO_CY, 3, COL_SFONDO);
+    dmDot(g, CRONO_CX, CRONO_CY, 5, COL_SFONDO);
 }
 
 static void disegnaCrono(Arduino_GFX *g)
@@ -4364,9 +4368,10 @@ void setup()
     // Schermata di attesa: la rete puo' prendersi qualche secondo
     // e uno schermo nero sembrerebbe un blocco.
     comp->fillScreen(COL_SFONDO);
-    testoCentrato(comp, 132, "ESP32", 3, 2, COL_ETICHETTA, 2);
-    testoCentrato(comp, 176, "MENTALTOY", 7, 5, COL_ACCESO);
-    testoCentrato(comp, 268, "CONNESSIONE", 3, 2, COL_ETICHETTA, 2);
+    testoCentrato(comp, 118, "ESP32", 3, 2, COL_ETICHETTA, 2);
+    testoCentrato(comp, 168, "AVVIO", 8, 6, COL_ACCESO);
+    testoCentrato(comp, 248, "MENTALTOY", 4, 3, COL_SECONDARIO, 2);
+    testoCentrato(comp, 300, "CONNESSIONE", 3, 2, COL_ETICHETTA, 2);
     comp->flush();
 
     // L'ora dell'RTC vale subito: se poi arriva quella di rete,
