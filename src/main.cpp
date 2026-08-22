@@ -397,7 +397,7 @@ static void cronoAvviaFerma()
 // anche il modo di far vedere che il comando e' stato ricevuto -
 // altrimenti premi e non succede niente di visibile, perche' il
 // quadrante era gia' quasi fermo.
-#define AZZERA_DURATA 620
+#define AZZERA_DURATA 420
 static bool azzeraInCorso = false;
 static uint32_t azzeraInizio = 0;
 static float azzeraDa = 0;
@@ -2867,38 +2867,41 @@ static void disegnaInterruttore(Arduino_GFX *g, int16_t x, int16_t cy, bool acce
 // insieme.
 static void disegnaGiri(Arduino_GFX *g)
 {
-    telaio(g, "");
+    // La riga in cima e' sempre la stessa in tutto l'oggetto: a
+    // sinistra il nome di dove sei, a destra la carica - o la croce
+    // per uscire, quando ci si trova dentro una sezione. E' l'unico
+    // punto fermo mentre tutto il resto cambia, e non si tocca.
+    telaio(g, "GIRI");
 
     disegnaGriglia(g, LCD_W - PADDING - MEZZA_ICONA, PADDING + 8, ICO_CHIUDI,
                    ICONA_COMANDO, 4, 3, COL_SECONDARIO);
 
-    // Il tempo corrente in cima. Il bollo dei giri sta in mezzo al
-    // quadrante e si preme anche senza volerlo: aprendo questa
-    // schermata per sbaglio, almeno si vede l'ora del cronografo
-    // invece di un elenco che non si cercava.
+    // Il tempo corrente comincia sotto. Il bollo dei giri sta in mezzo
+    // al quadrante e si preme anche senza volerlo: entrando per
+    // sbaglio, almeno si vede l'ora del cronografo invece di un
+    // elenco che non si cercava.
     {
         uint32_t t = cronoTempo();
         char buf[16];
         snprintf(buf, sizeof(buf), "%02lu:%02lu", (unsigned long)(t / 60000),
                  (unsigned long)((t / 1000) % 60));
 
-        const int16_t passo = 5;
+        const int16_t passo = 6;
         const int16_t largo = dmTextWidth(buf, passo, 1);
-        const int16_t x0 = (LCD_W - (largo + 12 + dmTextWidth("0", 3, 1))) / 2;
+        const int16_t x0 = (LCD_W - (largo + 14 + dmTextWidth("0", 4, 1))) / 2;
+        const int16_t y0 = 84;
 
-        dmText(g, x0, 40, buf, passo, 4,
+        dmText(g, x0, y0, buf, passo, 5,
                cronoAttivo ? COL_ROSSO : COL_ACCESO);
-        dmDot(g, x0 + largo + 4, 40 + 7 * passo - 3, 3, COL_SECONDARIO);
+        dmDot(g, x0 + largo + 5, y0 + 7 * passo - 4, 4, COL_SECONDARIO);
 
         snprintf(buf, sizeof(buf), "%lu", (unsigned long)((t / 100) % 10));
-        dmText(g, x0 + largo + 12, 40 + 7 * passo - 21, buf, 3, 2, COL_SECONDARIO);
+        dmText(g, x0 + largo + 14, y0 + 7 * passo - 28, buf, 4, 3, COL_SECONDARIO);
     }
-
-    testoCentrato(g, 96, "GIRI", 3, 2, COL_ETICHETTA, 2);
 
     if (cronoNGiri == 0)
     {
-        testoCentrato(g, 220, "NESSUN GIRO", 4, 3, COL_SPENTO);
+        testoCentrato(g, 230, "NESSUN GIRO", 4, 3, COL_SPENTO);
         return;
     }
 
@@ -2908,7 +2911,7 @@ static void disegnaGiri(Arduino_GFX *g)
     for (int i = 1; i < cronoNGiri; ++i)
         if (cronoGiri[i] < migliore) migliore = cronoGiri[i];
 
-    const int16_t ALTO = 138;
+    const int16_t ALTO = 156;
     const int16_t RIGA = 46;
     char buf[20];
 
