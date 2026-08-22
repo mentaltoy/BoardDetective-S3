@@ -363,6 +363,8 @@ static DmRullo rulloCrono;
 static bool cronoAttivo = false;
 static uint32_t cronoPartenza = 0;    // quando e' stato fatto partire
 static uint32_t cronoAccumulato = 0;  // quanto aveva gia' fatto prima dell'ultima pausa
+static uint32_t cronoGiroDa = 0;      // da dove si conta il giro in corso
+static uint32_t cronoGiroUltimo = 0;  // quanto e' durato l'ultimo giro chiuso
 
 static uint32_t cronoTempo()
 {
@@ -387,6 +389,18 @@ static void cronoAzzera()
 {
     cronoAttivo = false;
     cronoAccumulato = 0;
+    cronoGiroDa = 0;
+    cronoGiroUltimo = 0;
+}
+
+// Il giro: quanto e' passato dall'ultima volta che hai premuto. Su un
+// cronografo serve a misurare i pezzi di una cosa lunga senza
+// fermare il conto totale.
+static void cronoGiro()
+{
+    uint32_t adesso = cronoTempo();
+    cronoGiroUltimo = adesso - cronoGiroDa;
+    cronoGiroDa = adesso;
 }
 
 // Anche i numeri della sveglia scorrono. Mentre tieni premuto pero'
@@ -1439,8 +1453,14 @@ static void disegnaVentola(Arduino_GFX *g, int16_t cx, int16_t cy,
 //  veloci devono essere nette.
 
 #define CRONO_CX (LCD_W / 2)
-#define CRONO_CY 196
-#define CRONO_RAGGIO 128
+#define CRONO_CY 192
+#define CRONO_RAGGIO 124
+
+// Sopra il quadrante c'e' l'etichetta, sotto le cifre: la stessa
+// distanza da tutte e due, o l'occhio vede il disco scivolare da una
+// parte.
+#define CRONO_CIFRE_Y 326
+#define CRONO_PULSANTI_Y 386
 
 // Una tacca: punti in fila lungo il raggio. Sui quadranti veri le
 // tacche sono trattini, non pallini - e la differenza fra il minuto
@@ -1480,7 +1500,7 @@ static void disegnaCrono(Arduino_GFX *g)
         const float co = cosf(a), si = sinf(a);
         // La punta guarda in fuori, verso la tacca dello zero: e' lei
         // che indica, e indica il bordo. La base sta verso il centro.
-        const int16_t righe[3] = {CRONO_RAGGIO - 30, CRONO_RAGGIO - 38, CRONO_RAGGIO - 46};
+        const int16_t righe[3] = {CRONO_RAGGIO - 36, CRONO_RAGGIO - 44, CRONO_RAGGIO - 52};
         const int lati[3] = {0, 1, 2};
 
         for (int riga = 0; riga < 3; ++riga)
@@ -1548,7 +1568,7 @@ static void disegnaCrono(Arduino_GFX *g)
     const int16_t largoDecimo = dmTextWidth("0", 3, 1);
     const int16_t STACCO = 12;
     const int16_t x0 = (LCD_W - (largoGrande + STACCO + largoDecimo)) / 2;
-    const int16_t yCifre = 344;
+    const int16_t yCifre = CRONO_CIFRE_Y;
 
     if (dmRullo(g, rulloCrono, buf, x0, yCifre, passo, 3, COL_ACCESO, 1, 240, 30))
         numeriInMovimento = true;
@@ -1559,8 +1579,26 @@ static void disegnaCrono(Arduino_GFX *g)
     dmText(g, x0 + largoGrande + STACCO, yCifre + 7 * passo - 21, buf, 3, 2,
            cronoAttivo ? COL_ROSSO : COL_SECONDARIO);
 
-    if (!cronoAttivo && t > 0)
-        testoCentrato(g, 384, "AZZERA", 3, 2, COL_SECONDARIO, 2);
+    // I due comandi in fondo, come le anse di un cronografo: azzerare
+    // a sinistra, segnare il giro a destra. Spenti quando non
+    // servirebbero a niente.
+    disegnaGriglia(g, PADDING + MEZZA_ICONA, CRONO_PULSANTI_Y, ICO_CHIUDI,
+                   ICONA_COMANDO, 4, 3,
+                   (!cronoAttivo && t > 0) ? COL_SECONDARIO : COL_SPENTO);
+
+    disegnaGriglia(g, LCD_W - PADDING - MEZZA_ICONA, CRONO_PULSANTI_Y, ICO_PIU,
+                   ICONA_COMANDO, 4, 3,
+                   cronoAttivo ? COL_SECONDARIO : COL_SPENTO);
+
+    // L'ultimo giro chiuso, fra i due.
+    if (cronoGiroUltimo > 0)
+    {
+        snprintf(buf, sizeof(buf), "%02lu:%02lu.%lu",
+                 (unsigned long)(cronoGiroUltimo / 60000),
+                 (unsigned long)((cronoGiroUltimo / 1000) % 60),
+                 (unsigned long)((cronoGiroUltimo / 100) % 10));
+        testoCentrato(g, CRONO_PULSANTI_Y - 11, buf, 3, 2, COL_ETICHETTA, 1);
+    }
 
     // Finche' corre, la lancetta chiede il fotogramma successivo.
     if (cronoAttivo && schedaCorrente == SCHEDA_CRONO)
@@ -3237,12 +3275,17 @@ static void tapNelleSchede()
 
     if (schedaCorrente == SCHEDA_CRONO)
     {
-        // Azzera si prende la sua riga in fondo; tutto il resto dello
-        // schermo avvia e ferma. Di corsa si guarda il tempo, non il
-        // dito, e il bersaglio piu' grande va al gesto piu' comune.
+        // I due angoli in fondo hanno i loro comandi; tutto il resto
+        // dello schermo avvia e ferma. Di corsa si guarda il tempo,
+        // non il dito, e il bersaglio piu' grande va al gesto piu'
+        // comune.
         if (!cronoAttivo && cronoTempo() > 0 &&
-            dentroRett(tapX, tapY, LCD_W / 2, 390, 130, 26))
+            dentroRett(tapX, tapY, PADDING + MEZZA_ICONA, CRONO_PULSANTI_Y, 56, 34))
             cronoAzzera();
+        else if (cronoAttivo &&
+                 dentroRett(tapX, tapY, LCD_W - PADDING - MEZZA_ICONA,
+                            CRONO_PULSANTI_Y, 56, 34))
+            cronoGiro();
         else
             cronoAvviaFerma();
 
@@ -3878,7 +3921,7 @@ static void disegnaOta()
         dmDot(comp, PADDING + i * passo, 280, 5,
               i < accese ? COL_ROSSO : COL_SPENTO);
 
-    testoCentrato(comp, 340, "NON STACCARE", 2, 2, COL_ETICHETTA, 2);
+    testoCentrato(comp, 340, "ATTENDERE", 2, 2, COL_ETICHETTA, 2);
     comp->flush();
 }
 
