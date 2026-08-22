@@ -1522,11 +1522,21 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
     float co = cosf(a), si = sinf(a);
     uint16_t colore = cronoAttivo ? COL_ROSSO : COL_ACCESO;
 
-    const int16_t rPunta = CRONO_RAGGIO - 26;
+    // Corpo dritto fino quasi alle tacche, poi una punta a triangolo.
+    // Una rastremazione continua su tutta la lunghezza fa una lancia,
+    // che a questa risoluzione sfuma nel nulla; il corpo parallelo
+    // resta pieno e leggibile, e a puntare ci pensa solo l'ultimo
+    // pezzo. E' la forma delle lancette dei subacquei, dove leggere
+    // in fretta conta piu' dell'eleganza.
+    const int16_t rPunta = CRONO_RAGGIO - 32;
+    const int16_t rSpalla = rPunta - 20;
+    const float LARGO = 5.0f;
+
     for (int16_t r = 12; r <= rPunta; r += 5)
     {
-        float quanto = (float)(r - 12) / (float)(rPunta - 12);
-        float largo = (1.0f - quanto) * 5.5f;
+        float largo = (r <= rSpalla)
+                          ? LARGO
+                          : LARGO * (1.0f - (float)(r - rSpalla) / (float)(rPunta - rSpalla));
 
         if (largo > 1.6f)
             for (int k = -1; k <= 1; k += 2)
@@ -3071,9 +3081,12 @@ static void rinfrescaCrono()
     if (!cronoAttivo || !schedaVisibile(SCHEDA_CRONO)) return;
 
     Arduino_GFX *g = scheda[SCHEDA_CRONO];
-    const int16_t lato = 2 * (CRONO_RAGGIO - 26);
 
-    g->fillRect(CRONO_CX - lato / 2, CRONO_CY - lato / 2, lato, lato, COL_SFONDO);
+    // Un cerchio, non un quadrato: gli angoli di un quadrato inscritto
+    // sporgono di meta' diagonale oltre i suoi lati, arrivavano fin
+    // dove stanno le tacche e se le mangiavano quattro per volta.
+    g->fillCircle(CRONO_CX, CRONO_CY, CRONO_RAGGIO - 28, COL_SFONDO);
+
     cronoTriangolo(g);
     cronoLancetta(g, cronoTempo());
 }
