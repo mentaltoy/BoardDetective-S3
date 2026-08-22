@@ -1646,7 +1646,11 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
         uint16_t tinta = (passata == 0) ? COL_SFONDO : colore;
         int16_t grossezza = (passata == 0) ? 11 : 5;
 
-        for (float r = -RP; r <= rPunta; r += 3.5f)
+        // Il passo si infittisce nel semicerchio dietro il centro: li'
+        // la larghezza cambia in fretta - a un capo e' zero, a meta'
+        // e' quasi piena - e con il passo del corpo la curva veniva a
+        // gradini, con l'ultimo punto che sporgeva da solo.
+        for (float r = -RP; r <= rPunta; r += (r < 0.0f ? 1.6f : 3.5f))
         {
             float semi;
             if (r < 0.0f)
@@ -1725,7 +1729,10 @@ static void disegnaCrono(Arduino_GFX *g)
     // riscontro.
     const int16_t passo = 4;
     const int16_t largoGrande = dmTextWidth(buf, passo, 1);
-    const int16_t largoDecimo = dmTextWidth("0", 3, 1);
+    // Il decimo e' grande come il resto: e' un numero della stessa
+    // riga, e farlo piu' piccolo lo faceva sembrare una nota a
+    // margine invece di una cifra del tempo.
+    const int16_t largoDecimo = dmTextWidth("0", passo, 1);
     const int16_t STACCO = 12;
     const int16_t x0 = (LCD_W - (largoGrande + STACCO + largoDecimo)) / 2;
     const int16_t yCifre = CRONO_CIFRE_Y;
@@ -1736,7 +1743,7 @@ static void disegnaCrono(Arduino_GFX *g)
     dmDot(g, x0 + largoGrande + 4, yCifre + 7 * passo - 3, 3, COL_ACCESO);
 
     snprintf(buf, sizeof(buf), "%lu", (unsigned long)decimi);
-    dmText(g, x0 + largoGrande + STACCO, yCifre + 7 * passo - 21, buf, 3, 2,
+    dmText(g, x0 + largoGrande + STACCO, yCifre, buf, passo, 3,
            cronoAttivo ? COL_ROSSO : COL_SECONDARIO);
 
     // I due comandi in fondo, come le anse di un cronografo: azzerare
