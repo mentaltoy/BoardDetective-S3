@@ -1315,7 +1315,7 @@ static void disegnaVentola(Arduino_GFX *g, int16_t cx, int16_t cy,
     for (int pala = 0; pala < 3; ++pala)
     {
         float base = angolo + pala * (2.0f * (float)M_PI / 3.0f);
-        for (int16_t r = minuta ? 5 : 10; r <= raggio - (minuta ? 4 : 12); r += passoPala)
+        for (int16_t r = minuta ? 6 : 10; r <= raggio - (minuta ? 2 : 12); r += passoPala)
         {
             float a = base + (float)r * (minuta ? 0.030f : 0.016f);
             dmDot(g, cx + (int16_t)lroundf(cosf(a) * r),
@@ -1326,15 +1326,11 @@ static void disegnaVentola(Arduino_GFX *g, int16_t cx, int16_t cy,
     // Il mozzo, e la griglia intorno solo quando c'e' spazio.
     if (minuta)
     {
+        // Senza anello: alla taglia dell'iconcina le tre pale da sole
+        // si leggono meglio di quanto si leggano dentro un cerchio,
+        // che a quelle dimensioni finisce per chiuderle in una
+        // macchia invece di incorniciarle.
         dmDot(g, cx, cy, 4, colore);
-
-        // L'anello c'e' anche qui, ma del colore delle pale: grigio,
-        // a questa taglia, sparirebbe.
-        // Largo e rado: appiccicato alle pale l'insieme diventa una
-        // macchia e non si legge piu' come una ventola.
-        const int quanti = 12;
-        dmRing(g, cx, cy, raggio + 9, quanti, 0.0f,
-               360.0f * (quanti - 1) / quanti, quanti, 3, colore, colore);
     }
     else
     {
@@ -1425,7 +1421,7 @@ static void disegnaOra(Arduino_GFX *g, const struct tm &t)
             if (climi[i].valido && climi[i].acceso) ++accesi;
 
         float scatto = (time(nullptr) % 4) * (float)M_PI / 6.0f;   // trenta gradi per volta
-        disegnaVentola(g, BARRA_VENT, BARRA_Y, 15, scatto,
+        disegnaVentola(g, BARRA_VENT, BARRA_Y, 17, scatto,
                        accesi > 0 ? COL_ACCESO : COL_SPENTO);
     }
 }
@@ -2726,15 +2722,30 @@ static void aggiornaVisibilita()
 }
 
 // Durante lo scorrimento le schede non vengono ridisegnate: si
-// affiancano quelle gia' pronte. Una ventola accesa pero' si
-// fermerebbe proprio mentre la stai guardando passare.
+// affiancano quelle gia' pronte. Ma quelle che si muovono da sole -
+// la ventola, l'orologio - si fermerebbero proprio mentre le stai
+// guardando passare.
 //
-// Ridisegnare tutta la scheda a ogni fotogramma costerebbe quanto
-// comporne una: qui invece si ripulisce e si rifa' solo il riquadro
-// della pala, che e' un settimo dell'area. Lo scorrimento resta
-// quello di prima e la ventola non si accorge di niente.
-static void rinfrescaVentole()
+// Le due hanno costi diversi e si trattano in modo diverso. La pala
+// gira di continuo, quindi si ripulisce e si rifa' solo il suo
+// riquadro: 140 pixel per 140 contro 368 per 448. L'orologio invece
+// cambia una volta al secondo, quindi tanto vale rifarlo tutto -
+// capita al massimo una volta per scorrimento.
+static void rinfrescaVisibili()
 {
+    if (schedaVisibile(SCHEDA_ORA))
+    {
+        struct tm t;
+        oraCorrente(t);
+
+        static int ultimoScatto = -1;
+        if (t.tm_sec != ultimoScatto)
+        {
+            ultimoScatto = t.tm_sec;
+            ridisegna(SCHEDA_ORA);
+        }
+    }
+
 #if N_CLIMI > 0
     for (int i = 0; i < N_CLIMI; ++i)
     {
@@ -2843,7 +2854,7 @@ static void aggiornaAnimazione()
     float p = (float)passato / (float)animDurata;
     float e = 1.0f - powf(1.0f - p, 3.0f);
     scorrimento = animDa + (animA - animDa) * e;
-    rinfrescaVentole();
+    rinfrescaVisibili();
     componi();
 }
 
@@ -3412,7 +3423,7 @@ static void gestisciTocco()
         }
 
         scorrimento = nuovo;
-        rinfrescaVentole();
+        rinfrescaVisibili();
         componi();
     }
     else if (!tp.premuto && ditoGiu)
