@@ -2213,6 +2213,24 @@ static void disegnaAria(Arduino_GFX *g)
 #define CLIMA_CY 150
 #define CLIMA_RAGGIO 64
 
+// Fa passare il tempo per la pala: la velocita' insegue quella
+// richiesta e l'angolo avanza di conseguenza.
+static void avanzaVentola(Clima &clima)
+{
+    uint32_t adesso = millis();
+    float dt = (adesso - clima.ultimoGiro) / 1000.0f;
+    clima.ultimoGiro = adesso;
+    if (dt > 0.2f) dt = 0.2f;
+
+    float bersaglio = clima.acceso
+                          ? (2.0f * (float)M_PI) / (climaGiroMs(clima) / 1000.0f)
+                          : 0.0f;
+
+    clima.velocita += (bersaglio - clima.velocita) * fminf(1.0f, dt * 1.6f);
+    clima.angolo += clima.velocita * dt;
+    if (clima.angolo > 2.0f * (float)M_PI) clima.angolo -= 2.0f * (float)M_PI;
+}
+
 static void disegnaVentola(Arduino_GFX *g, int16_t cx, int16_t cy,
                            int16_t raggio, float angolo, uint16_t colore)
 {
@@ -2257,19 +2275,7 @@ static void disegnaClima(Arduino_GFX *g, Clima &clima, int quale)
     // faceva saltare la pala in un'altra posizione. E la velocita'
     // insegue quella richiesta invece di adottarla di colpo - una
     // ventola ha una massa, prende giri e li perde.
-    uint32_t adesso = millis();
-    float dt = (adesso - clima.ultimoGiro) / 1000.0f;
-    clima.ultimoGiro = adesso;
-    if (dt > 0.2f) dt = 0.2f;
-
-    float bersaglio = clima.acceso
-                          ? (2.0f * (float)M_PI) / (climaGiroMs(clima) / 1000.0f)
-                          : 0.0f;
-
-    clima.velocita += (bersaglio - clima.velocita) * fminf(1.0f, dt * 1.6f);
-    clima.angolo += clima.velocita * dt;
-    if (clima.angolo > 2.0f * (float)M_PI) clima.angolo -= 2.0f * (float)M_PI;
-
+    avanzaVentola(clima);
     float angolo = clima.angolo;
 
     // Finche' gira - anche mentre sta rallentando fino a fermarsi -
@@ -2678,6 +2684,37 @@ static void aggiornaVisibilita()
     }
 }
 
+// Durante lo scorrimento le schede non vengono ridisegnate: si
+// affiancano quelle gia' pronte. Una ventola accesa pero' si
+// fermerebbe proprio mentre la stai guardando passare.
+//
+// Ridisegnare tutta la scheda a ogni fotogramma costerebbe quanto
+// comporne una: qui invece si ripulisce e si rifa' solo il riquadro
+// della pala, che e' un settimo dell'area. Lo scorrimento resta
+// quello di prima e la ventola non si accorge di niente.
+static void rinfrescaVentole()
+{
+#if N_CLIMI > 0
+    for (int i = 0; i < N_CLIMI; ++i)
+    {
+        int sc = SCHEDA_CLIMA + i;
+        if (sc >= N_SCHEDE) break;
+        if (!climi[i].valido) continue;
+        if (!climi[i].acceso && climi[i].velocita <= 0.02f) continue;
+        if (!schedaVisibile(sc)) continue;
+
+        avanzaVentola(climi[i]);
+
+        const int16_t lato = 140;
+        scheda[sc]->fillRect(CLIMA_CX - lato / 2, CLIMA_CY - lato / 2,
+                             lato, lato, COL_SFONDO);
+        disegnaVentola(scheda[sc], CLIMA_CX, CLIMA_CY, CLIMA_RAGGIO,
+                       climi[i].angolo,
+                       climi[i].acceso ? COL_ACCESO : COL_SPENTO);
+    }
+#endif
+}
+
 static void componi()
 {
     int off = (int)lroundf(scorrimento);
@@ -2765,6 +2802,7 @@ static void aggiornaAnimazione()
     float p = (float)passato / (float)animDurata;
     float e = 1.0f - powf(1.0f - p, 3.0f);
     scorrimento = animDa + (animA - animDa) * e;
+    rinfrescaVentole();
     componi();
 }
 
@@ -3285,6 +3323,7 @@ static void gestisciTocco()
         }
 
         scorrimento = nuovo;
+        rinfrescaVentole();
         componi();
     }
     else if (!tp.premuto && ditoGiu)
