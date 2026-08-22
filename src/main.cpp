@@ -444,6 +444,7 @@ static bool editorInRipetizione = false;
 static bool numeriInMovimento = false;
 
 static int ultimoSecondo = -1;
+static int ultimoSecondoInvolucro = -1;
 static int ultimoMinuto = -1;
 static uint32_t prossimoMeteo = 0;
 static uint32_t prossimoClima = 0;
@@ -1514,7 +1515,9 @@ static void cronoTacca(Arduino_GFX *g, float angolo, int16_t rDa, int16_t rA,
 static void cronoTrama(Arduino_GFX *g)
 {
     const int16_t passo = 10;
-    const int16_t limite = CRONO_RAGGIO - 30;
+    // Fin quasi alle tacche: prima si fermava trenta pixel prima e
+    // fra la trama e il bordo restava un anello vuoto.
+    const int16_t limite = CRONO_RAGGIO - 14;
     const int32_t limite2 = (int32_t)limite * limite;
 
     for (int16_t dy = -limite; dy <= limite; dy += passo)
@@ -1660,6 +1663,10 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
         }
     }
 
+    // Il foro al centro: sugli orologi veri e' il buco in cui si
+    // infila l'asse, e senza, il perno sembra una goccia appoggiata
+    // invece di un pezzo montato su qualcosa.
+    dmDot(g, CRONO_CX, CRONO_CY, 3, COL_SFONDO);
 }
 
 static void disegnaCrono(Arduino_GFX *g)
@@ -4357,8 +4364,9 @@ void setup()
     // Schermata di attesa: la rete puo' prendersi qualche secondo
     // e uno schermo nero sembrerebbe un blocco.
     comp->fillScreen(COL_SFONDO);
-    testoCentrato(comp, 200, "AVVIO", 8, 6, COL_ACCESO);
-    testoCentrato(comp, 270, "CONNESSIONE", 3, 2, COL_ETICHETTA, 2);
+    testoCentrato(comp, 132, "ESP32", 3, 2, COL_ETICHETTA, 2);
+    testoCentrato(comp, 176, "MENTALTOY", 7, 5, COL_ACCESO);
+    testoCentrato(comp, 268, "CONNESSIONE", 3, 2, COL_ETICHETTA, 2);
     comp->flush();
 
     // L'ora dell'RTC vale subito: se poi arriva quella di rete,
@@ -4569,6 +4577,16 @@ void loop()
     {
         numeriInMovimento = false;
         ridisegna(schedaCorrente);   // se un numero scorre ancora, lo rialza
+        componi();
+    }
+    else if (t.tm_sec != ultimoSecondoInvolucro)
+    {
+        // Il battito della rete e la carica vivono nell'involucro, che
+        // si rifa' solo quando si ricompone. Su una scheda ferma non
+        // si ricomponeva mai e il pallino restava immobile: da fuori
+        // sembrava rete caduta. Un fotogramma al secondo costa niente
+        // e lo tiene vivo dappertutto.
+        ultimoSecondoInvolucro = t.tm_sec;
         componi();
     }
     if (fabsf(palliniOpacita() - palliniOpacitaDisegnata) > 0.02f)
