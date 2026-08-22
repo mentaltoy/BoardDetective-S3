@@ -1472,6 +1472,7 @@ static void disegnaVentola(Arduino_GFX *g, int16_t cx, int16_t cy,
 // parte.
 #define CRONO_CIFRE_Y 326
 #define CRONO_PULSANTI_Y 386
+#define CRONO_BOLLO 62
 
 // Una tacca: punti in fila lungo il raggio. Sui quadranti veri le
 // tacche sono trattini, non pallini - e la differenza fra il minuto
@@ -1484,6 +1485,23 @@ static void cronoTacca(Arduino_GFX *g, float angolo, int16_t rDa, int16_t rA,
     for (int16_t r = rDa; r <= rA; r += 5)
         dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
                  CRONO_CY + (int16_t)lroundf(si * r), diam, colore);
+}
+
+// Le sessanta tacche: ogni cinque piu' lunga e piu' grossa. La
+// differenza si legge dalla lunghezza prima ancora che dallo
+// spessore, ed e' quello che permette di leggere un quadrante senza
+// contare le tacche una per una.
+static void cronoTacche(Arduino_GFX *g)
+{
+    for (int i = 0; i < 60; ++i)
+    {
+        float a = (i * 6.0f - 90.0f) * (float)M_PI / 180.0f;
+
+        if ((i % 5) == 0)
+            cronoTacca(g, a, CRONO_RAGGIO - 24, CRONO_RAGGIO, 5, COL_SECONDARIO);
+        else
+            cronoTacca(g, a, CRONO_RAGGIO - 10, CRONO_RAGGIO, 3, COL_ETICHETTA);
+    }
 }
 
 // Il triangolo sopra lo zero: dice dov'e' il sessanta e si trova
@@ -1528,26 +1546,42 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
     // resta pieno e leggibile, e a puntare ci pensa solo l'ultimo
     // pezzo. E' la forma delle lancette dei subacquei, dove leggere
     // in fretta conta piu' dell'eleganza.
-    const int16_t rPunta = CRONO_RAGGIO - 32;
-    const int16_t rSpalla = rPunta - 20;
+    // Arriva fino alle tacche e ci passa sopra, come sui subacquei:
+    // la lancetta e' quello che stai guardando, il quadrante e' il
+    // fondo.
+    const int16_t rPunta = CRONO_RAGGIO - 2;
+    const int16_t rSpalla = rPunta - 22;
     const float LARGO = 5.0f;
 
-    for (int16_t r = 12; r <= rPunta; r += 5)
+    // Due passate. Prima tutto il vuoto, poi tutto il pieno: facendo
+    // vuoto e pieno insieme punto per punto, il vuoto di ognuno
+    // cancellerebbe il pieno del precedente e la lancetta verrebbe
+    // fuori a pezzi.
+    for (int passata = 0; passata < 2; ++passata)
     {
-        float largo = (r <= rSpalla)
-                          ? LARGO
-                          : LARGO * (1.0f - (float)(r - rSpalla) / (float)(rPunta - rSpalla));
+        uint16_t tinta = (passata == 0) ? COL_SFONDO : colore;
+        // Il vuoto sta appena piu' largo del pieno: quel tanto che
+        // basta a staccare la lancetta da cio' che le passa sotto.
+        // Piu' largo, e si porta via mezzo quadrante.
+        int16_t grossezza = (passata == 0) ? 9 : 5;
 
-        if (largo > 1.6f)
-            for (int k = -1; k <= 1; k += 2)
-            {
-                int16_t px = CRONO_CX + (int16_t)lroundf(co * r - si * k * largo);
-                int16_t py = CRONO_CY + (int16_t)lroundf(si * r + co * k * largo);
-                dmDot(g, px, py, 5, colore);
-            }
+        for (int16_t r = 12; r <= rPunta; r += 5)
+        {
+            float largo = (r <= rSpalla)
+                              ? LARGO
+                              : LARGO * (1.0f - (float)(r - rSpalla) / (float)(rPunta - rSpalla));
 
-        dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
-                 CRONO_CY + (int16_t)lroundf(si * r), 5, colore);
+            if (largo > 1.6f)
+                for (int k = -1; k <= 1; k += 2)
+                {
+                    int16_t px = CRONO_CX + (int16_t)lroundf(co * r - si * k * largo);
+                    int16_t py = CRONO_CY + (int16_t)lroundf(si * r + co * k * largo);
+                    dmDot(g, px, py, grossezza, tinta);
+                }
+
+            dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
+                     CRONO_CY + (int16_t)lroundf(si * r), grossezza, tinta);
+        }
     }
 
     dmMarcatore(g, CRONO_CX, CRONO_CY, 7, 4, colore);
@@ -1559,18 +1593,19 @@ static void disegnaCrono(Arduino_GFX *g)
 
     uint32_t t = cronoTempo();
 
-    // ---- il quadrante ----
-    for (int i = 0; i < 60; ++i)
-    {
-        float a = (i * 6.0f - 90.0f) * (float)M_PI / 180.0f;
-
-        if ((i % 5) == 0)
-            cronoTacca(g, a, CRONO_RAGGIO - 24, CRONO_RAGGIO, 5, COL_SECONDARIO);
-        else
-            cronoTacca(g, a, CRONO_RAGGIO - 10, CRONO_RAGGIO, 3, COL_ETICHETTA);
-    }
+    cronoTacche(g);
 
     cronoTriangolo(g);
+
+    // Quanti giri hai segnato, a ore sei: sui quadranti veri li' ci
+    // sta il nome della marca, ed e' l'unico posto dentro il disco
+    // dove qualcosa puo' stare senza dare fastidio. E' anche il
+    // pulsante per aprire l'elenco - un bersaglio tondo in mezzo allo
+    // schermo si prende con il dito senza guardare.
+    if (cronoNGiri > 0)
+        disegnaBollo(g, CRONO_CX, CRONO_CY + CRONO_BOLLO, '0' + (cronoNGiri % 10),
+                     4, 3, COL_ACCESO);
+
     cronoLancetta(g, t);
     // ---- il tempo in cifre ----
     uint32_t minuti = t / 60000;
@@ -3086,8 +3121,13 @@ static void rinfrescaCrono()
     // sporgono di meta' diagonale oltre i suoi lati, arrivavano fin
     // dove stanno le tacche e se le mangiavano quattro per volta.
     g->fillCircle(CRONO_CX, CRONO_CY, CRONO_RAGGIO - 28, COL_SFONDO);
-
+    cronoTacche(g);
     cronoTriangolo(g);
+
+    if (cronoNGiri > 0)
+        disegnaBollo(g, CRONO_CX, CRONO_CY + CRONO_BOLLO, '0' + (cronoNGiri % 10),
+                     4, 3, COL_ACCESO);
+
     cronoLancetta(g, cronoTempo());
 }
 
@@ -3373,7 +3413,7 @@ static void tapNelleSchede()
                             CRONO_PULSANTI_Y, 56, 34))
             cronoGiro();
         else if (cronoNGiri > 0 &&
-                 dentroRett(tapX, tapY, LCD_W / 2, CRONO_PULSANTI_Y - 8, 76, 26))
+                 dentro(tapX, tapY, CRONO_CX, CRONO_CY + CRONO_BOLLO, 40))
         {
             vista = VISTA_GIRI;
             listaScorrimento = 0;
