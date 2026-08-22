@@ -35,6 +35,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <ArduinoOTA.h>
 #include <time.h>
 #include <esp_sntp.h>
 #include <math.h>
@@ -3813,6 +3814,75 @@ static void gestisciPulsante()
 }
 
 // ------------------------------------------------------------
+//  AGGIORNAMENTO VIA WIFI
+// ------------------------------------------------------------
+//  Il programma nuovo arriva dalla rete e si scrive nella meta'
+//  libera della memoria: al riavvio si parte da quella. Se il
+//  trasferimento si interrompe a meta', la vecchia e' ancora intatta
+//  e la board riparte come prima - e' per questo che le meta' sono
+//  due.
+//
+//  Funziona solo a schermo acceso, perche' in standby la radio e'
+//  spenta. Un colpo al pulsante e si puo' aggiornare.
+
+static volatile bool otaInCorso = false;
+static volatile int otaPercento = 0;
+
+static void otaPrepara()
+{
+    ArduinoOTA.setHostname("dotclock");
+#ifdef OTA_PASSWORD
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+#endif
+
+    ArduinoOTA.onStart([]() {
+        otaInCorso = true;
+        otaPercento = 0;
+        Serial.println("[ota] aggiornamento in arrivo");
+    });
+
+    ArduinoOTA.onProgress([](unsigned int fatto, unsigned int totale) {
+        otaPercento = totale ? (int)((fatto * 100ULL) / totale) : 0;
+    });
+
+    ArduinoOTA.onEnd([]() {
+        otaPercento = 100;
+        Serial.println("[ota] arrivato, riavvio");
+    });
+
+    ArduinoOTA.onError([](ota_error_t errore) {
+        otaInCorso = false;
+        Serial.printf("[ota] errore %u\n", errore);
+    });
+
+    ArduinoOTA.begin();
+    Serial.println("[ota] pronto a ricevere aggiornamenti dalla rete");
+}
+
+// La schermata che si vede mentre arriva: una barra fatta di punti,
+// come tutto il resto.
+static void disegnaOta()
+{
+    comp->fillScreen(COL_SFONDO);
+    testoCentrato(comp, 120, "AGGIORNAMENTO", 3, 2, COL_ETICHETTA, 2);
+
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d%%", otaPercento);
+    testoCentrato(comp, 170, buf, 9, 7, COL_ACCESO);
+
+    const int TACCHE = 30;
+    const int16_t passo = (LCD_W - 2 * PADDING) / (TACCHE - 1);
+    int accese = (otaPercento * TACCHE + 50) / 100;
+
+    for (int i = 0; i < TACCHE; ++i)
+        dmDot(comp, PADDING + i * passo, 280, 5,
+              i < accese ? COL_ROSSO : COL_SPENTO);
+
+    testoCentrato(comp, 340, "NON STACCARE", 2, 2, COL_ETICHETTA, 2);
+    comp->flush();
+}
+
+// ------------------------------------------------------------
 //  CHI PARLA CON LA RETE
 // ------------------------------------------------------------
 //  Tutte le chiamate stanno qui, su un core loro. Prima erano nel
@@ -3834,6 +3904,9 @@ static void taskRete(void *)
     {
         // Prima i comandi in attesa: chi ha appena toccato vede gia'
         // il risultato a schermo, ma la macchina deve saperlo subito.
+        if (retePresente)
+            ArduinoOTA.handle();
+
         if (retePresente)
             for (int i = 0; i < N_CLIMI; ++i)
                 if (climi[i].daInviare)
@@ -3993,6 +4066,9 @@ void setup()
     Serial.println("[web] specchio spento (SPECCHIO 0 in main.cpp)");
 #endif
 
+    if (retePresente)
+        otaPrepara();
+
     // Da qui in poi la rete se la vede un core per conto suo.
     xTaskCreatePinnedToCore(taskRete, "rete", 6144, nullptr, 1, nullptr, 0);
 
@@ -4005,6 +4081,20 @@ void setup()
 
 void loop()
 {
+    // Mentre arriva un aggiornamento non si fa altro: si guarda la
+    // barra e si aspetta.
+    if (otaInCorso)
+    {
+        static int ultimo = -1;
+        if (otaPercento != ultimo)
+        {
+            ultimo = otaPercento;
+            disegnaOta();
+        }
+        delay(20);
+        return;
+    }
+
     struct tm adesso;
     oraCorrente(adesso);
 
