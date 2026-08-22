@@ -1561,7 +1561,7 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
     for (int passata = 0; passata < 2; ++passata)
     {
         uint16_t tinta = (passata == 0) ? COL_SFONDO : colore;
-        int16_t grossezza = (passata == 0) ? 9 : 5;
+        int16_t grossezza = (passata == 0) ? 11 : 5;
 
         for (float r = -RP; r <= rPunta; r += 4.0f)
         {
@@ -2811,14 +2811,38 @@ static void disegnaInterruttore(Arduino_GFX *g, int16_t x, int16_t cy, bool acce
 // insieme.
 static void disegnaGiri(Arduino_GFX *g)
 {
-    telaio(g, "GIRI");
+    telaio(g, "");
 
     disegnaGriglia(g, LCD_W - PADDING - MEZZA_ICONA, PADDING + 8, ICO_CHIUDI,
                    ICONA_COMANDO, 4, 3, COL_SECONDARIO);
 
+    // Il tempo corrente in cima. Il bollo dei giri sta in mezzo al
+    // quadrante e si preme anche senza volerlo: aprendo questa
+    // schermata per sbaglio, almeno si vede l'ora del cronografo
+    // invece di un elenco che non si cercava.
+    {
+        uint32_t t = cronoTempo();
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%02lu:%02lu", (unsigned long)(t / 60000),
+                 (unsigned long)((t / 1000) % 60));
+
+        const int16_t passo = 5;
+        const int16_t largo = dmTextWidth(buf, passo, 1);
+        const int16_t x0 = (LCD_W - (largo + 12 + dmTextWidth("0", 3, 1))) / 2;
+
+        dmText(g, x0, 40, buf, passo, 4,
+               cronoAttivo ? COL_ROSSO : COL_ACCESO);
+        dmDot(g, x0 + largo + 4, 40 + 7 * passo - 3, 3, COL_SECONDARIO);
+
+        snprintf(buf, sizeof(buf), "%lu", (unsigned long)((t / 100) % 10));
+        dmText(g, x0 + largo + 12, 40 + 7 * passo - 21, buf, 3, 2, COL_SECONDARIO);
+    }
+
+    testoCentrato(g, 96, "GIRI", 3, 2, COL_ETICHETTA, 2);
+
     if (cronoNGiri == 0)
     {
-        testoCentrato(g, 200, "NESSUN GIRO", 4, 3, COL_SPENTO);
+        testoCentrato(g, 220, "NESSUN GIRO", 4, 3, COL_SPENTO);
         return;
     }
 
@@ -2828,7 +2852,7 @@ static void disegnaGiri(Arduino_GFX *g)
     for (int i = 1; i < cronoNGiri; ++i)
         if (cronoGiri[i] < migliore) migliore = cronoGiri[i];
 
-    const int16_t ALTO = 108;
+    const int16_t ALTO = 138;
     const int16_t RIGA = 46;
     char buf[20];
 
@@ -3959,6 +3983,62 @@ static void gestisciTocco()
 //  pannello a dormire. Su un AMOLED significa che i pixel non
 //  emettono piu' niente, che e' l'unico modo di spegnerlo davvero.
 
+// ------------------------------------------------------------
+//  IL SECONDO PULSANTE
+// ------------------------------------------------------------
+//  Non e' collegato al processore come quello dello standby: passa
+//  dall'espansore, il chip che aggiunge otto linee sul bus condiviso.
+//  Il suo stato si legge chiedendoglielo, e a riposo la linea sta
+//  alta - premendo va a zero.
+//
+//  Serve anche all'elettronica di accensione, e tenendolo premuto sei
+//  secondi la board si spegne: quella parte e' cablata e il programma
+//  non la puo' impedire. Per questo qui si guarda solo il colpo
+//  secco.
+//
+//  Fa una cosa sola: avvia e ferma il cronografo. Altrove non fa
+//  niente, che e' meglio di un comando che cambia significato a
+//  seconda di dove ti trovi.
+
+#define EXP_ADDR 0x20
+#define EXP_PWR 0x10   // bit 4, trovato guardando cosa cambia premendo
+
+static bool pwrPremuto()
+{
+    Wire.beginTransmission(EXP_ADDR);
+    Wire.write(0x00);
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom((uint8_t)EXP_ADDR, (uint8_t)1) != 1) return false;
+    return (Wire.read() & EXP_PWR) == 0;
+}
+
+static void gestisciSecondoPulsante()
+{
+    static bool precedente = false;
+    static uint32_t ultimoCambio = 0;
+    static uint32_t prossimaLettura = 0;
+
+    // Ogni quaranta millesimi: un dito non fa una pressione piu' corta
+    // di cosi', e ogni lettura e' una chiacchierata sul bus condiviso.
+    if ((int32_t)(millis() - prossimaLettura) < 0) return;
+    prossimaLettura = millis() + 40;
+
+    bool ora = pwrPremuto();
+
+    if (ora && !precedente && (millis() - ultimoCambio) > 250)
+    {
+        ultimoCambio = millis();
+
+        if (schermoAcceso && vista == VISTA_SCHEDE && schedaCorrente == SCHEDA_CRONO)
+        {
+            cronoAvviaFerma();
+            daRidisegnare[SCHEDA_CRONO] = true;
+        }
+    }
+
+    precedente = ora;
+}
+
 static void gestisciPulsante()
 {
     static bool precedente = HIGH;
@@ -4314,7 +4394,8 @@ void loop()
         // Il campo scelto e la campana dell'allarme lampeggiano: si
         // ridisegna quando cambia lo stato, non a ritmo fisso.
         static bool ultimoLampeggio = false;
-        bool lampeggia = (vista == VISTA_EDITOR || vista == VISTA_ALLARME);
+        bool lampeggia = (vista == VISTA_EDITOR || vista == VISTA_ALLARME ||
+                          (vista == VISTA_GIRI && cronoAttivo));
         bool ora = ((millis() / 420) % 2) == 0;
 
         if (vistaDaRidisegnare || (lampeggia && ora != ultimoLampeggio))
@@ -4425,6 +4506,7 @@ void loop()
     }
 
     gestisciPulsante();
+    gestisciSecondoPulsante();
 
     delay(5);
 }
