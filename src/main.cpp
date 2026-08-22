@@ -1502,12 +1502,26 @@ static void cronoTacca(Arduino_GFX *g, float angolo, int16_t rDa, int16_t rA,
 {
     float co = cosf(angolo), si = sinf(angolo);
 
-    // Passo quattro e non cinque: a cinque i punti si toccavano
-    // appena, e da quando sotto c'e' la trama fra l'uno e l'altro
-    // spuntava il fondo - la tacca sembrava spezzata da un pixel.
-    for (int16_t r = rDa; r <= rA; r += 4)
-        dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
-                 CRONO_CY + (int16_t)lroundf(si * r), diam, colore);
+    // Due passate, come per la lancetta: prima il vuoto, poi il pieno.
+    // Cosi' la tacca si stacca dalla trama invece di doverla coprire
+    // punto per punto - e il fondo puo' restare fitto quanto vuole
+    // senza mai spuntare da sotto.
+    for (int passata = 0; passata < 2; ++passata)
+    {
+        uint16_t tinta = (passata == 0) ? COL_SFONDO : colore;
+        int16_t d = (passata == 0) ? diam + 5 : diam;
+
+        for (int16_t r = rDa; r <= rA; r += 4)
+            dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
+                     CRONO_CY + (int16_t)lroundf(si * r), d, tinta);
+
+        // Il punto sul bordo esterno si disegna comunque: con il passo
+        // fisso l'ultimo cadeva dove capitava, e le tacche corte
+        // finivano due pixel piu' dentro di quelle lunghe - si vedeva
+        // che il cerchio esterno non era uno solo.
+        dmDot(g, CRONO_CX + (int16_t)lroundf(co * rA),
+                 CRONO_CY + (int16_t)lroundf(si * rA), d, tinta);
+    }
 }
 
 // Il fondo del quadrante: una griglia regolare di punti quasi neri.
@@ -1674,7 +1688,7 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
     // Il foro al centro: sugli orologi veri e' il buco in cui si
     // infila l'asse, e senza, il perno sembra una goccia appoggiata
     // invece di un pezzo montato su qualcosa.
-    dmDot(g, CRONO_CX, CRONO_CY, 7, COL_SFONDO);
+    dmDot(g, CRONO_CX, CRONO_CY, 13, COL_SFONDO);
 }
 
 static void disegnaCrono(Arduino_GFX *g)
