@@ -252,7 +252,8 @@ enum Vista
     VISTA_SCHEDE = 0,
     VISTA_LISTA,      // l'elenco delle sveglie
     VISTA_EDITOR,     // imposta un orario
-    VISTA_ALLARME     // sta suonando
+    VISTA_ALLARME,    // sta suonando
+    VISTA_GIRI        // l'elenco dei giri del cronografo
 };
 
 static Vista vista = VISTA_SCHEDE;
@@ -366,6 +367,12 @@ static uint32_t cronoAccumulato = 0;  // quanto aveva gia' fatto prima dell'ulti
 static uint32_t cronoGiroDa = 0;      // da dove si conta il giro in corso
 static uint32_t cronoGiroUltimo = 0;  // quanto e' durato l'ultimo giro chiuso
 
+// I giri si accumulano: uno solo non serve a niente, perche' il senso
+// di un giro e' il confronto con quelli prima.
+#define MAX_GIRI 24
+static uint32_t cronoGiri[MAX_GIRI];
+static int cronoNGiri = 0;
+
 static uint32_t cronoTempo()
 {
     return cronoAccumulato + (cronoAttivo ? (millis() - cronoPartenza) : 0);
@@ -391,6 +398,7 @@ static void cronoAzzera()
     cronoAccumulato = 0;
     cronoGiroDa = 0;
     cronoGiroUltimo = 0;
+    cronoNGiri = 0;
 }
 
 // Il giro: quanto e' passato dall'ultima volta che hai premuto. Su un
@@ -401,6 +409,9 @@ static void cronoGiro()
     uint32_t adesso = cronoTempo();
     cronoGiroUltimo = adesso - cronoGiroDa;
     cronoGiroDa = adesso;
+
+    if (cronoNGiri < MAX_GIRI)
+        cronoGiri[cronoNGiri++] = cronoGiroUltimo;
 }
 
 // Anche i numeri della sveglia scorrono. Mentre tieni premuto pero'
@@ -1475,6 +1486,63 @@ static void cronoTacca(Arduino_GFX *g, float angolo, int16_t rDa, int16_t rA,
                  CRONO_CY + (int16_t)lroundf(si * r), diam, colore);
 }
 
+// Il triangolo sopra lo zero: dice dov'e' il sessanta e si trova
+// senza cercarlo anche mentre la lancetta corre. La punta guarda in
+// fuori, verso la tacca; la base sta verso il centro.
+static void cronoTriangolo(Arduino_GFX *g)
+{
+    const float a = -90.0f * (float)M_PI / 180.0f;
+    const float co = cosf(a), si = sinf(a);
+
+    const int16_t righe[3] = {CRONO_RAGGIO - 36, CRONO_RAGGIO - 44, CRONO_RAGGIO - 52};
+    const int lati[3] = {0, 1, 2};
+
+    for (int riga = 0; riga < 3; ++riga)
+        for (int k = -lati[riga]; k <= lati[riga]; ++k)
+        {
+            int16_t px = CRONO_CX + (int16_t)lroundf(co * righe[riga] - si * k * 7);
+            int16_t py = CRONO_CY + (int16_t)lroundf(si * righe[riga] + co * k * 7);
+            dmDot(g, px, py, 5, COL_ACCESO);
+        }
+}
+
+// La lancetta scorre, non scatta: siccome i decimi si contano
+// davvero, una lancetta che salta direbbe una cosa falsa su cio' che
+// si sta misurando. Ed e' una freccia - larga alla base, affilata in
+// punta - perche' un bastoncino di spessore costante punta ovunque.
+//
+// I punti laterali non spariscono di colpo: si avvicinano all'asse
+// fino a fondersi con quello centrale. Passando da tre punti a uno da
+// un raggio all'altro si vedeva uno scalino, e una lancetta con uno
+// scalino non e' affilata, e' rotta.
+static void cronoLancetta(Arduino_GFX *g, uint32_t t)
+{
+    float giro = (t % 60000UL) / 60000.0f;
+    float a = (giro * 360.0f - 90.0f) * (float)M_PI / 180.0f;
+    float co = cosf(a), si = sinf(a);
+    uint16_t colore = cronoAttivo ? COL_ROSSO : COL_ACCESO;
+
+    const int16_t rPunta = CRONO_RAGGIO - 26;
+    for (int16_t r = 12; r <= rPunta; r += 5)
+    {
+        float quanto = (float)(r - 12) / (float)(rPunta - 12);
+        float largo = (1.0f - quanto) * 5.5f;
+
+        if (largo > 1.6f)
+            for (int k = -1; k <= 1; k += 2)
+            {
+                int16_t px = CRONO_CX + (int16_t)lroundf(co * r - si * k * largo);
+                int16_t py = CRONO_CY + (int16_t)lroundf(si * r + co * k * largo);
+                dmDot(g, px, py, 5, colore);
+            }
+
+        dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
+                 CRONO_CY + (int16_t)lroundf(si * r), 5, colore);
+    }
+
+    dmMarcatore(g, CRONO_CX, CRONO_CY, 7, 4, colore);
+}
+
 static void disegnaCrono(Arduino_GFX *g)
 {
     telaio(g, "CRONOMETRO");
@@ -1492,66 +1560,8 @@ static void disegnaCrono(Arduino_GFX *g)
             cronoTacca(g, a, CRONO_RAGGIO - 10, CRONO_RAGGIO, 3, COL_ETICHETTA);
     }
 
-    // Il triangolo sopra il sessanta: su un cronografo dice dov'e' lo
-    // zero, e si trova senza doverlo cercare anche mentre la lancetta
-    // corre.
-    {
-        const float a = -90.0f * (float)M_PI / 180.0f;
-        const float co = cosf(a), si = sinf(a);
-        // La punta guarda in fuori, verso la tacca dello zero: e' lei
-        // che indica, e indica il bordo. La base sta verso il centro.
-        const int16_t righe[3] = {CRONO_RAGGIO - 36, CRONO_RAGGIO - 44, CRONO_RAGGIO - 52};
-        const int lati[3] = {0, 1, 2};
-
-        for (int riga = 0; riga < 3; ++riga)
-            for (int k = -lati[riga]; k <= lati[riga]; ++k)
-            {
-                int16_t px = CRONO_CX + (int16_t)lroundf(co * righe[riga] - si * k * 7);
-                int16_t py = CRONO_CY + (int16_t)lroundf(si * righe[riga] + co * k * 7);
-                dmDot(g, px, py, 5, COL_ACCESO);
-            }
-    }
-
-    // ---- la lancetta ----
-    //
-    // Non scatta di secondo in secondo: scorre. E' la differenza fra
-    // un quarzo e un cronografo meccanico, ma qui non e' solo gusto -
-    // siccome i decimi si contano davvero, una lancetta che salta
-    // direbbe una cosa falsa su cio' che si sta misurando.
-    //
-    // E ha la forma che hanno le lancette dei cronografi: larga alla
-    // base e affilata in punta. Un bastoncino di spessore costante
-    // punta ovunque; una freccia punta in un posto solo.
-    float giro = (t % 60000UL) / 60000.0f;
-    float a = (giro * 360.0f - 90.0f) * (float)M_PI / 180.0f;
-    float co = cosf(a), si = sinf(a);
-    uint16_t colLancetta = cronoAttivo ? COL_ROSSO : COL_ACCESO;
-
-    // I punti laterali non spariscono di colpo: si avvicinano
-    // all'asse fino a fondersi con quello centrale. Passando invece
-    // da tre punti a uno da un raggio all'altro si vedeva uno
-    // scalino, e una lancetta con uno scalino non e' affilata, e'
-    // rotta.
-    const int16_t rPunta = CRONO_RAGGIO - 26;
-    for (int16_t r = 12; r <= rPunta; r += 5)
-    {
-        float quanto = (float)(r - 12) / (float)(rPunta - 12);
-        float largo = (1.0f - quanto) * 5.5f;
-
-        if (largo > 1.6f)
-            for (int k = -1; k <= 1; k += 2)
-            {
-                int16_t px = CRONO_CX + (int16_t)lroundf(co * r - si * k * largo);
-                int16_t py = CRONO_CY + (int16_t)lroundf(si * r + co * k * largo);
-                dmDot(g, px, py, 5, colLancetta);
-            }
-
-        dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
-                 CRONO_CY + (int16_t)lroundf(si * r), 5, colLancetta);
-    }
-
-    dmMarcatore(g, CRONO_CX, CRONO_CY, 7, 4, colLancetta);
-
+    cronoTriangolo(g);
+    cronoLancetta(g, t);
     // ---- il tempo in cifre ----
     uint32_t minuti = t / 60000;
     uint32_t secondi = (t / 1000) % 60;
@@ -2758,6 +2768,52 @@ static void disegnaInterruttore(Arduino_GFX *g, int16_t x, int16_t cy, bool acce
             dmDot(g, x + (base + c) * passo, y0 + r * passo, 4, colore);
 }
 
+// L'elenco dei giri. Uno solo non direbbe niente: il senso di un giro
+// e' il confronto con quelli prima, e per confrontare bisogna vederli
+// insieme.
+static void disegnaGiri(Arduino_GFX *g)
+{
+    telaio(g, "GIRI");
+
+    disegnaGriglia(g, LCD_W - PADDING - MEZZA_ICONA, PADDING + 8, ICO_CHIUDI,
+                   ICONA_COMANDO, 4, 3, COL_SECONDARIO);
+
+    if (cronoNGiri == 0)
+    {
+        testoCentrato(g, 200, "NESSUN GIRO", 4, 3, COL_SPENTO);
+        return;
+    }
+
+    // Il migliore si segna: e' la cosa che si cerca guardando un
+    // elenco di tempi.
+    uint32_t migliore = cronoGiri[0];
+    for (int i = 1; i < cronoNGiri; ++i)
+        if (cronoGiri[i] < migliore) migliore = cronoGiri[i];
+
+    const int16_t ALTO = 108;
+    const int16_t RIGA = 46;
+    char buf[20];
+
+    for (int i = 0; i < cronoNGiri; ++i)
+    {
+        int16_t y = ALTO + i * RIGA - (int16_t)lroundf(listaScorrimento);
+        if (y < ALTO - 30 || y > LCD_H - PADDING - 20) continue;
+
+        bool top = (cronoGiri[i] == migliore) && (cronoNGiri > 1);
+
+        snprintf(buf, sizeof(buf), "%d", i + 1);
+        dmText(g, PADDING, y + 4, buf, 3, 2, COL_ETICHETTA, 2);
+
+        snprintf(buf, sizeof(buf), "%02lu:%02lu.%lu",
+                 (unsigned long)(cronoGiri[i] / 60000),
+                 (unsigned long)((cronoGiri[i] / 1000) % 60),
+                 (unsigned long)((cronoGiri[i] / 100) % 10));
+        int16_t w = dmTextWidth(buf, 4, 1);
+        dmText(g, LCD_W - PADDING - w, y, buf, 4, 3,
+               top ? COL_ROSSO : COL_ACCESO);
+    }
+}
+
 static void disegnaLista(Arduino_GFX *g)
 {
     telaio(g, "SVEGLIE");
@@ -3007,8 +3063,25 @@ static void aggiornaVisibilita()
 // riquadro: 140 pixel per 140 contro 368 per 448. L'orologio invece
 // cambia una volta al secondo, quindi tanto vale rifarlo tutto -
 // capita al massimo una volta per scorrimento.
+// Il cronografo mentre scorri: si ripulisce solo il disco interno -
+// le tacche non si muovono - e si rifanno triangolo, lancetta e
+// perno. Un terzo dell'area invece di tutta la scheda.
+static void rinfrescaCrono()
+{
+    if (!cronoAttivo || !schedaVisibile(SCHEDA_CRONO)) return;
+
+    Arduino_GFX *g = scheda[SCHEDA_CRONO];
+    const int16_t lato = 2 * (CRONO_RAGGIO - 26);
+
+    g->fillRect(CRONO_CX - lato / 2, CRONO_CY - lato / 2, lato, lato, COL_SFONDO);
+    cronoTriangolo(g);
+    cronoLancetta(g, cronoTempo());
+}
+
 static void rinfrescaVisibili()
 {
+    rinfrescaCrono();
+
     if (schedaVisibile(SCHEDA_ORA))
     {
         struct tm t;
@@ -3286,6 +3359,13 @@ static void tapNelleSchede()
                  dentroRett(tapX, tapY, LCD_W - PADDING - MEZZA_ICONA,
                             CRONO_PULSANTI_Y, 56, 34))
             cronoGiro();
+        else if (cronoNGiri > 0 &&
+                 dentroRett(tapX, tapY, LCD_W / 2, CRONO_PULSANTI_Y - 8, 76, 26))
+        {
+            vista = VISTA_GIRI;
+            listaScorrimento = 0;
+            vistaDaRidisegnare = true;
+        }
         else
             cronoAvviaFerma();
 
@@ -3436,9 +3516,11 @@ static void gestisciToccoModale()
         if (abs(tp.y - partenzaY) > 8 || abs(tp.x - tapX) > 8)
             mosso = true;
 
-        if (vista == VISTA_LISTA && mosso)
+        if ((vista == VISTA_LISTA || vista == VISTA_GIRI) && mosso)
         {
-            float massimo = (float)(nSveglie * LISTA_RIGA) - (LISTA_BASSO - LISTA_ALTO);
+            float massimo = (vista == VISTA_GIRI)
+                                ? (float)(cronoNGiri * 46) - 240.0f
+                                : (float)(nSveglie * LISTA_RIGA) - (LISTA_BASSO - LISTA_ALTO);
             if (massimo < 0) massimo = 0;
             listaScorrimento = scorrimentoPartenzaY + (partenzaY - tp.y);
             if (listaScorrimento < 0) listaScorrimento = 0;
@@ -3479,6 +3561,14 @@ static void gestisciToccoModale()
             daRidisegnare[SCHEDA_ORA] = true;
             componi();
             break;
+        case VISTA_GIRI:
+            if (dentro(tapX, tapY, LCD_W - PADDING - MEZZA_ICONA, PADDING + 8, BERSAGLIO))
+            {
+                vista = VISTA_SCHEDE;
+                daRidisegnare[SCHEDA_CRONO] = true;
+                componi();
+            }
+            break;
         case VISTA_LISTA:  tapNellaLista(); break;
         case VISTA_EDITOR: tapNellEditor(); break;
         default: break;
@@ -3501,6 +3591,7 @@ static void disegnaVista()
     switch (vista)
     {
     case VISTA_LISTA:   disegnaLista(comp); break;
+    case VISTA_GIRI:    disegnaGiri(comp);  break;
     case VISTA_EDITOR:  disegnaEditor(comp); break;
     case VISTA_ALLARME: disegnaAllarme(comp, t); break;
     default: return;
@@ -3833,23 +3924,45 @@ static void gestisciPulsante()
     // rimbalzano per qualche millisecondo: senza questa attesa un
     // colpo solo verrebbe letto come venti, e lo schermo
     // lampeggerebbe invece di cambiare stato.
+    static uint32_t premutoDa = 0;
+    static bool giaFatto = false;
+
     if (precedente == HIGH && ora == LOW && (millis() - ultimoCambio) > 300)
     {
-        ultimoCambio = millis();
-        schermoAcceso = !schermoAcceso;
+        premutoDa = millis();
+        giaFatto = false;
+    }
 
-        if (schermoAcceso)
+    // Tenuto premuto: standby, sempre e da qualunque scheda.
+    if (ora == LOW && !giaFatto && premutoDa && (millis() - premutoDa) > 700)
+    {
+        giaFatto = true;
+        ultimoCambio = millis();
+        if (schermoAcceso) entraInStandby();
+        else { esciDaStandby(); componi(); }
+    }
+
+    // Colpo secco: sul cronografo avvia e ferma - un pulsante vero e'
+    // meglio di un dito sul vetro quando conta il momento esatto.
+    // Altrove fa quello che ha sempre fatto.
+    if (precedente == LOW && ora == HIGH && !giaFatto && premutoDa)
+    {
+        ultimoCambio = millis();
+        giaFatto = true;
+
+        if (schermoAcceso && vista == VISTA_SCHEDE && schedaCorrente == SCHEDA_CRONO)
         {
-            // schermoAcceso e' gia' stato invertito: si rimette com'era
-            // e si lascia decidere alla funzione.
-            schermoAcceso = false;
-            esciDaStandby();
-            componi();
+            cronoAvviaFerma();
+            daRidisegnare[SCHEDA_CRONO] = true;
+        }
+        else if (schermoAcceso)
+        {
+            entraInStandby();
         }
         else
         {
-            schermoAcceso = true;
-            entraInStandby();
+            esciDaStandby();
+            componi();
         }
     }
 
