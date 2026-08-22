@@ -2879,19 +2879,32 @@ static void tapNelleSchede()
         Clima &clima = CLIMA_DI(schedaCorrente);
         int v = climaIndiceVelocita(clima);
 
-        if (dentro(tapX, tapY, 52, CLIMA_CY, BERSAGLIO))
+        // I bersagli non sono i simboli: sono le fasce che li
+        // contengono. La scheda e' divisa in due colonne laterali e
+        // una centrale, e in tre fasce in altezza - ventola, gradi,
+        // modalita'. Ogni punto dello schermo appartiene a qualcosa,
+        // senza zone morte fra un comando e l'altro: un dito copre
+        // mezzo centimetro di vetro e non vede cosa sta coprendo.
+        //
+        // La grafica resta identica: quello che cambia e' solo dove
+        // lo schermo ascolta.
+        const int16_t COLONNA = 58;   // meta' larghezza delle fasce laterali
+        const int16_t SINISTRA = 52;
+        const int16_t DESTRA = LCD_W - 52;
+
+        if (dentroRett(tapX, tapY, SINISTRA, 152, COLONNA, 60))
         {
             if (v > 0) climaComanda(clima, clima.acceso, clima.impostata, CLIMA_VELOCITA[v - 1], clima.modo);
         }
-        else if (dentro(tapX, tapY, LCD_W - 52, CLIMA_CY, BERSAGLIO))
+        else if (dentroRett(tapX, tapY, DESTRA, 152, COLONNA, 60))
         {
             if (v < CLIMA_N_VELOCITA - 1) climaComanda(clima, clima.acceso, clima.impostata, CLIMA_VELOCITA[v + 1], clima.modo);
         }
-        else if (dentro(tapX, tapY, 52, 274, BERSAGLIO))
+        else if (dentroRett(tapX, tapY, SINISTRA, 258, COLONNA, 42))
             climaComanda(clima, clima.acceso, clima.impostata - 1, clima.ventola, clima.modo);
-        else if (dentro(tapX, tapY, LCD_W - 52, 274, BERSAGLIO))
+        else if (dentroRett(tapX, tapY, DESTRA, 258, COLONNA, 42))
             climaComanda(clima, clima.acceso, clima.impostata + 1, clima.ventola, clima.modo);
-        else if (clima.acceso && dentroRett(tapX, tapY, CLIMA_CX, 332, 84, 30))
+        else if (clima.acceso && dentroRett(tapX, tapY, CLIMA_CX, 334, 90, 30))
             climaComanda(clima, true, clima.impostata, clima.ventola, climaProssimoModo(clima));
         else if (dentro(tapX, tapY, CLIMA_CX, CLIMA_CY, CLIMA_RAGGIO))
             climaComanda(clima, !clima.acceso, clima.impostata, clima.ventola, clima.modo);
