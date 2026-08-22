@@ -1643,7 +1643,7 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t, bool aPunti)
     // A punti sta un filo piu' larga: le serve spazio per cinque file
     // staccate, mentre da piena bastano meno pixel a fare la stessa
     // forma.
-    const float RP = aPunti ? 9.5f : 8.0f;
+    const float RP = aPunti ? 11.0f : 8.0f;
     const int16_t rPunta = CRONO_RAGGIO - 2;
     const float hPunta = 2.0f * RP * 0.866f;     // altezza di un equilatero di lato 2*RP
     const float rSpalla = rPunta - hPunta;
@@ -1654,7 +1654,13 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t, bool aPunti)
     for (int passata = 0; passata < 2; ++passata)
     {
         uint16_t tinta = (passata == 0) ? COL_SFONDO : colore;
-        int16_t grossezza = (passata == 0) ? 11 : 5;
+        // A punti il pieno e' piu' piccolo del passo, o i punti si
+        // toccano e la forma torna solida: cinque di larghezza ogni
+        // 4,6 di distanza vuol dire sovrapposti. Quattro ogni 5,5
+        // lascia un pixel e mezzo di vuoto fra l'uno e l'altro, ed e'
+        // li' che si vede che sono punti.
+        int16_t grossezza = (passata == 0) ? (aPunti ? 10 : 11)
+                                           : (aPunti ? 4 : 5);
 
         // Il passo si infittisce nel semicerchio dietro il centro: li'
         // la larghezza cambia in fretta - a un capo e' zero, a meta'
@@ -1674,8 +1680,8 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t, bool aPunti)
         // passare da tre a uno e sembravano due pixel sfuggiti dal
         // rettangolo, non un triangolo. Con cinque degrada 5-3-1 e il
         // triangolo si legge.
-        const float PASSO = aPunti ? 4.6f : 3.0f;
-        const float AVANZO = aPunti ? 4.6f : 3.5f;
+        const float PASSO = aPunti ? 5.5f : 3.0f;
+        const float AVANZO = aPunti ? 5.5f : 3.5f;
 
         for (float r = -RP; r <= rPunta; r += (r < 0.0f ? (aPunti ? 3.0f : 1.6f) : AVANZO))
         {
