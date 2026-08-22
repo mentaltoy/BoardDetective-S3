@@ -4451,11 +4451,6 @@ void setup()
     // Da qui in poi la rete se la vede un core per conto suo.
     xTaskCreatePinnedToCore(taskRete, "rete", 6144, nullptr, 1, nullptr, 0);
 
-    schedaCorrente = SCHEDA_CRONO;
-    cronoAccumulato = 41 * 1000UL + 400;
-    ridisegna(SCHEDA_CRONO);
-    componi();
-
     Serial.println("[pronto] scorri con il dito per cambiare scheda");
 }
 
