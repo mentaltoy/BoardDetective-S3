@@ -1438,8 +1438,21 @@ static void disegnaVentola(Arduino_GFX *g, int16_t cx, int16_t cy,
 //  veloci devono essere nette.
 
 #define CRONO_CX (LCD_W / 2)
-#define CRONO_CY 188
-#define CRONO_RAGGIO 108
+#define CRONO_CY 180
+#define CRONO_RAGGIO 116
+
+// Una tacca: punti in fila lungo il raggio. Sui quadranti veri le
+// tacche sono trattini, non pallini - e la differenza fra il minuto
+// e il quinto di minuto si legge dalla loro lunghezza prima ancora
+// che dal loro spessore.
+static void cronoTacca(Arduino_GFX *g, float angolo, int16_t rDa, int16_t rA,
+                       int16_t diam, uint16_t colore)
+{
+    float co = cosf(angolo), si = sinf(angolo);
+    for (int16_t r = rDa; r <= rA; r += 5)
+        dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
+                 CRONO_CY + (int16_t)lroundf(si * r), diam, colore);
+}
 
 static void disegnaCrono(Arduino_GFX *g)
 {
@@ -1448,50 +1461,68 @@ static void disegnaCrono(Arduino_GFX *g)
     uint32_t t = cronoTempo();
 
     // ---- il quadrante ----
-    //
-    // Sessanta tacche, una per secondo, e ogni cinque piu' lunga e
-    // piu' grossa: e' cosi' che si legge un quadrante senza contare
-    // le tacche una per una. Gli orologi lo fanno da tre secoli.
     for (int i = 0; i < 60; ++i)
     {
         float a = (i * 6.0f - 90.0f) * (float)M_PI / 180.0f;
-        float co = cosf(a), si = sinf(a);
-        bool grossa = (i % 5) == 0;
 
-        if (grossa)
-        {
-            dmDot(g, CRONO_CX + (int16_t)lroundf(co * CRONO_RAGGIO),
-                     CRONO_CY + (int16_t)lroundf(si * CRONO_RAGGIO), 5, COL_SECONDARIO);
-            dmDot(g, CRONO_CX + (int16_t)lroundf(co * (CRONO_RAGGIO - 10)),
-                     CRONO_CY + (int16_t)lroundf(si * (CRONO_RAGGIO - 10)), 5, COL_SECONDARIO);
-        }
+        if ((i % 5) == 0)
+            cronoTacca(g, a, CRONO_RAGGIO - 18, CRONO_RAGGIO, 5, COL_SECONDARIO);
         else
-        {
-            dmDot(g, CRONO_CX + (int16_t)lroundf(co * CRONO_RAGGIO),
-                     CRONO_CY + (int16_t)lroundf(si * CRONO_RAGGIO), 3, COL_ETICHETTA);
-        }
+            cronoTacca(g, a, CRONO_RAGGIO - 7, CRONO_RAGGIO, 3, COL_ETICHETTA);
+    }
+
+    // Il triangolo sopra il sessanta: su un cronografo dice dov'e' lo
+    // zero, e si trova senza doverlo cercare anche mentre la lancetta
+    // corre.
+    {
+        const float a = -90.0f * (float)M_PI / 180.0f;
+        const float co = cosf(a), si = sinf(a);
+        // Due file soltanto: tre punti larghi e uno in punta. Con tre
+        // file diventa un blocco, e un blocco non indica niente.
+        const int16_t righe[2] = {CRONO_RAGGIO - 25, CRONO_RAGGIO - 33};
+        const int lati[2] = {1, 0};
+
+        for (int riga = 0; riga < 2; ++riga)
+            for (int k = -lati[riga]; k <= lati[riga]; ++k)
+            {
+                int16_t px = CRONO_CX + (int16_t)lroundf(co * righe[riga] - si * k * 7);
+                int16_t py = CRONO_CY + (int16_t)lroundf(si * righe[riga] + co * k * 7);
+                dmDot(g, px, py, 5, COL_ACCESO);
+            }
     }
 
     // ---- la lancetta ----
     //
     // Non scatta di secondo in secondo: scorre. E' la differenza fra
-    // un orologio al quarzo e un cronografo meccanico, e siccome
-    // qui i decimi si contano davvero, una lancetta che salta
-    // direbbe una cosa falsa su quello che l'oggetto sta misurando.
+    // un quarzo e un cronografo meccanico, ma qui non e' solo gusto -
+    // siccome i decimi si contano davvero, una lancetta che salta
+    // direbbe una cosa falsa su cio' che si sta misurando.
+    //
+    // E ha la forma che hanno le lancette dei cronografi: larga alla
+    // base e affilata in punta. Un bastoncino di spessore costante
+    // punta ovunque; una freccia punta in un posto solo.
     float giro = (t % 60000UL) / 60000.0f;
     float a = (giro * 360.0f - 90.0f) * (float)M_PI / 180.0f;
     float co = cosf(a), si = sinf(a);
+    uint16_t colLancetta = cronoAttivo ? COL_ROSSO : COL_ACCESO;
 
-    for (int16_t r = 14; r <= CRONO_RAGGIO - 14; r += 7)
-        dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
-                 CRONO_CY + (int16_t)lroundf(si * r), 5,
-                 cronoAttivo ? COL_ROSSO : COL_SECONDARIO);
+    const int16_t rPunta = CRONO_RAGGIO - 24;
+    for (int16_t r = 12; r <= rPunta; r += 6)
+    {
+        float quanto = (float)(r - 12) / (float)(rPunta - 12);
+        int lati = (quanto < 0.38f) ? 1 : 0;   // tre punti di larghezza, poi uno
 
-    // Il perno.
-    dmMarcatore(g, CRONO_CX, CRONO_CY, 7, 4,
-                cronoAttivo ? COL_ROSSO : COL_SECONDARIO);
+        for (int k = -lati; k <= lati; ++k)
+        {
+            int16_t px = CRONO_CX + (int16_t)lroundf(co * r - si * k * 5);
+            int16_t py = CRONO_CY + (int16_t)lroundf(si * r + co * k * 5);
+            dmDot(g, px, py, 5, colLancetta);
+        }
+    }
 
-    // ---- il tempo in cifre, sotto ----
+    dmMarcatore(g, CRONO_CX, CRONO_CY, 7, 4, colLancetta);
+
+    // ---- il tempo in cifre ----
     uint32_t minuti = t / 60000;
     uint32_t secondi = (t / 1000) % 60;
     uint32_t decimi = (t / 100) % 10;
@@ -1499,26 +1530,24 @@ static void disegnaCrono(Arduino_GFX *g)
     char buf[16];
     snprintf(buf, sizeof(buf), "%02lu:%02lu", (unsigned long)minuti, (unsigned long)secondi);
 
-    const int16_t passo = 6;
+    const int16_t passo = 5;
     const int16_t largoGrande = dmTextWidth(buf, passo, 1);
-    const int16_t largoDecimo = dmTextWidth("0", 4, 1);
-    const int16_t STACCO = 18;
+    const int16_t largoDecimo = dmTextWidth("0", 3, 1);
+    const int16_t STACCO = 14;
     const int16_t x0 = (LCD_W - (largoGrande + STACCO + largoDecimo)) / 2;
-    const int16_t yCifre = 330;
+    const int16_t yCifre = 322;
 
-    if (dmRullo(g, rulloCrono, buf, x0, yCifre, passo, 5, COL_ACCESO, 1, 240, 30))
+    if (dmRullo(g, rulloCrono, buf, x0, yCifre, passo, 4, COL_ACCESO, 1, 240, 30))
         numeriInMovimento = true;
 
-    dmDot(g, x0 + largoGrande + 7, yCifre + 7 * passo - 4, 5, COL_ACCESO);
+    dmDot(g, x0 + largoGrande + 5, yCifre + 7 * passo - 4, 4, COL_ACCESO);
 
     snprintf(buf, sizeof(buf), "%lu", (unsigned long)decimi);
-    dmText(g, x0 + largoGrande + STACCO, yCifre + 7 * passo - 28, buf, 4, 3,
+    dmText(g, x0 + largoGrande + STACCO, yCifre + 7 * passo - 21, buf, 3, 3,
            cronoAttivo ? COL_ROSSO : COL_SECONDARIO);
 
-    // Azzerare si puo' solo da fermo: farlo mentre corre sarebbe
-    // quasi sempre un errore.
     if (!cronoAttivo && t > 0)
-        testoCentrato(g, 388, "AZZERA", 3, 2, COL_SECONDARIO, 2);
+        testoCentrato(g, 376, "AZZERA", 3, 2, COL_SECONDARIO, 2);
 
     // Finche' corre, la lancetta chiede il fotogramma successivo.
     if (cronoAttivo && schedaCorrente == SCHEDA_CRONO)
@@ -2883,6 +2912,14 @@ static void avviaAnimazioniIngresso()
         bolleInizio = millis();
         ridisegna(SCHEDA_ARIA);
     }
+    else if (schedaCorrente == SCHEDA_CRONO)
+    {
+        // Come le schede del condizionatore: niente animazione
+        // d'ingresso, ma una lancetta che gira sempre. Se nessuno
+        // chiede il primo disegno, lei resta ferma per sempre -
+        // perche' e' disegnandosi che chiede il fotogramma dopo.
+        daRidisegnare[SCHEDA_CRONO] = true;
+    }
     else if (schedaCorrente == SCHEDA_CLIMA || schedaCorrente == SCHEDA_CLIMA2)
     {
         // Le schede del condizionatore non hanno un'animazione
@@ -3193,7 +3230,7 @@ static void tapNelleSchede()
         if (dentro(tapX, tapY, CRONO_CX, CRONO_CY, CRONO_RAGGIO))
             cronoAvviaFerma();
         else if (!cronoAttivo && cronoTempo() > 0 &&
-                 dentroRett(tapX, tapY, LCD_W / 2, 394, 110, 30))
+                 dentroRett(tapX, tapY, LCD_W / 2, 382, 110, 28))
             cronoAzzera();
         else
             return;
