@@ -3280,6 +3280,8 @@ static void dormiFinoAlProssimoSecondo()
         aggiornaBatteria();
     }
 
+    // Con il cavo attaccato non dorme: non serve risparmiare, e nel
+    // sonno la board non risponde nemmeno al caricamento.
     if (alimentato)
     {
         delay(50);
