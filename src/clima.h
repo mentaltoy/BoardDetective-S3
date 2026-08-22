@@ -28,11 +28,14 @@
 #include <Arduino.h>
 #include <HTTPClient.h>
 
-#define CLIMA_IP "192.168.1.2"
-#define CLIMA_NOME "SALONE"
-
 struct Clima
 {
+    Clima(const char *indirizzo, const char *etichetta)
+        : ip(indirizzo), nome(etichetta) {}
+
+    const char *ip;
+    const char *nome;
+
     bool valido = false;
     bool acceso = false;
     int modo = 3;          // 3 = raffredda, 4 = riscalda, 2 = deumidifica, 6 = ventola
@@ -41,10 +44,19 @@ struct Clima
     float esterna = 0;
     String ventola = "A";
     String direzione = "0";
-    uint32_t ultimoTentativo = 0;
+
+    // Lo stato della pala, che vive fra un disegno e l'altro.
+    float angolo = 0;
+    float velocita = 0;
+    uint32_t ultimoGiro = 0;
 };
 
-static Clima clima;
+// Le macchine di casa. Aggiungerne una e' una riga.
+#define N_CLIMI 2
+static Clima climi[N_CLIMI] = {
+    {"192.168.1.2", "SALONE"},
+    {"192.168.1.6", "CAMERA"},
+};
 
 // Estrae un campo dalla riga di risposta.
 static String climaCampo(const String &riga, const char *nome)
@@ -61,13 +73,13 @@ static String climaCampo(const String &riga, const char *nome)
     return riga.substring(inizio, fine);
 }
 
-static bool climaChiama(const char *percorso, String &risposta)
+static bool climaChiama(const Clima &c, const char *percorso, String &risposta)
 {
     HTTPClient http;
     http.setTimeout(3000);
     http.setConnectTimeout(2000);
 
-    String url = String("http://") + CLIMA_IP + percorso;
+    String url = String("http://") + c.ip + percorso;
     if (!http.begin(url)) return false;
 
     int codice = http.GET();
@@ -81,10 +93,10 @@ static bool climaChiama(const char *percorso, String &risposta)
     return risposta.startsWith("ret=OK");
 }
 
-static bool climaLeggi()
+static bool climaLeggi(Clima &clima)
 {
     String r;
-    if (!climaChiama("/aircon/get_control_info", r))
+    if (!climaChiama(clima, "/aircon/get_control_info", r))
     {
         clima.valido = false;
         return false;
@@ -96,7 +108,7 @@ static bool climaLeggi()
     clima.ventola = climaCampo(r, "f_rate");
     clima.direzione = climaCampo(r, "f_dir");
 
-    if (climaChiama("/aircon/get_sensor_info", r))
+    if (climaChiama(clima, "/aircon/get_sensor_info", r))
     {
         clima.interna = climaCampo(r, "htemp").toFloat();
         clima.esterna = climaCampo(r, "otemp").toFloat();
@@ -112,7 +124,7 @@ static bool climaLeggi()
 static const char *CLIMA_VELOCITA[] = {"B", "3", "4", "5", "6", "7", "A"};
 #define CLIMA_N_VELOCITA 7
 
-static int climaIndiceVelocita()
+static int climaIndiceVelocita(const Clima &clima)
 {
     for (int i = 0; i < CLIMA_N_VELOCITA; ++i)
         if (clima.ventola == CLIMA_VELOCITA[i]) return i;
@@ -131,7 +143,7 @@ static const char *climaNomeVelocita(const String &f)
 // Quanti millesimi di secondo per un giro di pala. Piu' forte va, piu'
 // in fretta gira: e' l'unica cosa che risponde subito all'occhio, e
 // vederla accelerare e' la prova che il comando e' arrivato.
-static uint32_t climaGiroMs()
+static uint32_t climaGiroMs(const Clima &clima)
 {
     if (clima.ventola == "B") return 11000;
     if (clima.ventola == "A") return 6500;
@@ -147,7 +159,8 @@ static uint32_t climaGiroMs()
 }
 
 // Rimanda tutto lo stato con dentro le modifiche richieste.
-static bool climaComanda(bool acceso, float gradi, const String &ventola, int modo)
+static bool climaComanda(Clima &clima, bool acceso, float gradi,
+                         const String &ventola, int modo)
 {
     if (gradi < 16) gradi = 16;
     if (gradi > 32) gradi = 32;
@@ -159,7 +172,7 @@ static bool climaComanda(bool acceso, float gradi, const String &ventola, int mo
              ventola.c_str(), clima.direzione.c_str());
 
     String r;
-    if (!climaChiama(url, r)) return false;
+    if (!climaChiama(clima, url, r)) return false;
 
     // Si aggiorna subito quello che si vede, senza aspettare la
     // rilettura: il comando e' andato a buon fine, e vedere il numero
@@ -177,7 +190,7 @@ static bool climaComanda(bool acceso, float gradi, const String &ventola, int mo
 static const int CLIMA_MODI[] = {3, 4, 2, 6, 1};
 #define CLIMA_N_MODI 5
 
-static int climaProssimoModo()
+static int climaProssimoModo(const Clima &clima)
 {
     for (int i = 0; i < CLIMA_N_MODI; ++i)
         if (CLIMA_MODI[i] == clima.modo)

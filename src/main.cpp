@@ -195,9 +195,9 @@ static Arduino_Canvas *comp = new Arduino_Canvas(LCD_W, LCD_H, panel);
 // ------------------------------------------------------------
 
 #if HA_LOGO
-#define N_SCHEDE 7
+#define N_SCHEDE 8
 #else
-#define N_SCHEDE 6
+#define N_SCHEDE 7
 #endif
 
 #define SCHEDA_ORA 0
@@ -205,8 +205,12 @@ static Arduino_Canvas *comp = new Arduino_Canvas(LCD_W, LCD_H, panel);
 #define SCHEDA_METEO 2
 #define SCHEDA_BARO 3
 #define SCHEDA_ARIA 4
-#define SCHEDA_CLIMA 5
-#define SCHEDA_LOGO 6
+#define SCHEDA_CLIMA 5     // il salone
+#define SCHEDA_CLIMA2 6    // la camera
+#define SCHEDA_LOGO 7
+
+// Da quale scheda si comanda quale macchina.
+#define CLIMA_DI(scheda) (climi[(scheda) == SCHEDA_CLIMA ? 0 : 1])
 
 // Ogni scheda ha il suo foglio di memoria, sempre pronto.
 // Sono 329 KB l'uno: con 8 MB di PSRAM ce ne stanno una ventina,
@@ -214,6 +218,7 @@ static Arduino_Canvas *comp = new Arduino_Canvas(LCD_W, LCD_H, panel);
 // L'output e' nullptr perche' questi fogli non vanno mai a
 // schermo da soli: passano sempre da "comp".
 static Arduino_Canvas *scheda[N_SCHEDE] = {
+    new Arduino_Canvas(LCD_W, LCD_H, nullptr),
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
@@ -338,7 +343,7 @@ static DmRullo rulloOra;
 static DmRullo rulloSole;
 static DmRullo rulloBaro;
 static DmRullo rulloAria;
-static DmRullo rulloClima;
+static DmRullo rulloClima[N_CLIMI];
 
 // Anche i numeri della sveglia scorrono. Mentre tieni premuto pero'
 // l'animazione si spegne: a quel ritmo non farebbe in tempo a
@@ -2232,9 +2237,9 @@ static void disegnaVentola(Arduino_GFX *g, int16_t cx, int16_t cy,
            quanti, 4, COL_SPENTO, COL_SPENTO);
 }
 
-static void disegnaClima(Arduino_GFX *g)
+static void disegnaClima(Arduino_GFX *g, Clima &clima, int quale)
 {
-    telaio(g, CLIMA_NOME);
+    telaio(g, clima.nome);
 
     if (!clima.valido)
     {
@@ -2251,26 +2256,25 @@ static void disegnaClima(Arduino_GFX *g)
     // faceva saltare la pala in un'altra posizione. E la velocita'
     // insegue quella richiesta invece di adottarla di colpo - una
     // ventola ha una massa, prende giri e li perde.
-    static float angolo = 0;
-    static float velocita = 0;
-    static uint32_t ultimoGiro = 0;
-
     uint32_t adesso = millis();
-    float dt = (adesso - ultimoGiro) / 1000.0f;
-    ultimoGiro = adesso;
+    float dt = (adesso - clima.ultimoGiro) / 1000.0f;
+    clima.ultimoGiro = adesso;
     if (dt > 0.2f) dt = 0.2f;
 
     float bersaglio = clima.acceso
-                          ? (2.0f * (float)M_PI) / (climaGiroMs() / 1000.0f)
+                          ? (2.0f * (float)M_PI) / (climaGiroMs(clima) / 1000.0f)
                           : 0.0f;
 
-    velocita += (bersaglio - velocita) * fminf(1.0f, dt * 1.6f);
-    angolo += velocita * dt;
-    if (angolo > 2.0f * (float)M_PI) angolo -= 2.0f * (float)M_PI;
+    clima.velocita += (bersaglio - clima.velocita) * fminf(1.0f, dt * 1.6f);
+    clima.angolo += clima.velocita * dt;
+    if (clima.angolo > 2.0f * (float)M_PI) clima.angolo -= 2.0f * (float)M_PI;
+
+    float angolo = clima.angolo;
 
     // Finche' gira - anche mentre sta rallentando fino a fermarsi -
     // la scheda va ridisegnata.
-    if (schedaCorrente == SCHEDA_CLIMA && (clima.acceso || velocita > 0.02f))
+    if ((clima.acceso || clima.velocita > 0.02f) &&
+        (schedaCorrente == SCHEDA_CLIMA || schedaCorrente == SCHEDA_CLIMA2))
         numeriInMovimento = true;
 
     disegnaVentola(g, CLIMA_CX, CLIMA_CY, CLIMA_RAGGIO, angolo,
@@ -2289,7 +2293,7 @@ static void disegnaClima(Arduino_GFX *g)
     char buf[16];
     snprintf(buf, sizeof(buf), "%d^", (int)lroundf(clima.impostata));
     int16_t largo = dmTextWidth(buf, 9, 1);
-    if (dmRullo(g, rulloClima, buf, (LCD_W - largo) / 2, 248, 9, 7,
+    if (dmRullo(g, rulloClima[quale], buf, (LCD_W - largo) / 2, 248, 9, 7,
                 clima.acceso ? COL_ACCESO : COL_SPENTO))
         numeriInMovimento = true;
 
@@ -2337,7 +2341,8 @@ static void ridisegna(int i)
     case SCHEDA_METEO: disegnaMeteo(scheda[i]);   break;
     case SCHEDA_BARO:  disegnaBaro(scheda[i]);   break;
     case SCHEDA_ARIA:  disegnaAria(scheda[i]);   break;
-    case SCHEDA_CLIMA: disegnaClima(scheda[i]);  break;
+    case SCHEDA_CLIMA:  disegnaClima(scheda[i], climi[0], 0); break;
+    case SCHEDA_CLIMA2: disegnaClima(scheda[i], climi[1], 1); break;
 #if HA_LOGO
     case SCHEDA_LOGO:  disegnaLogo(scheda[i]);    break;
 #endif
@@ -2783,32 +2788,36 @@ static void tapNelleSchede()
     }
 #endif
 
-    if (schedaCorrente == SCHEDA_CLIMA && clima.valido)
+    if ((schedaCorrente == SCHEDA_CLIMA || schedaCorrente == SCHEDA_CLIMA2) &&
+        CLIMA_DI(schedaCorrente).valido)
     {
-        // Meno e piu' ai lati, e il resto della scheda accende o
-        // spegne: il bersaglio piu' grande per il gesto piu' comune.
-        int v = climaIndiceVelocita();
+        // Ogni scheda comanda la sua macchina. Meno e piu' ai lati per
+        // ventola e gradi, la scritta rossa per la modalita', e tutto
+        // il resto accende o spegne: il bersaglio piu' grande per il
+        // gesto piu' comune.
+        Clima &clima = CLIMA_DI(schedaCorrente);
+        int v = climaIndiceVelocita(clima);
 
         if (dentro(tapX, tapY, 52, CLIMA_CY, BERSAGLIO))
         {
-            if (v > 0) climaComanda(clima.acceso, clima.impostata, CLIMA_VELOCITA[v - 1], clima.modo);
+            if (v > 0) climaComanda(clima, clima.acceso, clima.impostata, CLIMA_VELOCITA[v - 1], clima.modo);
         }
         else if (dentro(tapX, tapY, LCD_W - 52, CLIMA_CY, BERSAGLIO))
         {
-            if (v < CLIMA_N_VELOCITA - 1) climaComanda(clima.acceso, clima.impostata, CLIMA_VELOCITA[v + 1], clima.modo);
+            if (v < CLIMA_N_VELOCITA - 1) climaComanda(clima, clima.acceso, clima.impostata, CLIMA_VELOCITA[v + 1], clima.modo);
         }
         else if (dentro(tapX, tapY, 52, 274, BERSAGLIO))
-            climaComanda(clima.acceso, clima.impostata - 1, clima.ventola, clima.modo);
+            climaComanda(clima, clima.acceso, clima.impostata - 1, clima.ventola, clima.modo);
         else if (dentro(tapX, tapY, LCD_W - 52, 274, BERSAGLIO))
-            climaComanda(clima.acceso, clima.impostata + 1, clima.ventola, clima.modo);
+            climaComanda(clima, clima.acceso, clima.impostata + 1, clima.ventola, clima.modo);
         else if (clima.acceso && dentro(tapX, tapY, CLIMA_CX, 332, 26))
-            climaComanda(true, clima.impostata, clima.ventola, climaProssimoModo());
+            climaComanda(clima, true, clima.impostata, clima.ventola, climaProssimoModo(clima));
         else if (dentro(tapX, tapY, CLIMA_CX, CLIMA_CY, CLIMA_RAGGIO))
-            climaComanda(!clima.acceso, clima.impostata, clima.ventola, clima.modo);
+            climaComanda(clima, !clima.acceso, clima.impostata, clima.ventola, clima.modo);
         else
             return;
 
-        daRidisegnare[SCHEDA_CLIMA] = true;
+        daRidisegnare[schedaCorrente] = true;
         return;
     }
 
@@ -3319,6 +3328,54 @@ static void gestisciPulsante()
 }
 
 // ------------------------------------------------------------
+//  CHI PARLA CON LA RETE
+// ------------------------------------------------------------
+//  Tutte le chiamate stanno qui, su un core loro. Prima erano nel
+//  ciclo principale, e ogni volta che il programma si fermava ad
+//  aspettare una risposta - decimi di secondo per il condizionatore
+//  in casa, secondi interi per un server lontano - lo schermo
+//  restava fermo. Si vedeva bene sulla ventola, che e' l'unica cosa
+//  che gira di continuo: ogni tanto si bloccava di colpo.
+//
+//  Aspettare non e' lavorare: mentre questo core sta fermo in
+//  attesa di una risposta, l'altro continua a disegnare.
+
+static void taskRete(void *)
+{
+    uint32_t prossimoMeteoTask = 0;
+
+    for (;;)
+    {
+        if (retePresente)
+        {
+            for (int i = 0; i < N_CLIMI; ++i)
+            {
+                bool eraAcceso = climi[i].acceso;
+                float eranoGradi = climi[i].impostata;
+                bool eraValido = climi[i].valido;
+
+                climaLeggi(climi[i]);
+
+                if (climi[i].valido != eraValido ||
+                    climi[i].acceso != eraAcceso ||
+                    climi[i].impostata != eranoGradi)
+                    daRidisegnare[SCHEDA_CLIMA + i] = true;
+            }
+
+            if ((int32_t)(millis() - prossimoMeteoTask) >= 0)
+            {
+                bool ok = scaricaMeteo();
+                scaricaAria();
+                prossimoMeteoTask = millis() + (ok ? 30UL * 60UL * 1000UL
+                                                   : 2UL * 60UL * 1000UL);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20000));
+    }
+}
+
+// ------------------------------------------------------------
 //  SETUP
 // ------------------------------------------------------------
 
@@ -3402,13 +3459,16 @@ void setup()
     prossimoMeteo = millis() + (scaricaMeteo() ? 30UL * 60UL * 1000UL : 2UL * 60UL * 1000UL);
     scaricaAria();
 
-    if (climaLeggi())
-        Serial.printf("[clima] %s, %s, chiesti %.0f gradi, in casa %.0f, fuori %.0f\n",
-                      clima.acceso ? "acceso" : "spento", climaModo(clima.modo),
-                      clima.impostata, clima.interna, clima.esterna);
-    else
-        Serial.println("[clima] condizionatore non raggiungibile");
-    prossimoClima = millis() + 30000UL;
+    for (int i = 0; i < N_CLIMI; ++i)
+    {
+        if (climaLeggi(climi[i]))
+            Serial.printf("[clima] %s: %s, %s, chiesti %.0f, in casa %.0f, fuori %.0f\n",
+                          climi[i].nome, climi[i].acceso ? "acceso" : "spento",
+                          climaModo(climi[i].modo), climi[i].impostata,
+                          climi[i].interna, climi[i].esterna);
+        else
+            Serial.printf("[clima] %s non raggiungibile\n", climi[i].nome);
+    }
 
     for (int i = 0; i < N_SCHEDE; ++i)
         ridisegna(i);
@@ -3420,6 +3480,9 @@ void setup()
 #else
     Serial.println("[web] specchio spento (SPECCHIO 0 in main.cpp)");
 #endif
+
+    // Da qui in poi la rete se la vede un core per conto suo.
+    xTaskCreatePinnedToCore(taskRete, "rete", 6144, nullptr, 1, nullptr, 0);
 
     Serial.println("[pronto] scorri con il dito per cambiare scheda");
 }
@@ -3536,27 +3599,6 @@ void loop()
             aggiornaBatteria();
             daRidisegnare[SCHEDA_METEO] = true;   // per l'indicatore di carica
         }
-    }
-
-    // Il condizionatore sta in casa: la risposta arriva in pochi
-    // millesimi, e chiederglielo spesso non costa niente. Ma si evita
-    // mentre il dito e' sullo schermo, o l'attesa si sentirebbe.
-    if (retePresente && (int32_t)(millis() - prossimoClima) >= 0)
-    {
-        prossimoClima = millis() + 30000UL;
-        bool prima = clima.acceso;
-        float gradiPrima = clima.impostata;
-        if (climaLeggi() && (prima != clima.acceso || gradiPrima != clima.impostata))
-            daRidisegnare[SCHEDA_CLIMA] = true;
-    }
-
-    if (retePresente && (int32_t)(millis() - prossimoMeteo) >= 0)
-    {
-        // Andata bene si riguarda fra mezz'ora, andata male fra due
-        // minuti: un buco di rete non deve lasciare la scheda vuota
-        // per tutto quel tempo.
-        prossimoMeteo = millis() + (scaricaMeteo() ? 30UL * 60UL * 1000UL : 2UL * 60UL * 1000UL);
-        scaricaAria();
     }
 
     // Si ridisegna solo quella che stai guardando: le altre
