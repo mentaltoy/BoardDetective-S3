@@ -392,8 +392,25 @@ static void cronoAvviaFerma()
     }
 }
 
+// Azzerare non e' istantaneo: la lancetta torna indietro fino allo
+// zero. Su un cronografo meccanico quel ritorno esiste davvero, ed e'
+// anche il modo di far vedere che il comando e' stato ricevuto -
+// altrimenti premi e non succede niente di visibile, perche' il
+// quadrante era gia' quasi fermo.
+#define AZZERA_DURATA 620
+static bool azzeraInCorso = false;
+static uint32_t azzeraInizio = 0;
+static float azzeraDa = 0;
+
 static void cronoAzzera()
 {
+    azzeraDa = (cronoTempo() % 60000UL) / 60000.0f;
+    if (azzeraDa > 0.001f)
+    {
+        azzeraInizio = millis();
+        azzeraInCorso = true;
+    }
+
     cronoAttivo = false;
     cronoAccumulato = 0;
     cronoGiroDa = 0;
@@ -1535,7 +1552,29 @@ static void cronoTriangolo(Arduino_GFX *g)
 // scalino non e' affilata, e' rotta.
 static void cronoLancetta(Arduino_GFX *g, uint32_t t)
 {
-    float giro = (t % 60000UL) / 60000.0f;
+    float giro;
+    if (azzeraInCorso)
+    {
+        uint32_t passato = millis() - azzeraInizio;
+        if (passato >= AZZERA_DURATA)
+        {
+            azzeraInCorso = false;
+            giro = 0.0f;
+        }
+        else
+        {
+            // Parte deciso e si posa sullo zero, come una lancetta
+            // che viene richiamata da una molla.
+            float p = (float)passato / (float)AZZERA_DURATA;
+            giro = azzeraDa * powf(1.0f - p, 2.2f);
+            numeriInMovimento = true;
+        }
+    }
+    else
+    {
+        giro = (t % 60000UL) / 60000.0f;
+    }
+
     float a = (giro * 360.0f - 90.0f) * (float)M_PI / 180.0f;
     float co = cosf(a), si = sinf(a);
     uint16_t colore = cronoAttivo ? COL_ROSSO : COL_ACCESO;
@@ -1563,7 +1602,7 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
         uint16_t tinta = (passata == 0) ? COL_SFONDO : colore;
         int16_t grossezza = (passata == 0) ? 11 : 5;
 
-        for (float r = -RP; r <= rPunta; r += 4.0f)
+        for (float r = -RP; r <= rPunta; r += 3.5f)
         {
             float semi;
             if (r < 0.0f)
@@ -1575,14 +1614,30 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
 
             if (semi < 0.0f) semi = 0.0f;
 
-            int quanti = (int)(semi * 2.0f / 4.0f);
-            for (int i = 0; i <= quanti; ++i)
-            {
-                float k = (quanti > 0) ? (-semi + 2.0f * semi * i / quanti) : 0.0f;
-                int16_t px = CRONO_CX + (int16_t)lroundf(co * r - si * k);
-                int16_t py = CRONO_CY + (int16_t)lroundf(si * r + co * k);
-                dmDot(g, px, py, grossezza, tinta);
-            }
+            // Il centro della fila si disegna sempre, poi si va verso i
+            // due bordi. Distribuendo i punti fra bordo e bordo, dove
+            // la lancetta si assottiglia ne restavano due ai lati e
+            // nessuno in mezzo: e li' si apriva la fessura che si
+            // vedeva sulla punta.
+            dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
+                     CRONO_CY + (int16_t)lroundf(si * r), grossezza, tinta);
+
+            for (float k = 3.0f; k <= semi + 0.01f; k += 3.0f)
+                for (int lato = -1; lato <= 1; lato += 2)
+                {
+                    int16_t px = CRONO_CX + (int16_t)lroundf(co * r - si * k * lato);
+                    int16_t py = CRONO_CY + (int16_t)lroundf(si * r + co * k * lato);
+                    dmDot(g, px, py, grossezza, tinta);
+                }
+
+            // E i due bordi esatti, che il passo fisso salterebbe.
+            if (semi > 2.0f)
+                for (int lato = -1; lato <= 1; lato += 2)
+                {
+                    int16_t px = CRONO_CX + (int16_t)lroundf(co * r - si * semi * lato);
+                    int16_t py = CRONO_CY + (int16_t)lroundf(si * r + co * semi * lato);
+                    dmDot(g, px, py, grossezza, tinta);
+                }
         }
     }
 
@@ -1648,8 +1703,9 @@ static void disegnaCrono(Arduino_GFX *g)
 
 
 
-    // Finche' corre, la lancetta chiede il fotogramma successivo.
-    if (cronoAttivo && schedaCorrente == SCHEDA_CRONO)
+    // Finche' corre - o finche' torna verso lo zero - la lancetta
+    // chiede il fotogramma successivo.
+    if ((cronoAttivo || azzeraInCorso) && schedaCorrente == SCHEDA_CRONO)
         numeriInMovimento = true;
 }
 
@@ -3130,7 +3186,7 @@ static void aggiornaVisibilita()
 // perno. Un terzo dell'area invece di tutta la scheda.
 static void rinfrescaCrono()
 {
-    if (!cronoAttivo || !schedaVisibile(SCHEDA_CRONO)) return;
+    if ((!cronoAttivo && !azzeraInCorso) || !schedaVisibile(SCHEDA_CRONO)) return;
 
     Arduino_GFX *g = scheda[SCHEDA_CRONO];
 
