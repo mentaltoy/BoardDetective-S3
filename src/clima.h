@@ -49,6 +49,11 @@ struct Clima
     float angolo = 0;
     float velocita = 0;
     uint32_t ultimoGiro = 0;
+
+    // Alzata quando c'e' un comando da spedire. Chi tocca cambia lo
+    // stato qui e alza questa; a spedirlo davvero ci pensa il core
+    // della rete, quando puo'.
+    volatile bool daInviare = false;
 };
 
 // Le macchine di casa. Aggiungerne una e' una riga.
@@ -158,31 +163,40 @@ static uint32_t climaGiroMs(const Clima &clima)
     return 6500;
 }
 
-// Rimanda tutto lo stato con dentro le modifiche richieste.
-static bool climaComanda(Clima &clima, bool acceso, float gradi,
+// Il tocco cambia subito quello che si vede e lascia detto che c'e'
+// da spedire. Non aspetta la macchina.
+//
+// E' una scelta, non una scorciatoia: la risposta arriva in qualche
+// decimo di secondo, e in quel tempo un'interfaccia che non reagisce
+// sembra rotta - si finisce per premere due volte. Mostrare subito il
+// risultato e mandarlo per davvero un istante dopo e' il modo in cui
+// si comportano tutte le cose che sembrano immediate. Se la macchina
+// non recepisse, la rilettura periodica rimetterebbe le cose a posto
+// da sola entro venti secondi.
+static void climaComanda(Clima &clima, bool acceso, float gradi,
                          const String &ventola, int modo)
 {
     if (gradi < 16) gradi = 16;
     if (gradi > 32) gradi = 32;
 
-    char url[160];
-    snprintf(url, sizeof(url),
-             "/aircon/set_control_info?pow=%d&mode=%d&stemp=%.1f&shum=0&f_rate=%s&f_dir=%s",
-             acceso ? 1 : 0, modo, gradi,
-             ventola.c_str(), clima.direzione.c_str());
-
-    String r;
-    if (!climaChiama(clima, url, r)) return false;
-
-    // Si aggiorna subito quello che si vede, senza aspettare la
-    // rilettura: il comando e' andato a buon fine, e vedere il numero
-    // cambiare nell'istante in cui tocchi e' meta' della sensazione
-    // che il comando funzioni.
     clima.acceso = acceso;
     clima.impostata = gradi;
     clima.ventola = ventola;
     clima.modo = modo;
-    return true;
+    clima.daInviare = true;
+}
+
+// Spedisce davvero lo stato: la chiama il core della rete.
+static bool climaSpedisci(Clima &clima)
+{
+    char url[160];
+    snprintf(url, sizeof(url),
+             "/aircon/set_control_info?pow=%d&mode=%d&stemp=%.1f&shum=0&f_rate=%s&f_dir=%s",
+             clima.acceso ? 1 : 0, clima.modo, clima.impostata,
+             clima.ventola.c_str(), clima.direzione.c_str());
+
+    String r;
+    return climaChiama(clima, url, r);
 }
 
 // Le modalita' in un giro: freddo, caldo, deumidifica, ventola,

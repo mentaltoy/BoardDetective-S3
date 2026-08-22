@@ -344,6 +344,7 @@ static DmRullo rulloSole;
 static DmRullo rulloBaro;
 static DmRullo rulloAria;
 static DmRullo rulloClima[N_CLIMI];
+static DmRullo rulloModo[N_CLIMI];
 
 // Anche i numeri della sveglia scorrono. Mentre tieni premuto pero'
 // l'animazione si spegne: a quel ritmo non farebbe in tempo a
@@ -2299,9 +2300,28 @@ static void disegnaClima(Arduino_GFX *g, Clima &clima, int quale)
 
     // La modalita' e' anche un comando: toccandola si passa alla
     // successiva. Il rosso la faceva gia' sembrare la cosa viva della
-    // scheda, tanto vale che lo sia.
-    testoCentrato(g, 322, clima.acceso ? climaModo(clima.modo) : "SPENTO", 3, 3,
-                  clima.acceso ? COL_ROSSO : COL_SPENTO, 2);
+    // scheda, tanto vale che lo sia. E cambia scorrendo, come i
+    // numeri dell'orologio.
+    //
+    // Il nome viene messo dentro un campo di larghezza fissa, con gli
+    // spazi ai lati: le parole sono lunghe diverse, e centrando ogni
+    // volta il testo salterebbe di lato mentre scorre. Cosi' invece la
+    // riga resta ferma e si muovono solo le lettere.
+    {
+        const char *nome = clima.acceso ? climaModo(clima.modo) : "SPENTO";
+        char campo[20];
+        int len = strlen(nome);
+        int vuoto = 12 - len;
+        if (vuoto < 0) vuoto = 0;
+        int sinistra = vuoto / 2;
+        snprintf(campo, sizeof(campo), "%*s%s%*s", sinistra, "", nome,
+                 vuoto - sinistra, "");
+
+        int16_t largoModo = dmTextWidth(campo, 3, 2);
+        if (dmRullo(g, rulloModo[quale], campo, (LCD_W - largoModo) / 2, 322, 3, 3,
+                    clima.acceso ? COL_ROSSO : COL_SPENTO, 2, 520, 45))
+            numeriInMovimento = true;
+    }
 
     // Quella che c'e' davvero, dentro e fuori.
     dmText(g, PADDING, 346, "IN CASA", 2, 2, COL_ETICHETTA, 2);
@@ -2742,6 +2762,14 @@ static bool dentro(int16_t x, int16_t y, int16_t cx, int16_t cy, int16_t raggio)
     return (abs(x - cx) <= raggio) && (abs(y - cy) <= raggio);
 }
 
+// Bersaglio rettangolare, per le scritte: sono larghe e basse, e un
+// quadrato o non le copre o invade quello che sta sopra e sotto.
+static bool dentroRett(int16_t x, int16_t y, int16_t cx, int16_t cy,
+                       int16_t mezzaLarghezza, int16_t mezzaAltezza)
+{
+    return (abs(x - cx) <= mezzaLarghezza) && (abs(y - cy) <= mezzaAltezza);
+}
+
 static void apriLista()
 {
     vista = VISTA_LISTA;
@@ -2810,7 +2838,7 @@ static void tapNelleSchede()
             climaComanda(clima, clima.acceso, clima.impostata - 1, clima.ventola, clima.modo);
         else if (dentro(tapX, tapY, LCD_W - 52, 274, BERSAGLIO))
             climaComanda(clima, clima.acceso, clima.impostata + 1, clima.ventola, clima.modo);
-        else if (clima.acceso && dentro(tapX, tapY, CLIMA_CX, 332, 26))
+        else if (clima.acceso && dentroRett(tapX, tapY, CLIMA_CX, 332, 84, 30))
             climaComanda(clima, true, clima.impostata, clima.ventola, climaProssimoModo(clima));
         else if (dentro(tapX, tapY, CLIMA_CX, CLIMA_CY, CLIMA_RAGGIO))
             climaComanda(clima, !clima.acceso, clima.impostata, clima.ventola, clima.modo);
@@ -3343,13 +3371,28 @@ static void gestisciPulsante()
 static void taskRete(void *)
 {
     uint32_t prossimoMeteoTask = 0;
+    uint32_t prossimaLettura = 0;
 
     for (;;)
     {
+        // Prima i comandi in attesa: chi ha appena toccato vede gia'
+        // il risultato a schermo, ma la macchina deve saperlo subito.
         if (retePresente)
+            for (int i = 0; i < N_CLIMI; ++i)
+                if (climi[i].daInviare)
+                {
+                    climi[i].daInviare = false;
+                    climaSpedisci(climi[i]);
+                }
+
+        if (retePresente && (int32_t)(millis() - prossimaLettura) >= 0)
         {
+            prossimaLettura = millis() + 20000UL;
+
             for (int i = 0; i < N_CLIMI; ++i)
             {
+                if (climi[i].daInviare) continue;   // ha la precedenza il comando
+
                 bool eraAcceso = climi[i].acceso;
                 float eranoGradi = climi[i].impostata;
                 bool eraValido = climi[i].valido;
@@ -3371,7 +3414,8 @@ static void taskRete(void *)
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(20000));
+        // Corto, per accorgersi in fretta di un comando appena dato.
+        vTaskDelay(pdMS_TO_TICKS(80));
     }
 }
 
