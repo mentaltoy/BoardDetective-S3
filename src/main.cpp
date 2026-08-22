@@ -196,19 +196,20 @@ static Arduino_Canvas *comp = new Arduino_Canvas(LCD_W, LCD_H, panel);
 // ------------------------------------------------------------
 
 #if HA_LOGO
-#define N_SCHEDE 8
+#define N_SCHEDE 9
 #else
-#define N_SCHEDE 7
+#define N_SCHEDE 8
 #endif
 
 #define SCHEDA_ORA 0
-#define SCHEDA_SOLE 1
-#define SCHEDA_METEO 2
-#define SCHEDA_BARO 3
-#define SCHEDA_ARIA 4
-#define SCHEDA_CLIMA 5     // il salone
-#define SCHEDA_CLIMA2 6    // la camera
-#define SCHEDA_LOGO 7
+#define SCHEDA_CRONO 1
+#define SCHEDA_SOLE 2
+#define SCHEDA_METEO 3
+#define SCHEDA_BARO 4
+#define SCHEDA_ARIA 5
+#define SCHEDA_CLIMA 6     // il salone
+#define SCHEDA_CLIMA2 7    // la camera
+#define SCHEDA_LOGO 8
 
 // Da quale scheda si comanda quale macchina.
 #define CLIMA_DI(scheda) (climi[(scheda) == SCHEDA_CLIMA ? 0 : 1])
@@ -219,6 +220,7 @@ static Arduino_Canvas *comp = new Arduino_Canvas(LCD_W, LCD_H, panel);
 // L'output e' nullptr perche' questi fogli non vanno mai a
 // schermo da soli: passano sempre da "comp".
 static Arduino_Canvas *scheda[N_SCHEDE] = {
+    new Arduino_Canvas(LCD_W, LCD_H, nullptr),
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
@@ -346,6 +348,45 @@ static DmRullo rulloBaro;
 static DmRullo rulloAria;
 static DmRullo rulloClima[N_CLIMI];
 static DmRullo rulloModo[N_CLIMI];
+static DmRullo rulloCrono;
+
+// ------------------------------------------------------------
+//  IL CRONOMETRO
+// ------------------------------------------------------------
+//  Il tempo non si accumula sommando pezzetti a ogni giro: si
+//  guarda l'orologio all'avvio e si sottrae. Sommare significa
+//  raccogliere tutti gli errori di arrotondamento uno dopo l'altro,
+//  e un cronometro che perde mezzo secondo ogni dieci minuti non e'
+//  un cronometro.
+
+static bool cronoAttivo = false;
+static uint32_t cronoPartenza = 0;    // quando e' stato fatto partire
+static uint32_t cronoAccumulato = 0;  // quanto aveva gia' fatto prima dell'ultima pausa
+
+static uint32_t cronoTempo()
+{
+    return cronoAccumulato + (cronoAttivo ? (millis() - cronoPartenza) : 0);
+}
+
+static void cronoAvviaFerma()
+{
+    if (cronoAttivo)
+    {
+        cronoAccumulato += millis() - cronoPartenza;
+        cronoAttivo = false;
+    }
+    else
+    {
+        cronoPartenza = millis();
+        cronoAttivo = true;
+    }
+}
+
+static void cronoAzzera()
+{
+    cronoAttivo = false;
+    cronoAccumulato = 0;
+}
 
 // Anche i numeri della sveglia scorrono. Mentre tieni premuto pero'
 // l'animazione si spegne: a quel ritmo non farebbe in tempo a
@@ -1000,6 +1041,30 @@ static const char *ICO_SPUNTA[ICONA_COMANDO] = {
     ".........",
 };
 
+static const char *ICO_AVVIA[ICONA_COMANDO] = {
+    "..#......",
+    "..##.....",
+    "..###....",
+    "..####...",
+    "..#####..",
+    "..####...",
+    "..###....",
+    "..##.....",
+    "..#......",
+};
+
+static const char *ICO_FERMA[ICONA_COMANDO] = {
+    ".##...##.",
+    ".##...##.",
+    ".##...##.",
+    ".##...##.",
+    ".##...##.",
+    ".##...##.",
+    ".##...##.",
+    ".##...##.",
+    ".........",
+};
+
 static const char *ICO_CESTINO[ICONA_COMANDO] = {
     "..#####..",
     ".#######.",
@@ -1361,6 +1426,64 @@ static void disegnaVentola(Arduino_GFX *g, int16_t cx, int16_t cy,
         dmRing(g, cx, cy, raggio, quanti, 0.0f, 360.0f * (quanti - 1) / quanti,
                quanti, 4, COL_SPENTO, COL_SPENTO);
     }
+}
+
+// ------------------------------------------------------------
+//  SCHEDA 2: IL CRONOMETRO
+// ------------------------------------------------------------
+//  Minuti e secondi scorrono come sull'orologio; i decimi no.
+//  A dieci cambi al secondo un'animazione non farebbe in tempo a
+//  finire che gia' ne parte un'altra, e si vedrebbero cifre
+//  interrotte a meta' corsa invece di un numero che corre. Le cose
+//  veloci devono essere nette.
+
+#define CRONO_Y 150
+#define CRONO_PASSO 8
+
+static void disegnaCrono(Arduino_GFX *g)
+{
+    telaio(g, "CRONOMETRO");
+
+    uint32_t t = cronoTempo();
+    uint32_t minuti = t / 60000;
+    uint32_t secondi = (t / 1000) % 60;
+    uint32_t decimi = (t / 100) % 10;
+
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%02lu:%02lu", (unsigned long)minuti, (unsigned long)secondi);
+
+    // Il blocco sta insieme: minuti e secondi grandi, il punto, e il
+    // decimo piu' piccolo appoggiato in basso, come su un cronometro
+    // da polso.
+    const int16_t largoGrande = dmTextWidth(buf, CRONO_PASSO, 1);
+    const int16_t largoDecimo = dmTextWidth("0", 5, 1);
+    const int16_t STACCO = 24;
+    const int16_t totale = largoGrande + STACCO + largoDecimo;
+    const int16_t x0 = (LCD_W - totale) / 2;
+
+    if (dmRullo(g, rulloCrono, buf, x0, CRONO_Y, CRONO_PASSO, 6, COL_ACCESO,
+                1, 240, 30))
+        numeriInMovimento = true;
+
+    // Il punto sta in basso, sulla riga dei piedi delle cifre.
+    dmDot(g, x0 + largoGrande + 9, CRONO_Y + 7 * CRONO_PASSO - 5, 6, COL_ACCESO);
+
+    snprintf(buf, sizeof(buf), "%lu", (unsigned long)decimi);
+    dmText(g, x0 + largoGrande + STACCO, CRONO_Y + 7 * CRONO_PASSO - 35, buf, 5, 4,
+           cronoAttivo ? COL_ROSSO : COL_SECONDARIO);
+
+    const char *stato = cronoAttivo ? "IN CORSA"
+                                    : (cronoTempo() > 0 ? "FERMO" : "PRONTO");
+    testoCentrato(g, 250, stato, 3, 2, COL_ETICHETTA, 2);
+
+    // Il comando grande al centro, che e' quello che si usa sempre.
+    disegnaGriglia(g, LCD_W / 2, 320, cronoAttivo ? ICO_FERMA : ICO_AVVIA,
+                   ICONA_COMANDO, 7, 6, cronoAttivo ? COL_ROSSO : COL_ACCESO);
+
+    // Azzerare si puo' solo da fermo: farlo mentre corre sarebbe
+    // quasi sempre un errore.
+    if (!cronoAttivo && cronoTempo() > 0)
+        testoCentrato(g, 386, "AZZERA", 3, 2, COL_SECONDARIO, 2);
 }
 
 // ------------------------------------------------------------
@@ -2429,6 +2552,7 @@ static void ridisegna(int i)
     switch (i)
     {
     case SCHEDA_ORA:   disegnaOra(scheda[i], t);  break;
+    case SCHEDA_CRONO: disegnaCrono(scheda[i]);   break;
     case SCHEDA_SOLE:  disegnaSole(scheda[i], t); break;
     case SCHEDA_METEO: disegnaMeteo(scheda[i]);   break;
     case SCHEDA_BARO:  disegnaBaro(scheda[i]);   break;
@@ -3019,6 +3143,22 @@ static void tapNelleSchede()
             return;
 
         daRidisegnare[schedaCorrente] = true;
+        return;
+    }
+
+    if (schedaCorrente == SCHEDA_CRONO)
+    {
+        // Il comando grande si prende la fascia centrale: e' quello
+        // che si tocca di corsa, guardando il tempo e non il dito.
+        if (dentroRett(tapX, tapY, LCD_W / 2, 320, 120, 54))
+            cronoAvviaFerma();
+        else if (!cronoAttivo && cronoTempo() > 0 &&
+                 dentroRett(tapX, tapY, LCD_W / 2, 392, 110, 32))
+            cronoAzzera();
+        else
+            return;
+
+        daRidisegnare[SCHEDA_CRONO] = true;
         return;
     }
 
@@ -3845,6 +3985,19 @@ void loop()
             prossimoTentativo = millis() + 300;
             touchOk = touch.begin();
             if (touchOk) Serial.println("[touch] risvegliato");
+        }
+    }
+
+    // Il cronometro chiede un disegno per ogni decimo che cambia.
+    // Non di piu': a schermo si vedrebbe lo stesso numero, e ogni
+    // fotogramma in piu' e' tempo tolto a tutto il resto.
+    if (cronoAttivo && schedaCorrente == SCHEDA_CRONO)
+    {
+        static uint32_t prossimoDecimo = 0;
+        if ((int32_t)(millis() - prossimoDecimo) >= 0)
+        {
+            prossimoDecimo = millis() + 90;
+            daRidisegnare[SCHEDA_CRONO] = true;
         }
     }
 
