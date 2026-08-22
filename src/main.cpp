@@ -453,6 +453,15 @@ static void axpScrivi(uint8_t reg, uint8_t valore)
 // Quali regolatori secondari sono accesi all'avvio: e' lo stato a cui
 // si torna ogni volta che ci si risveglia.
 static uint8_t ldoNormali = 0;
+static bool imuPronto = false;
+
+// Quali alimentazioni si spengono in standby: tutte quelle
+// secondarie. Provate una per una a schermo acceso, nessuna di
+// queste alimenta il pannello - lui sta su un convertitore
+// principale, che non si tocca. Ed e' anche il motivo per cui il
+// risveglio faceva crashare: rimettevo in piedi un display che non
+// era mai caduto, e la sua funzione di avvio reinizializza il bus.
+#define LDO_DA_SPEGNERE 0xFF
 
 static void aggiornaBatteria()
 {
@@ -1743,6 +1752,10 @@ static void logoGeometria(int16_t &passo, int16_t &diam, int16_t &x0, int16_t &y
 
 static void fisicaAvvia()
 {
+    // Si sveglia adesso, che e' l'unico momento in cui serve.
+    if (!imuPronto)
+        imuPronto = imuBegin();
+
     int16_t passo, diam, x0, y0;
     logoGeometria(passo, diam, x0, y0);
 
@@ -3258,8 +3271,8 @@ static void entraInStandby()
     // Il processore, la flash e la memoria stanno su un'alimentazione
     // diversa che non si tocca - se toccarla fosse possibile, la
     // board si spegnerebbe e basta.
-    if (ldoNormali)
-        axpScrivi(0x90, 0x00);
+    if (ldoNormali & LDO_DA_SPEGNERE)
+        axpScrivi(0x90, ldoNormali & ~LDO_DA_SPEGNERE);
 
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
@@ -3305,6 +3318,8 @@ static void dormiFinoAlProssimoSecondo()
 
     // Con il cavo attaccato non dorme: non serve risparmiare, e nel
     // sonno la board non risponde nemmeno al caricamento.
+    // Con il cavo attaccato non dorme: non serve risparmiare, e nel
+    // sonno la board non risponde nemmeno al caricamento.
     if (alimentato)
     {
         delay(50);
@@ -3334,27 +3349,32 @@ static void esciDaStandby()
     // Poi le alimentazioni, e il tempo perche' si stabilizzino: i
     // chip che le ricevono hanno bisogno di trovare la tensione
     // pronta prima di sentirsi parlare.
-    if (ldoNormali)
+    if (ldoNormali & LDO_DA_SPEGNERE)
     {
         axpScrivi(0x90, ldoNormali);
-        delay(120);
+
+        // Il tempo perche' le tensioni salgano. Quaranta millesimi
+        // bastano: sono regolatori piccoli, e ogni decimo speso qui
+        // e' un decimo che aspetti guardando lo schermo nero.
+        delay(40);
 
         // Restati senza corrente, hanno dimenticato tutto: vanno
-        // riconfigurati da capo, esattamente come all'accensione.
-        panel->begin();
-        audioBegin();
-        imuBegin();
+        // riconfigurati. Ma solo i chip, non i bus con cui ci si
+        // parla: quelli stanno nel processore e non si sono mai
+        // spenti, e reinstallarli darebbe errore o peggio.
+        audioRiconfigura();
 
-        // Il touch ci mette un po' a tornare in se': se ci si limita
-        // a un tentativo, accendendo lo schermo lo si trova morto per
-        // qualche secondo, che e' proprio il momento in cui uno lo
-        // tocca.
-        touchOk = false;
-        for (int tentativo = 0; tentativo < 6 && !touchOk; ++tentativo)
-        {
-            touchOk = touch.begin();
-            if (!touchOk) delay(60);
-        }
+        // L'accelerometro non si tocca qui: il suo risveglio vuole
+        // mezzo secondo di attese, e serve solo al gioco del logo.
+        // Lo si sveglia quando lo si usa, non quando si accende lo
+        // schermo - meta' del tempo di risveglio se ne andava li'.
+        imuPronto = false;
+
+        // Un tentativo solo: se non risponde subito ci pensa il
+        // ritentativo del ciclo, ogni tre decimi. Insistere qui
+        // significherebbe far aspettare chi guarda lo schermo per un
+        // pezzo che gli servira' fra un secondo.
+        touchOk = touch.begin();
     }
 
     audioRisveglio();
@@ -3677,6 +3697,14 @@ void setup()
     aggiornaBatteria();
     Serial.printf("[batteria] %d%%%s\n", batteria, alimentato ? " (cavo collegato)" : "");
 
+    // A quanti milliampere carica: serve a ricavare la capacita' vera
+    // della batteria guardando quanto sale la percentuale al minuto.
+    {
+        uint8_t icc = axpLeggi(0x62) & 0x1F;
+        int mA = (icc <= 8) ? (icc * 25) : (200 + (icc - 8) * 100);
+        Serial.printf("[axp] corrente di carica impostata: %d mA\n", mA);
+    }
+
     ldoNormali = axpLeggi(0x90);
     Serial.printf("[axp] regolatori secondari: 0x%02X\n", ldoNormali);
 
@@ -3684,7 +3712,7 @@ void setup()
     Serial.printf("[sveglie] %d salvate, %d attive\n", nSveglie, sveglieAttive());
 
     audioBegin();
-    imuBegin();
+    imuPronto = imuBegin();
 
     // Schermata di attesa: la rete puo' prendersi qualche secondo
     // e uno schermo nero sembrerebbe un blocco.
@@ -3814,7 +3842,7 @@ void loop()
         static uint32_t prossimoTentativo = 0;
         if ((int32_t)(millis() - prossimoTentativo) >= 0)
         {
-            prossimoTentativo = millis() + 500;
+            prossimoTentativo = millis() + 300;
             touchOk = touch.begin();
             if (touchOk) Serial.println("[touch] risvegliato");
         }
@@ -3823,6 +3851,20 @@ void loop()
     // Da qui in giu' si entra solo a schermo fermo.
 
     const struct tm &t = adesso;
+
+    // Un rigo al minuto sulla carica: e' l'unico modo di misurare la
+    // batteria senza uno strumento esterno - la pendenza di questa
+    // riga, insieme alla corrente di carica, da' la capacita'.
+    {
+        static uint32_t prossimaNota = 0;
+        if ((int32_t)(millis() - prossimaNota) >= 0)
+        {
+            prossimaNota = millis() + 60000UL;
+            aggiornaBatteria();
+            Serial.printf("[batteria] %d%% %s\n", batteria,
+                          alimentato ? "(in carica)" : "(a batteria)");
+        }
+    }
 
     if (t.tm_sec != ultimoSecondo)
     {

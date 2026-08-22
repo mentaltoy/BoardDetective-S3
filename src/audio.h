@@ -71,6 +71,34 @@ static uint8_t esLeggi(uint8_t reg)
     return Wire.read();
 }
 
+// Solo i registri del codec, senza toccare il bus dei campioni. Serve
+// al risveglio: il codec resta senza corrente e dimentica tutto, ma
+// il bus e' del processore e non si e' mosso - reinstallarlo darebbe
+// errore.
+static void audioRiconfigura()
+{
+    esScrivi(0x00, 0x1F);
+    delay(20);
+    esScrivi(0x00, 0x00);
+    esScrivi(0x00, 0x80);
+    esScrivi(0x01, 0x3F);
+    esScrivi(0x02, 0x00);
+    esScrivi(0x03, 0x10);
+    esScrivi(0x04, 0x10);
+    esScrivi(0x05, 0x00);
+    esScrivi(0x06, 0x03);
+    esScrivi(0x07, 0x00);
+    esScrivi(0x08, 0xFF);
+    esScrivi(0x09, 0x0C);
+    esScrivi(0x0A, 0x0C);
+    esScrivi(0x0D, 0x01);
+    esScrivi(0x0E, 0x02);
+    esScrivi(0x12, 0x00);
+    esScrivi(0x13, 0x10);
+    esScrivi(0x32, 0xC0);
+    esScrivi(0x37, 0x08);
+}
+
 static bool audioBegin()
 {
     // Il chip si presenta con due registri di sola lettura che
