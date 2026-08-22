@@ -1281,6 +1281,62 @@ static void indicatoreBatteria(Arduino_GFX *g)
                   c < piene ? colore : COL_SPENTO);
 }
 
+// Fa passare il tempo per la pala: la velocita' insegue quella
+// richiesta e l'angolo avanza di conseguenza.
+static void avanzaVentola(Clima &clima)
+{
+    uint32_t adesso = millis();
+    float dt = (adesso - clima.ultimoGiro) / 1000.0f;
+    clima.ultimoGiro = adesso;
+    if (dt > 0.2f) dt = 0.2f;
+
+    float bersaglio = clima.acceso
+                          ? (2.0f * (float)M_PI) / (climaGiroMs(clima) / 1000.0f)
+                          : 0.0f;
+
+    clima.velocita += (bersaglio - clima.velocita) * fminf(1.0f, dt * 1.6f);
+    clima.angolo += clima.velocita * dt;
+    if (clima.angolo > 2.0f * (float)M_PI) clima.angolo -= 2.0f * (float)M_PI;
+}
+
+static void disegnaVentola(Arduino_GFX *g, int16_t cx, int16_t cy,
+                           int16_t raggio, float angolo, uint16_t colore)
+{
+    // Sotto una certa taglia le pale diventano due punti e l'anello
+    // esterno si impasta con loro: la versione piccola e' piu' rada.
+    bool minuta = (raggio < 30);
+    int16_t passoPala = minuta ? 5 : 7;
+    int16_t grossezza = minuta ? 4 : 5;
+
+    // Tre pale, curve. Ogni pala e' una fila di punti che si allarga
+    // dal centro ruotando: dritta sembrerebbe un'elica di carta,
+    // piegata sembra una ventola.
+    for (int pala = 0; pala < 3; ++pala)
+    {
+        float base = angolo + pala * (2.0f * (float)M_PI / 3.0f);
+        for (int16_t r = minuta ? 6 : 10; r <= raggio - (minuta ? 2 : 12); r += passoPala)
+        {
+            float a = base + (float)r * (minuta ? 0.030f : 0.016f);
+            dmDot(g, cx + (int16_t)lroundf(cosf(a) * r),
+                     cy + (int16_t)lroundf(sinf(a) * r), grossezza, colore);
+        }
+    }
+
+    // Il mozzo, e la griglia intorno solo quando c'e' spazio.
+    if (minuta)
+    {
+        dmDot(g, cx, cy, 4, colore);
+    }
+    else
+    {
+        dmMarcatore(g, cx, cy, 6, 4, colore);
+
+        int quanti = (int)(2.0f * (float)M_PI * raggio / PASSO_QUADRANTE);
+        dmRing(g, cx, cy, raggio, quanti, 0.0f, 360.0f * (quanti - 1) / quanti,
+               quanti, 4, COL_SPENTO, COL_SPENTO);
+    }
+}
+
 // ------------------------------------------------------------
 //  SCHEDA 1: L'ORA
 // ------------------------------------------------------------
@@ -1344,6 +1400,25 @@ static void disegnaOra(Arduino_GFX *g, const struct tm &t)
         disegnaBollo(g, BARRA_SX + 50, BARRA_Y, '0' + sveglieAttive(), 4, 3, COL_ACCESO);
 
     disegnaGriglia(g, BARRA_DX, BARRA_Y, ICO_PIU, ICONA_COMANDO, 4, 3, COL_SECONDARIO);
+
+    // Una ventola piccola: dice se in casa c'e' un condizionatore
+    // acceso, senza dover andare a guardare le sue schede.
+    //
+    // Non gira: scatta di un passo al secondo, come il battito della
+    // rete e il marcatore dei secondi. Farla girare davvero
+    // vorrebbe dire ridisegnare l'orologio venti volte al secondo -
+    // trentasei millesimi ogni volta - e il processore non
+    // tornerebbe mai a dormire. In un oggetto dove tutto scandisce
+    // il secondo, uno scatto al secondo non e' un ripiego.
+    {
+        int accesi = 0;
+        for (int i = 0; i < N_CLIMI; ++i)
+            if (climi[i].valido && climi[i].acceso) ++accesi;
+
+        float scatto = (time(nullptr) % 4) * (float)M_PI / 6.0f;   // trenta gradi per volta
+        disegnaVentola(g, BARRA_DX - 52, BARRA_Y, 17, scatto,
+                       accesi > 0 ? COL_ACCESO : COL_SPENTO);
+    }
 }
 
 // ------------------------------------------------------------
@@ -2212,49 +2287,6 @@ static void disegnaAria(Arduino_GFX *g)
 #define CLIMA_CX (LCD_W / 2)
 #define CLIMA_CY 150
 #define CLIMA_RAGGIO 64
-
-// Fa passare il tempo per la pala: la velocita' insegue quella
-// richiesta e l'angolo avanza di conseguenza.
-static void avanzaVentola(Clima &clima)
-{
-    uint32_t adesso = millis();
-    float dt = (adesso - clima.ultimoGiro) / 1000.0f;
-    clima.ultimoGiro = adesso;
-    if (dt > 0.2f) dt = 0.2f;
-
-    float bersaglio = clima.acceso
-                          ? (2.0f * (float)M_PI) / (climaGiroMs(clima) / 1000.0f)
-                          : 0.0f;
-
-    clima.velocita += (bersaglio - clima.velocita) * fminf(1.0f, dt * 1.6f);
-    clima.angolo += clima.velocita * dt;
-    if (clima.angolo > 2.0f * (float)M_PI) clima.angolo -= 2.0f * (float)M_PI;
-}
-
-static void disegnaVentola(Arduino_GFX *g, int16_t cx, int16_t cy,
-                           int16_t raggio, float angolo, uint16_t colore)
-{
-    // Tre pale, curve. Ogni pala e' una fila di punti che si allarga
-    // dal centro ruotando: dritta sembrerebbe un'elica di carta,
-    // piegata sembra una ventola.
-    for (int pala = 0; pala < 3; ++pala)
-    {
-        float base = angolo + pala * (2.0f * (float)M_PI / 3.0f);
-        for (int16_t r = 10; r <= raggio - 12; r += 7)
-        {
-            float a = base + (float)r * 0.016f;
-            dmDot(g, cx + (int16_t)lroundf(cosf(a) * r),
-                     cy + (int16_t)lroundf(sinf(a) * r), 5, colore);
-        }
-    }
-
-    // Il mozzo e la griglia intorno.
-    dmMarcatore(g, cx, cy, 6, 4, colore);
-
-    int quanti = (int)(2.0f * (float)M_PI * raggio / PASSO_QUADRANTE);
-    dmRing(g, cx, cy, raggio, quanti, 0.0f, 360.0f * (quanti - 1) / quanti,
-           quanti, 4, COL_SPENTO, COL_SPENTO);
-}
 
 static void disegnaClima(Arduino_GFX *g, Clima &clima, int quale)
 {
