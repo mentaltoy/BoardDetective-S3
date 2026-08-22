@@ -1540,62 +1540,52 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
     float co = cosf(a), si = sinf(a);
     uint16_t colore = cronoAttivo ? COL_ROSSO : COL_ACCESO;
 
-    // Corpo dritto fino quasi alle tacche, poi una punta a triangolo.
-    // Una rastremazione continua su tutta la lunghezza fa una lancia,
-    // che a questa risoluzione sfuma nel nulla; il corpo parallelo
-    // resta pieno e leggibile, e a puntare ci pensa solo l'ultimo
-    // pezzo. E' la forma delle lancette dei subacquei, dove leggere
-    // in fretta conta piu' dell'eleganza.
-    // Arriva fino alle tacche e ci passa sopra, come sui subacquei:
-    // la lancetta e' quello che stai guardando, il quadrante e' il
-    // fondo.
+    // La forma e' geometrica, non approssimata: un semicerchio dietro
+    // il centro, due lati paralleli larghi quanto il suo diametro, e
+    // in punta un triangolo equilatero con la base larga uguale.
+    // Tre pezzi che si toccano dove finiscono, senza raccordi
+    // inventati - e' cosi' che sono fatte le lancette vere.
+    //
+    // Per disegnarla non si segue il contorno: per ogni distanza dal
+    // centro si calcola quanto e' larga li', e si riempie. Il
+    // semicerchio da' Pitagora, il corpo una costante, la punta una
+    // retta che scende a zero.
+    const float RP = 8.0f;                       // raggio del perno
     const int16_t rPunta = CRONO_RAGGIO - 2;
-    const int16_t rSpalla = rPunta - 22;
-    const float LARGO = 5.0f;
+    const float hPunta = 2.0f * RP * 0.866f;     // altezza di un equilatero di lato 2*RP
+    const float rSpalla = rPunta - hPunta;
 
     // Due passate. Prima tutto il vuoto, poi tutto il pieno: facendo
     // vuoto e pieno insieme punto per punto, il vuoto di ognuno
-    // cancellerebbe il pieno del precedente e la lancetta verrebbe
-    // fuori a pezzi.
+    // cancellerebbe il pieno del precedente.
     for (int passata = 0; passata < 2; ++passata)
     {
         uint16_t tinta = (passata == 0) ? COL_SFONDO : colore;
-        // Il vuoto sta appena piu' largo del pieno: quel tanto che
-        // basta a staccare la lancetta da cio' che le passa sotto.
-        // Piu' largo, e si porta via mezzo quadrante.
         int16_t grossezza = (passata == 0) ? 9 : 5;
 
-        // Parte dal centro, non da dodici pixel piu' in la': il perno
-        // dev'essere il punto da cui la lancetta comincia, non una
-        // palla appoggiata sotto. E vicino al centro si allarga, cosi'
-        // il raccordo nasce dalla forma stessa invece di essere una
-        // giunzione fra due pezzi.
-        for (int16_t r = 0; r <= rPunta; r += 4)
+        for (float r = -RP; r <= rPunta; r += 4.0f)
         {
-            float largo;
-            if (r < 20)
-                largo = LARGO + (20.0f - r) * 0.14f;
+            float semi;
+            if (r < 0.0f)
+                semi = sqrtf(RP * RP - r * r);
             else if (r <= rSpalla)
-                largo = LARGO;
+                semi = RP;
             else
-                largo = LARGO * (1.0f - (float)(r - rSpalla) / (float)(rPunta - rSpalla));
+                semi = RP * (1.0f - (r - rSpalla) / hPunta);
 
-            if (largo > 1.6f)
-                for (int k = -1; k <= 1; k += 2)
-                {
-                    int16_t px = CRONO_CX + (int16_t)lroundf(co * r - si * k * largo);
-                    int16_t py = CRONO_CY + (int16_t)lroundf(si * r + co * k * largo);
-                    dmDot(g, px, py, grossezza, tinta);
-                }
+            if (semi < 0.0f) semi = 0.0f;
 
-            dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
-                     CRONO_CY + (int16_t)lroundf(si * r), grossezza, tinta);
+            int quanti = (int)(semi * 2.0f / 4.0f);
+            for (int i = 0; i <= quanti; ++i)
+            {
+                float k = (quanti > 0) ? (-semi + 2.0f * semi * i / quanti) : 0.0f;
+                int16_t px = CRONO_CX + (int16_t)lroundf(co * r - si * k);
+                int16_t py = CRONO_CY + (int16_t)lroundf(si * r + co * k);
+                dmDot(g, px, py, grossezza, tinta);
+            }
         }
     }
 
-    // Il cuore del perno: un punto grosso quanto la lancetta e' larga,
-    // che chiude il raccordo senza aggiungere una forma nuova.
-    dmDot(g, CRONO_CX, CRONO_CY, 11, colore);
 }
 
 static void disegnaCrono(Arduino_GFX *g)
@@ -3980,38 +3970,16 @@ static void gestisciPulsante()
     // rimbalzano per qualche millisecondo: senza questa attesa un
     // colpo solo verrebbe letto come venti, e lo schermo
     // lampeggerebbe invece di cambiare stato.
-    static uint32_t premutoDa = 0;
-    static bool giaFatto = false;
-
+    // Il pulsante fa una cosa sola, sempre, da qualunque scheda:
+    // accende e spegne lo schermo. Avevo provato a dargli anche
+    // l'avvio del cronografo, ma un comando che cambia significato a
+    // seconda di dove ti trovi non e' un comando: e' una cosa da
+    // ricordare.
     if (precedente == HIGH && ora == LOW && (millis() - ultimoCambio) > 300)
     {
-        premutoDa = millis();
-        giaFatto = false;
-    }
-
-    // Tenuto premuto: standby, sempre e da qualunque scheda.
-    if (ora == LOW && !giaFatto && premutoDa && (millis() - premutoDa) > 700)
-    {
-        giaFatto = true;
         ultimoCambio = millis();
-        if (schermoAcceso) entraInStandby();
-        else { esciDaStandby(); componi(); }
-    }
 
-    // Colpo secco: sul cronografo avvia e ferma - un pulsante vero e'
-    // meglio di un dito sul vetro quando conta il momento esatto.
-    // Altrove fa quello che ha sempre fatto.
-    if (precedente == LOW && ora == HIGH && !giaFatto && premutoDa)
-    {
-        ultimoCambio = millis();
-        giaFatto = true;
-
-        if (schermoAcceso && vista == VISTA_SCHEDE && schedaCorrente == SCHEDA_CRONO)
-        {
-            cronoAvviaFerma();
-            daRidisegnare[SCHEDA_CRONO] = true;
-        }
-        else if (schermoAcceso)
+        if (schermoAcceso)
         {
             entraInStandby();
         }
