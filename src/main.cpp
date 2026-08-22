@@ -1438,8 +1438,8 @@ static void disegnaVentola(Arduino_GFX *g, int16_t cx, int16_t cy,
 //  veloci devono essere nette.
 
 #define CRONO_CX (LCD_W / 2)
-#define CRONO_CY 180
-#define CRONO_RAGGIO 116
+#define CRONO_CY 196
+#define CRONO_RAGGIO 128
 
 // Una tacca: punti in fila lungo il raggio. Sui quadranti veri le
 // tacche sono trattini, non pallini - e la differenza fra il minuto
@@ -1466,9 +1466,9 @@ static void disegnaCrono(Arduino_GFX *g)
         float a = (i * 6.0f - 90.0f) * (float)M_PI / 180.0f;
 
         if ((i % 5) == 0)
-            cronoTacca(g, a, CRONO_RAGGIO - 18, CRONO_RAGGIO, 5, COL_SECONDARIO);
+            cronoTacca(g, a, CRONO_RAGGIO - 24, CRONO_RAGGIO, 5, COL_SECONDARIO);
         else
-            cronoTacca(g, a, CRONO_RAGGIO - 7, CRONO_RAGGIO, 3, COL_ETICHETTA);
+            cronoTacca(g, a, CRONO_RAGGIO - 10, CRONO_RAGGIO, 3, COL_ETICHETTA);
     }
 
     // Il triangolo sopra il sessanta: su un cronografo dice dov'e' lo
@@ -1477,12 +1477,12 @@ static void disegnaCrono(Arduino_GFX *g)
     {
         const float a = -90.0f * (float)M_PI / 180.0f;
         const float co = cosf(a), si = sinf(a);
-        // Due file soltanto: tre punti larghi e uno in punta. Con tre
-        // file diventa un blocco, e un blocco non indica niente.
-        const int16_t righe[2] = {CRONO_RAGGIO - 25, CRONO_RAGGIO - 33};
-        const int lati[2] = {1, 0};
+        // La punta guarda in fuori, verso la tacca dello zero: e' lei
+        // che indica, e indica il bordo. La base sta verso il centro.
+        const int16_t righe[3] = {CRONO_RAGGIO - 30, CRONO_RAGGIO - 38, CRONO_RAGGIO - 46};
+        const int lati[3] = {0, 1, 2};
 
-        for (int riga = 0; riga < 2; ++riga)
+        for (int riga = 0; riga < 3; ++riga)
             for (int k = -lati[riga]; k <= lati[riga]; ++k)
             {
                 int16_t px = CRONO_CX + (int16_t)lroundf(co * righe[riga] - si * k * 7);
@@ -1506,18 +1506,27 @@ static void disegnaCrono(Arduino_GFX *g)
     float co = cosf(a), si = sinf(a);
     uint16_t colLancetta = cronoAttivo ? COL_ROSSO : COL_ACCESO;
 
-    const int16_t rPunta = CRONO_RAGGIO - 24;
-    for (int16_t r = 12; r <= rPunta; r += 6)
+    // I punti laterali non spariscono di colpo: si avvicinano
+    // all'asse fino a fondersi con quello centrale. Passando invece
+    // da tre punti a uno da un raggio all'altro si vedeva uno
+    // scalino, e una lancetta con uno scalino non e' affilata, e'
+    // rotta.
+    const int16_t rPunta = CRONO_RAGGIO - 26;
+    for (int16_t r = 12; r <= rPunta; r += 5)
     {
         float quanto = (float)(r - 12) / (float)(rPunta - 12);
-        int lati = (quanto < 0.38f) ? 1 : 0;   // tre punti di larghezza, poi uno
+        float largo = (1.0f - quanto) * 5.5f;
 
-        for (int k = -lati; k <= lati; ++k)
-        {
-            int16_t px = CRONO_CX + (int16_t)lroundf(co * r - si * k * 5);
-            int16_t py = CRONO_CY + (int16_t)lroundf(si * r + co * k * 5);
-            dmDot(g, px, py, 5, colLancetta);
-        }
+        if (largo > 1.6f)
+            for (int k = -1; k <= 1; k += 2)
+            {
+                int16_t px = CRONO_CX + (int16_t)lroundf(co * r - si * k * largo);
+                int16_t py = CRONO_CY + (int16_t)lroundf(si * r + co * k * largo);
+                dmDot(g, px, py, 5, colLancetta);
+            }
+
+        dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
+                 CRONO_CY + (int16_t)lroundf(si * r), 5, colLancetta);
     }
 
     dmMarcatore(g, CRONO_CX, CRONO_CY, 7, 4, colLancetta);
@@ -1530,24 +1539,27 @@ static void disegnaCrono(Arduino_GFX *g)
     char buf[16];
     snprintf(buf, sizeof(buf), "%02lu:%02lu", (unsigned long)minuti, (unsigned long)secondi);
 
-    const int16_t passo = 5;
+    // Punti piu' radi rispetto al passo: la stessa taglia ma meno
+    // pieni, cosi' il quadrante resta lo strumento e il numero il
+    // riscontro.
+    const int16_t passo = 4;
     const int16_t largoGrande = dmTextWidth(buf, passo, 1);
     const int16_t largoDecimo = dmTextWidth("0", 3, 1);
-    const int16_t STACCO = 14;
+    const int16_t STACCO = 12;
     const int16_t x0 = (LCD_W - (largoGrande + STACCO + largoDecimo)) / 2;
-    const int16_t yCifre = 322;
+    const int16_t yCifre = 344;
 
-    if (dmRullo(g, rulloCrono, buf, x0, yCifre, passo, 4, COL_ACCESO, 1, 240, 30))
+    if (dmRullo(g, rulloCrono, buf, x0, yCifre, passo, 3, COL_ACCESO, 1, 240, 30))
         numeriInMovimento = true;
 
-    dmDot(g, x0 + largoGrande + 5, yCifre + 7 * passo - 4, 4, COL_ACCESO);
+    dmDot(g, x0 + largoGrande + 4, yCifre + 7 * passo - 3, 3, COL_ACCESO);
 
     snprintf(buf, sizeof(buf), "%lu", (unsigned long)decimi);
-    dmText(g, x0 + largoGrande + STACCO, yCifre + 7 * passo - 21, buf, 3, 3,
+    dmText(g, x0 + largoGrande + STACCO, yCifre + 7 * passo - 21, buf, 3, 2,
            cronoAttivo ? COL_ROSSO : COL_SECONDARIO);
 
     if (!cronoAttivo && t > 0)
-        testoCentrato(g, 376, "AZZERA", 3, 2, COL_SECONDARIO, 2);
+        testoCentrato(g, 384, "AZZERA", 3, 2, COL_SECONDARIO, 2);
 
     // Finche' corre, la lancetta chiede il fotogramma successivo.
     if (cronoAttivo && schedaCorrente == SCHEDA_CRONO)
@@ -3224,16 +3236,14 @@ static void tapNelleSchede()
 
     if (schedaCorrente == SCHEDA_CRONO)
     {
-        // Si preme il quadrante, come la corona di un cronografo. Il
-        // bersaglio e' tutto il disco: di corsa si guarda il tempo,
-        // non il dito.
-        if (dentro(tapX, tapY, CRONO_CX, CRONO_CY, CRONO_RAGGIO))
-            cronoAvviaFerma();
-        else if (!cronoAttivo && cronoTempo() > 0 &&
-                 dentroRett(tapX, tapY, LCD_W / 2, 382, 110, 28))
+        // Azzera si prende la sua riga in fondo; tutto il resto dello
+        // schermo avvia e ferma. Di corsa si guarda il tempo, non il
+        // dito, e il bersaglio piu' grande va al gesto piu' comune.
+        if (!cronoAttivo && cronoTempo() > 0 &&
+            dentroRett(tapX, tapY, LCD_W / 2, 390, 130, 26))
             cronoAzzera();
         else
-            return;
+            cronoAvviaFerma();
 
         daRidisegnare[SCHEDA_CRONO] = true;
         return;
