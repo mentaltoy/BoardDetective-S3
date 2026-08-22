@@ -137,6 +137,7 @@
 #define MEZZA_ICONA 18
 #define BARRA_SX (PADDING + MEZZA_ICONA)
 #define BARRA_DX (LCD_W - PADDING - MEZZA_ICONA)
+#define BARRA_VENT 232
 
 // Quanto largo e' il bersaglio di un comando. Un dito copre quasi
 // mezzo centimetro di vetro e non vede cosa sta coprendo: la zona
@@ -1314,7 +1315,7 @@ static void disegnaVentola(Arduino_GFX *g, int16_t cx, int16_t cy,
     for (int pala = 0; pala < 3; ++pala)
     {
         float base = angolo + pala * (2.0f * (float)M_PI / 3.0f);
-        for (int16_t r = minuta ? 6 : 10; r <= raggio - (minuta ? 2 : 12); r += passoPala)
+        for (int16_t r = minuta ? 5 : 10; r <= raggio - (minuta ? 4 : 12); r += passoPala)
         {
             float a = base + (float)r * (minuta ? 0.030f : 0.016f);
             dmDot(g, cx + (int16_t)lroundf(cosf(a) * r),
@@ -1326,6 +1327,14 @@ static void disegnaVentola(Arduino_GFX *g, int16_t cx, int16_t cy,
     if (minuta)
     {
         dmDot(g, cx, cy, 4, colore);
+
+        // L'anello c'e' anche qui, ma del colore delle pale: grigio,
+        // a questa taglia, sparirebbe.
+        // Largo e rado: appiccicato alle pale l'insieme diventa una
+        // macchia e non si legge piu' come una ventola.
+        const int quanti = 12;
+        dmRing(g, cx, cy, raggio + 9, quanti, 0.0f,
+               360.0f * (quanti - 1) / quanti, quanti, 3, colore, colore);
     }
     else
     {
@@ -1416,7 +1425,7 @@ static void disegnaOra(Arduino_GFX *g, const struct tm &t)
             if (climi[i].valido && climi[i].acceso) ++accesi;
 
         float scatto = (time(nullptr) % 4) * (float)M_PI / 6.0f;   // trenta gradi per volta
-        disegnaVentola(g, BARRA_DX - 52, BARRA_Y, 17, scatto,
+        disegnaVentola(g, BARRA_VENT, BARRA_Y, 15, scatto,
                        accesi > 0 ? COL_ACCESO : COL_SPENTO);
     }
 }
@@ -2889,6 +2898,36 @@ static void apriEditor(int indice)
     vistaDaRidisegnare = true;
 }
 
+// Salta alla scheda del primo condizionatore acceso. Se sono tutti
+// fermi va comunque al primo: chi tocca la ventola vuole vedere i
+// condizionatori, non ricevere un rifiuto.
+static void vaiAlCondizionatore()
+{
+    int bersaglio = SCHEDA_CLIMA;
+    for (int i = 0; i < N_CLIMI; ++i)
+        if (climi[i].valido && climi[i].acceso)
+        {
+            bersaglio = SCHEDA_CLIMA + i;
+            break;
+        }
+
+    if (bersaglio >= N_SCHEDE) return;
+
+    schedaCorrente = bersaglio;
+    scorrimento = 0;
+    palliniFino = millis() + PALLINI_ATTESA;
+
+    // Le schede lasciate indietro riarmano le loro animazioni, e
+    // quella su cui si atterra fa partire la sua: e' lo stesso
+    // passaggio di uno scorrimento, solo senza il viaggio in mezzo.
+    aggiornaVisibilita();
+    avviaAnimazioniIngresso();
+
+    if (daRidisegnare[schedaCorrente])
+        ridisegna(schedaCorrente);
+    componi();
+}
+
 // Il tocco secco sulla barra in fondo alla scheda dell'ora.
 static void tapNelleSchede()
 {
@@ -2949,9 +2988,14 @@ static void tapNelleSchede()
 
     if (schedaCorrente != SCHEDA_ORA) return;
 
-    if (dentro(tapX, tapY, BARRA_SX, BARRA_Y, BERSAGLIO))
+    // Tre zone affiancate, ciascuna larga quanto le serve senza
+    // invadere la vicina. Le sveglie si prendono anche il contatore
+    // accanto alla campanella, che di suo non sarebbe toccabile.
+    if (dentroRett(tapX, tapY, 82, BARRA_Y, 72, BERSAGLIO))
         apriLista();
-    else if (dentro(tapX, tapY, BARRA_DX, BARRA_Y, BERSAGLIO))
+    else if (dentroRett(tapX, tapY, BARRA_VENT, BARRA_Y, 44, BERSAGLIO))
+        vaiAlCondizionatore();
+    else if (dentroRett(tapX, tapY, 320, BARRA_Y, 40, BERSAGLIO))
         apriEditor(-1);
 }
 
