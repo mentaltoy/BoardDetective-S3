@@ -178,6 +178,7 @@
 #define COL_SOLE 0xFE80    // giallo caldo
 #define COL_LUNA 0x7ADF    // viola-blu
 #define COL_BOLLA 0xED07   // ambra
+#define COL_TRAMA 0x18E3   // quasi nero: si sente, non si vede
 
 // ------------------------------------------------------------
 //  DISPLAY
@@ -1504,6 +1505,24 @@ static void cronoTacca(Arduino_GFX *g, float angolo, int16_t rDa, int16_t rA,
                  CRONO_CY + (int16_t)lroundf(si * r), diam, colore);
 }
 
+// Il fondo del quadrante: una griglia regolare di punti quasi neri.
+// Non deve vedersi, deve sentirsi. Serve a dare una superficie a cui
+// la lancetta si stacchi sopra, e a far capire che il disco e' un
+// fondo e non un buco. E' l'idea del Tapisserie degli orologi buoni
+// ridotta a quello che questo schermo sa fare: se la si nota, e' gia'
+// troppo forte.
+static void cronoTrama(Arduino_GFX *g)
+{
+    const int16_t passo = 10;
+    const int16_t limite = CRONO_RAGGIO - 30;
+    const int32_t limite2 = (int32_t)limite * limite;
+
+    for (int16_t dy = -limite; dy <= limite; dy += passo)
+        for (int16_t dx = -limite; dx <= limite; dx += passo)
+            if ((int32_t)dx * dx + (int32_t)dy * dy <= limite2)
+                dmDot(g, CRONO_CX + dx, CRONO_CY + dy, 3, COL_TRAMA);
+}
+
 // Le sessanta tacche: ogni cinque piu' lunga e piu' grossa. La
 // differenza si legge dalla lunghezza prima ancora che dallo
 // spessore, ed e' quello che permette di leggere un quadrante senza
@@ -1649,6 +1668,7 @@ static void disegnaCrono(Arduino_GFX *g)
 
     uint32_t t = cronoTempo();
 
+    cronoTrama(g);
     cronoTacche(g);
 
     cronoTriangolo(g);
@@ -3197,6 +3217,7 @@ static void rinfrescaCrono()
     // sporgono di meta' diagonale oltre i suoi lati, arrivavano fin
     // dove stanno le tacche e se le mangiavano quattro per volta.
     g->fillCircle(CRONO_CX, CRONO_CY, CRONO_RAGGIO - 28, COL_SFONDO);
+    cronoTrama(g);
     cronoTacche(g);
     cronoTriangolo(g);
 
