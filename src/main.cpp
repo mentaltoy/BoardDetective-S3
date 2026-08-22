@@ -442,6 +442,18 @@ static void scanI2C()
     Serial.println();
 }
 
+static void axpScrivi(uint8_t reg, uint8_t valore)
+{
+    Wire.beginTransmission(AXP_ADDR);
+    Wire.write(reg);
+    Wire.write(valore);
+    Wire.endTransmission();
+}
+
+// Quali regolatori secondari sono accesi all'avvio: e' lo stato a cui
+// si torna ogni volta che ci si risveglia.
+static uint8_t ldoNormali = 0;
+
 static void aggiornaBatteria()
 {
     // Il chip la percentuale la calcola gia' lui e la tiene nel
@@ -3238,6 +3250,17 @@ static void entraInStandby()
     panel->displayOff();
     audioRiposo();
 
+    // Spegnere l'immagine non spegne il circuito che alimenta il
+    // pannello: un AMOLED vuole tensioni alte generate da un
+    // convertitore che continua a lavorare a vuoto. Lo stesso vale
+    // per touch e audio. Qui si tolgono proprio le alimentazioni.
+    //
+    // Il processore, la flash e la memoria stanno su un'alimentazione
+    // diversa che non si tocca - se toccarla fosse possibile, la
+    // board si spegnerebbe e basta.
+    if (ldoNormali)
+        axpScrivi(0x90, 0x00);
+
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
     retePresente = false;
@@ -3297,12 +3320,43 @@ static void dormiFinoAlProssimoSecondo()
     esp_sleep_enable_gpio_wakeup();
 
     esp_light_sleep_start();
+
+    // Dopo il sonno il piedino puo' restare isolato, e letto come
+    // premuto: la board entrerebbe e uscirebbe dallo standby da sola.
+    pinMode(BTN_BOOT, INPUT_PULLUP);
 }
 
 static void esciDaStandby()
 {
     // Prima la velocita': tutto il resto la vuole gia' piena.
     setCpuFrequencyMhz(240);
+
+    // Poi le alimentazioni, e il tempo perche' si stabilizzino: i
+    // chip che le ricevono hanno bisogno di trovare la tensione
+    // pronta prima di sentirsi parlare.
+    if (ldoNormali)
+    {
+        axpScrivi(0x90, ldoNormali);
+        delay(120);
+
+        // Restati senza corrente, hanno dimenticato tutto: vanno
+        // riconfigurati da capo, esattamente come all'accensione.
+        panel->begin();
+        audioBegin();
+        imuBegin();
+
+        // Il touch ci mette un po' a tornare in se': se ci si limita
+        // a un tentativo, accendendo lo schermo lo si trova morto per
+        // qualche secondo, che e' proprio il momento in cui uno lo
+        // tocca.
+        touchOk = false;
+        for (int tentativo = 0; tentativo < 6 && !touchOk; ++tentativo)
+        {
+            touchOk = touch.begin();
+            if (!touchOk) delay(60);
+        }
+    }
+
     audioRisveglio();
 
     qmiWrite(QMI_CTRL7, 0x01);
@@ -3623,6 +3677,9 @@ void setup()
     aggiornaBatteria();
     Serial.printf("[batteria] %d%%%s\n", batteria, alimentato ? " (cavo collegato)" : "");
 
+    ldoNormali = axpLeggi(0x90);
+    Serial.printf("[axp] regolatori secondari: 0x%02X\n", ldoNormali);
+
     sveglieCarica();
     Serial.printf("[sveglie] %d salvate, %d attive\n", nSveglie, sveglieAttive());
 
@@ -3757,7 +3814,7 @@ void loop()
         static uint32_t prossimoTentativo = 0;
         if ((int32_t)(millis() - prossimoTentativo) >= 0)
         {
-            prossimoTentativo = millis() + 2000;
+            prossimoTentativo = millis() + 500;
             touchOk = touch.begin();
             if (touchOk) Serial.println("[touch] risvegliato");
         }
