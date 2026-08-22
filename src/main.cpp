@@ -1558,10 +1558,15 @@ static void cronoTacche(Arduino_GFX *g)
     {
         float a = (i * 6.0f - 90.0f) * (float)M_PI / 180.0f;
 
+        // Le corte finiscono un pixel piu' in fuori delle lunghe. Non
+        // e' un capriccio: il bordo del quadrante non lo fa il centro
+        // del punto ma il suo orlo, e un punto da tre sporge un pixel
+        // meno di uno da cinque. Con i centri allineati, i due giri di
+        // tacche finivano su due cerchi diversi.
         if ((i % 5) == 0)
             cronoTacca(g, a, CRONO_RAGGIO - 24, CRONO_RAGGIO, 5, COL_SECONDARIO);
         else
-            cronoTacca(g, a, CRONO_RAGGIO - 10, CRONO_RAGGIO, 3, COL_ETICHETTA);
+            cronoTacca(g, a, CRONO_RAGGIO - 10, CRONO_RAGGIO + 1, 3, COL_ETICHETTA);
     }
 }
 
@@ -1633,7 +1638,7 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
     // centro si calcola quanto e' larga li', e si riempie. Il
     // semicerchio da' Pitagora, il corpo una costante, la punta una
     // retta che scende a zero.
-    const float RP = 8.0f;                       // raggio del perno
+    const float RP = 9.5f;                       // raggio del perno
     const int16_t rPunta = CRONO_RAGGIO - 2;
     const float hPunta = 2.0f * RP * 0.866f;     // altezza di un equilatero di lato 2*RP
     const float rSpalla = rPunta - hPunta;
@@ -1660,7 +1665,11 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
         // Il passo resta fitto solo nel semicerchio dietro il centro,
         // dove la larghezza cambia troppo in fretta perche' pochi
         // punti sappiano raccontare la curva.
-        const float PASSO = 7.0f;
+        // Cinque file invece di tre: con tre, la punta poteva solo
+        // passare da tre a uno e sembravano due pixel sfuggiti dal
+        // rettangolo, non un triangolo. Con cinque degrada 5-3-1 e il
+        // triangolo si legge.
+        const float PASSO = 4.6f;
 
         for (float r = -RP; r <= rPunta; r += (r < 0.0f ? 3.0f : PASSO))
         {
@@ -1676,11 +1685,12 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
 
             // Il centro della fila c'e' sempre; gli altri si allineano
             // da li' verso i lati a passo fisso, cosi' le colonne
-            // restano dritte per tutta la lunghezza.
+            // restano dritte per tutta la lunghezza e la punta perde
+            // una fila per volta invece di sfilacciarsi.
             dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
                      CRONO_CY + (int16_t)lroundf(si * r), grossezza, tinta);
 
-            for (float k = PASSO; k <= semi + 1.0f; k += PASSO)
+            for (float k = PASSO; k <= semi + 0.6f; k += PASSO)
                 for (int lato = -1; lato <= 1; lato += 2)
                 {
                     int16_t px = CRONO_CX + (int16_t)lroundf(co * r - si * k * lato);
