@@ -1464,15 +1464,15 @@ static void disegnaVentola(Arduino_GFX *g, int16_t cx, int16_t cy,
 //  veloci devono essere nette.
 
 #define CRONO_CX (LCD_W / 2)
-#define CRONO_CY 192
-#define CRONO_RAGGIO 124
+#define CRONO_CY 216
+#define CRONO_RAGGIO 136
 
 // Sopra il quadrante c'e' l'etichetta, sotto le cifre: la stessa
 // distanza da tutte e due, o l'occhio vede il disco scivolare da una
 // parte.
-#define CRONO_CIFRE_Y 326
+#define CRONO_CIFRE_Y 372
 #define CRONO_PULSANTI_Y 386
-#define CRONO_BOLLO 62
+#define CRONO_BOLLO 70
 
 // Una tacca: punti in fila lungo il raggio. Sui quadranti veri le
 // tacche sono trattini, non pallini - e la differenza fra il minuto
@@ -1565,11 +1565,20 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
         // Piu' largo, e si porta via mezzo quadrante.
         int16_t grossezza = (passata == 0) ? 9 : 5;
 
-        for (int16_t r = 12; r <= rPunta; r += 5)
+        // Parte dal centro, non da dodici pixel piu' in la': il perno
+        // dev'essere il punto da cui la lancetta comincia, non una
+        // palla appoggiata sotto. E vicino al centro si allarga, cosi'
+        // il raccordo nasce dalla forma stessa invece di essere una
+        // giunzione fra due pezzi.
+        for (int16_t r = 0; r <= rPunta; r += 4)
         {
-            float largo = (r <= rSpalla)
-                              ? LARGO
-                              : LARGO * (1.0f - (float)(r - rSpalla) / (float)(rPunta - rSpalla));
+            float largo;
+            if (r < 20)
+                largo = LARGO + (20.0f - r) * 0.14f;
+            else if (r <= rSpalla)
+                largo = LARGO;
+            else
+                largo = LARGO * (1.0f - (float)(r - rSpalla) / (float)(rPunta - rSpalla));
 
             if (largo > 1.6f)
                 for (int k = -1; k <= 1; k += 2)
@@ -1584,7 +1593,9 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
         }
     }
 
-    dmMarcatore(g, CRONO_CX, CRONO_CY, 7, 4, colore);
+    // Il cuore del perno: un punto grosso quanto la lancetta e' larga,
+    // che chiude il raccordo senza aggiungere una forma nuova.
+    dmDot(g, CRONO_CX, CRONO_CY, 11, colore);
 }
 
 static void disegnaCrono(Arduino_GFX *g)
@@ -1645,15 +1656,7 @@ static void disegnaCrono(Arduino_GFX *g)
                    ICONA_COMANDO, 4, 3,
                    cronoAttivo ? COL_SECONDARIO : COL_SPENTO);
 
-    // L'ultimo giro chiuso, fra i due.
-    if (cronoGiroUltimo > 0)
-    {
-        snprintf(buf, sizeof(buf), "%02lu:%02lu.%lu",
-                 (unsigned long)(cronoGiroUltimo / 60000),
-                 (unsigned long)((cronoGiroUltimo / 1000) % 60),
-                 (unsigned long)((cronoGiroUltimo / 100) % 10));
-        testoCentrato(g, CRONO_PULSANTI_Y - 11, buf, 3, 2, COL_ETICHETTA, 1);
-    }
+
 
     // Finche' corre, la lancetta chiede il fotogramma successivo.
     if (cronoAttivo && schedaCorrente == SCHEDA_CRONO)
@@ -4280,6 +4283,13 @@ void setup()
 
     // Da qui in poi la rete se la vede un core per conto suo.
     xTaskCreatePinnedToCore(taskRete, "rete", 6144, nullptr, 1, nullptr, 0);
+
+    schedaCorrente = SCHEDA_CRONO;
+    cronoAccumulato = 3 * 60000UL + 21 * 1000UL + 400;
+    cronoGiri[0]=47200; cronoNGiri = 3;
+    cronoAvviaFerma();
+    ridisegna(SCHEDA_CRONO);
+    componi();
 
     Serial.println("[pronto] scorri con il dito per cambiare scheda");
 }
