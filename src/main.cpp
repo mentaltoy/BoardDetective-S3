@@ -1501,7 +1501,11 @@ static void cronoTacca(Arduino_GFX *g, float angolo, int16_t rDa, int16_t rA,
                        int16_t diam, uint16_t colore)
 {
     float co = cosf(angolo), si = sinf(angolo);
-    for (int16_t r = rDa; r <= rA; r += 5)
+
+    // Passo quattro e non cinque: a cinque i punti si toccavano
+    // appena, e da quando sotto c'e' la trama fra l'uno e l'altro
+    // spuntava il fondo - la tacca sembrava spezzata da un pixel.
+    for (int16_t r = rDa; r <= rA; r += 4)
         dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
                  CRONO_CY + (int16_t)lroundf(si * r), diam, colore);
 }
@@ -1670,7 +1674,7 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
     // Il foro al centro: sugli orologi veri e' il buco in cui si
     // infila l'asse, e senza, il perno sembra una goccia appoggiata
     // invece di un pezzo montato su qualcosa.
-    dmDot(g, CRONO_CX, CRONO_CY, 5, COL_SFONDO);
+    dmDot(g, CRONO_CX, CRONO_CY, 7, COL_SFONDO);
 }
 
 static void disegnaCrono(Arduino_GFX *g)
