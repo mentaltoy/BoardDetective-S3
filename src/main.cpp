@@ -2318,8 +2318,12 @@ static void disegnaClima(Arduino_GFX *g, Clima &clima, int quale)
                  vuoto - sinistra, "");
 
         int16_t largoModo = dmTextWidth(campo, 3, 2);
+        // Tutte le lettere insieme e in fretta. Lo sfasamento serve a
+        // un contatore, dove ogni cifra e' una ruota per conto suo;
+        // una parola invece e' una cosa sola, e vederla arrivare a
+        // pezzi la fa sembrare lenta.
         if (dmRullo(g, rulloModo[quale], campo, (LCD_W - largoModo) / 2, 322, 3, 3,
-                    clima.acceso ? COL_ROSSO : COL_SPENTO, 2, 520, 45))
+                    clima.acceso ? COL_ROSSO : COL_SPENTO, 2, 280, 0))
             numeriInMovimento = true;
     }
 
@@ -2647,6 +2651,17 @@ static void avviaAnimazioniIngresso()
         bolleAttive = true;
         bolleInizio = millis();
         ridisegna(SCHEDA_ARIA);
+    }
+    else if (schedaCorrente == SCHEDA_CLIMA || schedaCorrente == SCHEDA_CLIMA2)
+    {
+        // Le schede del condizionatore non hanno un'animazione
+        // d'ingresso: hanno una ventola che gira sempre. Ma il
+        // disegno riparte solo se qualcuno dice che c'e' qualcosa da
+        // muovere, e arrivando qui non lo diceva nessuno - la pala
+        // restava ferma finche' non arrivava una lettura dalla rete,
+        // fino a venti secondi dopo. Basta chiedere un disegno: da
+        // quello in poi e' la ventola stessa a chiedere il seguente.
+        daRidisegnare[schedaCorrente] = true;
     }
 }
 
