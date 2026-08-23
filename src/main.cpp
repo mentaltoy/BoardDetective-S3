@@ -400,9 +400,14 @@ static void cronoAvviaFerma()
 // anche il modo di far vedere che il comando e' stato ricevuto -
 // altrimenti premi e non succede niente di visibile, perche' il
 // quadrante era gia' quasi fermo.
-#define AZZERA_DURATA 420
+// Quanto dura il ritorno a zero: un tempo minimo piu' una quota
+// proporzionale alla strada da fare. Mezzo giro non puo' metterci
+// quanto un dodicesimo.
+#define AZZERA_MINIMO 260
+#define AZZERA_PIENO 900
 static bool azzeraInCorso = false;
 static uint32_t azzeraInizio = 0;
+static uint32_t azzeraDurata = AZZERA_MINIMO;
 static float azzeraDa = 0;
 
 static void cronoAzzera()
@@ -410,6 +415,7 @@ static void cronoAzzera()
     azzeraDa = (cronoTempo() % 60000UL) / 60000.0f;
     if (azzeraDa > 0.001f)
     {
+        azzeraDurata = AZZERA_MINIMO + (uint32_t)(azzeraDa * AZZERA_PIENO);
         azzeraInizio = millis();
         azzeraInCorso = true;
     }
@@ -1607,17 +1613,20 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t, bool aPunti)
     if (azzeraInCorso)
     {
         uint32_t passato = millis() - azzeraInizio;
-        if (passato >= AZZERA_DURATA)
+        if (passato >= azzeraDurata)
         {
             azzeraInCorso = false;
             giro = 0.0f;
         }
         else
         {
-            // Parte deciso e si posa sullo zero, come una lancetta
-            // che viene richiamata da una molla.
-            float p = (float)passato / (float)AZZERA_DURATA;
-            giro = azzeraDa * powf(1.0f - p, 2.2f);
+            // Velocita' costante, senza accelerare ne' frenare: e' come
+            // torna indietro la lancetta di un cronografo vero,
+            // trascinata da un meccanismo che gira sempre uguale. Una
+            // curva morbida qui sembrerebbe una scelta di stile su un
+            // gesto che invece e' meccanico.
+            float p = (float)passato / (float)azzeraDurata;
+            giro = azzeraDa * (1.0f - p);
             numeriInMovimento = true;
         }
     }
@@ -1681,22 +1690,19 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t, bool aPunti)
         // rettangolo, non un triangolo. Con cinque degrada 5-3-1 e il
         // triangolo si legge.
         const float PASSO = aPunti ? 5.8f : 3.0f;
-        const float AVANZO = aPunti ? PASSO * 0.866f : 3.5f;
+        const float AVANZO = aPunti ? PASSO : 3.5f;
 
-        // A punti le file si dispongono a nido d'ape, non a scacchiera.
+        // Le file sono allineate, non sfalsate a nido d'ape.
         //
-        // Su una griglia quadrata i vicini in diagonale stanno il 41
-        // per cento piu' lontani di quelli in fila: ruotando la
-        // lancetta la stessa forma sembra ora fitta ora rada, ed e'
-        // quello che la faceva sembrare imprecisa a certi angoli. In
-        // una maglia esagonale ogni punto ha sei vicini tutti alla
-        // stessa distanza, e la densita' non cambia mai comunque la
-        // si giri.
+        // La maglia esagonale tiene la densita' uguale a ogni angolo -
+        // sei vicini tutti alla stessa distanza - ma i suoi bordi
+        // laterali non sono dritti: le file alternano di mezzo passo e
+        // il fianco della lancetta viene seghettato. Con le file
+        // allineate succede il contrario: la densita' cambia un po'
+        // in diagonale, ma i due lati lunghi restano due righe pulite.
         //
-        // Si ottiene sfalsando di mezzo passo le file dispari e
-        // avvicinandole di quel tanto - 0,866, che e' l'altezza di un
-        // triangolo equilatero - perche' i punti restino equidistanti
-        // anche in diagonale.
+        // Su una lancetta lunga e stretta i fianchi sono la cosa che
+        // si guarda, quindi vincono loro.
         int fila = 0;
         for (float r = -RP; r <= rPunta; r += AVANZO, ++fila)
         {
@@ -1731,16 +1737,13 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t, bool aPunti)
                 continue;
             }
 
-            // A punti: le file pari hanno un punto sull'asse, le
-            // dispari due che lo scavalcano di mezzo passo.
-            bool sfalsata = (fila & 1);
+            // A punti: ogni fila ha il suo punto sull'asse e le altre
+            // in colonna, cosi' i fianchi cadono sempre sulla stessa
+            // distanza dall'asse.
+            dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
+                     CRONO_CY + (int16_t)lroundf(si * r), grossezza, tinta);
 
-            if (!sfalsata)
-                dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
-                         CRONO_CY + (int16_t)lroundf(si * r), grossezza, tinta);
-
-            float primo = sfalsata ? PASSO * 0.5f : PASSO;
-            for (float k = primo; k <= semi + 0.4f; k += PASSO)
+            for (float k = PASSO; k <= semi + 0.4f; k += PASSO)
                 for (int lato = -1; lato <= 1; lato += 2)
                     dmDot(g, CRONO_CX + (int16_t)lroundf(co * r - si * k * lato),
                              CRONO_CY + (int16_t)lroundf(si * r + co * k * lato),
