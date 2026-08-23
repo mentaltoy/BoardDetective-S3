@@ -293,6 +293,16 @@ static int16_t tapX = 0, tapY = 0;      // il dito si e' mosso poco: e' un tocco
 // se ne vanno da soli. Una schermata di orologio deve essere ferma;
 // i comandi servono nel momento in cui li usi, non prima.
 #define PALLINI_ATTESA 1000   // quanto restano dopo l'ultimo tocco
+
+// Dopo quanto lo schermo si spegne da solo.
+//
+// Fino a ieri non si spegneva mai: l'unico modo era premere power, e
+// una notte in cui te ne dimentichi e' una batteria finita. Un
+// pannello AMOLED acceso costa piu' di tutto il resto messo insieme,
+// e tenerlo acceso per una stanza vuota e' il solo consumo che non
+// compra niente.
+#define SPEGNIMENTO_AUTO 90000UL
+static uint32_t ultimaAttivita = 0;
 #define PALLINI_FADE 450      // quanto ci mettono a spegnersi
 static uint32_t palliniFino = 0;
 static float palliniOpacitaDisegnata = -1.0f;
@@ -3769,6 +3779,8 @@ static void gestisciToccoModale()
     TouchPoint tp = touch.leggi();
     uint32_t adesso = millis();
 
+    if (tp.premuto) ultimaAttivita = adesso;
+
     if (tp.premuto && !giu)
     {
         giu = true;
@@ -4029,6 +4041,8 @@ static void esciDaStandby()
     for (int i = 0; i < N_SCHEDE; ++i)
         daRidisegnare[i] = true;
 
+    ultimaAttivita = millis();
+
     Serial.println("[standby] sveglio");
 }
 
@@ -4074,7 +4088,10 @@ static void gestisciTocco()
     uint32_t adesso = millis();
 
     if (tp.premuto)
+    {
         palliniFino = adesso + PALLINI_ATTESA;
+        ultimaAttivita = adesso;
+    }
 
     if (tp.premuto && !ditoGiu)
     {
@@ -4228,6 +4245,8 @@ static void gestisciSecondoPulsante()
     if (ora && !precedente && (millis() - ultimoCambio) > 250)
     {
         ultimoCambio = millis();
+
+        ultimaAttivita = millis();
 
         if (schermoAcceso && vista == VISTA_SCHEDE &&
             (schedaCorrente == SCHEDA_CRONO || schedaCorrente == SCHEDA_CRONO_B))
@@ -4573,6 +4592,21 @@ void loop()
     {
         gestisciPulsante();
         dormiFinoAlProssimoSecondo();
+        return;
+    }
+
+    // Nessuno tocca da un pezzo: si spegne da solo.
+    //
+    // Con il cavo attaccato no: li' la corrente non e' un problema, e
+    // uno schermo che si spegne mentre ci stai lavorando - togliendo
+    // anche la radio, quindi l'aggiornamento via wifi - da' solo
+    // fastidio. E nemmeno mentre una sveglia sta suonando, che sarebbe
+    // il modo piu' sicuro di non sentirla.
+    if (!alimentato && vista != VISTA_ALLARME &&
+        (millis() - ultimaAttivita) > SPEGNIMENTO_AUTO)
+    {
+        Serial.println("[standby] nessuno tocca da un minuto e mezzo");
+        entraInStandby();
         return;
     }
 
