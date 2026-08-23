@@ -1672,101 +1672,147 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t, bool aPunti)
     // cancellerebbe il pieno del precedente.
     for (int passata = 0; passata < 2; ++passata)
     {
-        uint16_t tinta = (passata == 0) ? COL_SFONDO : colore;
-        // A punti il pieno e' piu' piccolo del passo, o i punti si
-        // toccano e la forma torna solida: cinque di larghezza ogni
-        // 4,6 di distanza vuol dire sovrapposti. Quattro ogni 5,5
-        // lascia un pixel e mezzo di vuoto fra l'uno e l'altro, ed e'
-        // li' che si vede che sono punti.
-        int16_t grossezza = (passata == 0) ? (aPunti ? 10 : 11)
-                                           : (aPunti ? 4 : 5);
-
-        // Il passo si infittisce nel semicerchio dietro il centro: li'
-        // la larghezza cambia in fretta - a un capo e' zero, a meta'
-        // e' quasi piena - e con il passo del corpo la curva veniva a
-        // gradini, con l'ultimo punto che sporgeva da solo.
-        // A punti staccati, non a massa piena. La forma resta quella -
-        // semicerchio, paralleli, triangolo - ma invece di riempirla
-        // fitta si mette un punto ogni sette pixel, in righe e
-        // colonne: cosi' la lancetta e' fatta della stessa materia di
-        // tutto il resto dello schermo, invece di essere l'unica cosa
-        // solida in mezzo a una matrice di led.
+        // ------------------------------------------------------
+        //  LA GRIGLIA STA FERMA, LA LANCETTA CI PASSA SOPRA
+        // ------------------------------------------------------
+        //  Finora i punti erano attaccati alla lancetta: un reticolo
+        //  che girava insieme a lei. Ogni punto scivolava sullo
+        //  schermo e a ogni fotogramma finiva arrotondato al pixel
+        //  intero - ma non tutti nello stesso momento. Cento punti
+        //  che scattano ognuno per conto suo sono esattamente quella
+        //  frittura che si vedeva al centro.
         //
-        // Il passo resta fitto solo nel semicerchio dietro il centro,
-        // dove la larghezza cambia troppo in fretta perche' pochi
-        // punti sappiano raccontare la curva.
-        // Cinque file invece di tre: con tre, la punta poteva solo
-        // passare da tre a uno e sembravano due pixel sfuggiti dal
-        // rettangolo, non un triangolo. Con cinque degrada 5-3-1 e il
-        // triangolo si legge.
-        const float PASSO = aPunti ? 5.8f : 3.0f;
-        const float AVANZO = aPunti ? PASSO * 0.866f : 3.5f;
-
-        // A punti le file si dispongono a nido d'ape, non a scacchiera.
+        //  Su una matrice di led vera i punti non si muovono: e' la
+        //  lancetta che ci passa attraverso, e sono i led ad
+        //  accendersi e spegnersi. Qui la griglia e' ancorata al
+        //  quadrante e non si muove mai. Nessun punto scivola,
+        //  quindi non resta niente che possa sfarfallare.
         //
-        // Su una griglia quadrata i vicini in diagonale stanno il 41
-        // per cento piu' lontani di quelli in fila: ruotando la
-        // lancetta la stessa forma sembra ora fitta ora rada, ed e'
-        // quello che la faceva sembrare imprecisa a certi angoli. In
-        // una maglia esagonale ogni punto ha sei vicini tutti alla
-        // stessa distanza, e la densita' non cambia mai comunque la
-        // si giri.
-        //
-        // Si ottiene sfalsando di mezzo passo le file dispari e
-        // avvicinandole di quel tanto - 0,866, che e' l'altezza di un
-        // triangolo equilatero - perche' i punti restino equidistanti
-        // anche in diagonale.
-        //
-        // Il prezzo sono i fianchi: alternando di mezzo passo non
-        // vengono due righe dritte. Provate allineate, si raddrizzano
-        // ma il corpo perde molto piu' di quanto guadagnino i bordi.
-        int fila = 0;
-        for (float r = -RP; r <= rPunta; r += AVANZO, ++fila)
+        //  Il rischio di una griglia fissa e' l'opposto: che la
+        //  lancetta avanzi a gradini, un punto alla volta, e perda
+        //  quello scorrere continuo che deve avere. Per questo un
+        //  punto non si accende di colpo, ma tanto piu' forte quanto
+        //  piu' e' dentro la forma. Il fondo sotto la lancetta e'
+        //  nero perche' lo scava la passata prima, e dmSfuma sfuma
+        //  verso il nero: l'intensita' si calcola, non c'e' bisogno
+        //  di andare a leggere cosa ci fosse sotto. La griglia resta
+        //  ferma, il movimento torna continuo.
+        if (passata == 1 && aPunti)
         {
-            float semi;
-            if (r < 0.0f)
-                semi = sqrtf(RP * RP - r * r);
-            else if (r <= rSpalla)
-                semi = RP;
-            else
-                semi = RP * (1.0f - (r - rSpalla) / hPunta);
+            const float P = 5.8f;         // passo della griglia
+            const float H = P * 0.866f;   // file a nido d'ape, come prima
+            const float RAMPA = 5.0f;     // in quanti pixel un punto passa da spento ad acceso
 
+            const float ESTREMO = rPunta + RP + P;
+            const int JMAX = (int)(ESTREMO / H) + 1;
+            const int IMAX = (int)(ESTREMO / P) + 1;
+
+            for (int j = -JMAX; j <= JMAX; ++j)
+            {
+                float y = CRONO_CY + j * H;
+                float scarto = (j & 1) ? P * 0.5f : 0.0f;
+
+                for (int i = -IMAX; i <= IMAX; ++i)
+                {
+                    float x = CRONO_CX + i * P + scarto;
+                    float dx = x - CRONO_CX, dy = y - CRONO_CY;
+                    if (dx * dx + dy * dy > ESTREMO * ESTREMO) continue;
+
+                    // Le stesse coordinate di sempre, lette al
+                    // contrario: invece di chiedere dove finisce un
+                    // punto della lancetta, si chiede a un punto
+                    // fermo quanto e' dentro la lancetta.
+                    float r = dx * co + dy * si;
+                    float k = -dx * si + dy * co;
+                    if (fabsf(k) > RP + RAMPA) continue;
+
+                    float dentro;
+                    if (r < 0.0f)
+                    {
+                        dentro = RP - sqrtf(r * r + k * k);
+                    }
+                    else
+                    {
+                        float semi = (r <= rSpalla)
+                                     ? RP
+                                     : RP * (1.0f - (r - rSpalla) / hPunta);
+                        float perLato = semi - fabsf(k);
+                        float perLungo = (float)rPunta - r;
+                        dentro = perLato < perLungo ? perLato : perLungo;
+                    }
+
+                    float quanto = dentro / RAMPA + 0.5f;
+                    if (quanto <= 0.10f) continue;
+                    if (quanto > 1.0f) quanto = 1.0f;
+
+                    dmDot(g, (int16_t)lroundf(x), (int16_t)lroundf(y),
+                          4, dmSfuma(colore, quanto));
+                }
+            }
+            continue;
+        }
+
+        // Il vuoto invece resta disegnato fitto e continuo, seguendo
+        // la lancetta come prima. E' solo nero: la sua grana non la
+        // vede nessuno, se ne vede il contorno, e un contorno fatto
+        // di punti fermi si frastaglierebbe sempre allo stesso modo
+        // mentre la lancetta ci scorre dentro.
+        uint16_t tinta = (passata == 0) ? COL_SFONDO : colore;
+        int16_t grossezza = (passata == 0) ? (aPunti ? 10 : 11) : 5;
+
+        const float PASSO = 3.0f;
+        const float AVANZO = 3.5f;
+
+        // La coda dietro il centro va piu' fitta del corpo: li' la
+        // larghezza cambia in fretta - a un capo e' zero, a meta' e'
+        // gia' piena - e con il passo del corpo la curva viene a
+        // gradini. Questo passo c'era, valeva 1,6, e l'ho perso io
+        // introducendo la lancetta a punti: prima e' diventato 3, poi
+        // 3,5, e la coda si e' ritrovata con meno della meta' delle
+        // file. E' per questo che il raccordo con il perno non era
+        // piu' quello di prima.
+        const float CODA = 1.6f;
+        for (float r = -RP; r < -0.01f; r += CODA)
+        {
+            float semi = sqrtf(RP * RP - r * r);
             if (semi < 0.0f) semi = 0.0f;
 
-            if (!aPunti)
-            {
-                // Da piena: centro, file a passo fitto, e i due bordi
-                // esatti che il passo salterebbe.
-                dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
-                         CRONO_CY + (int16_t)lroundf(si * r), grossezza, tinta);
+            dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
+                     CRONO_CY + (int16_t)lroundf(si * r), grossezza, tinta);
 
-                for (float k = PASSO; k <= semi + 0.01f; k += PASSO)
-                    for (int lato = -1; lato <= 1; lato += 2)
-                        dmDot(g, CRONO_CX + (int16_t)lroundf(co * r - si * k * lato),
-                                 CRONO_CY + (int16_t)lroundf(si * r + co * k * lato),
-                                 grossezza, tinta);
-
-                if (semi > 2.0f)
-                    for (int lato = -1; lato <= 1; lato += 2)
-                        dmDot(g, CRONO_CX + (int16_t)lroundf(co * r - si * semi * lato),
-                                 CRONO_CY + (int16_t)lroundf(si * r + co * semi * lato),
-                                 grossezza, tinta);
-                continue;
-            }
-
-            // A punti: le file pari hanno un punto sull'asse, le
-            // dispari due che lo scavalcano di mezzo passo.
-            bool sfalsata = (fila & 1);
-
-            if (!sfalsata)
-                dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
-                         CRONO_CY + (int16_t)lroundf(si * r), grossezza, tinta);
-
-            float primo = sfalsata ? PASSO * 0.5f : PASSO;
-            for (float k = primo; k <= semi + 0.4f; k += PASSO)
+            for (float k = CODA; k <= semi + 0.01f; k += CODA)
                 for (int lato = -1; lato <= 1; lato += 2)
                     dmDot(g, CRONO_CX + (int16_t)lroundf(co * r - si * k * lato),
                              CRONO_CY + (int16_t)lroundf(si * r + co * k * lato),
+                             grossezza, tinta);
+
+            if (semi > 2.0f)
+                for (int lato = -1; lato <= 1; lato += 2)
+                    dmDot(g, CRONO_CX + (int16_t)lroundf(co * r - si * semi * lato),
+                             CRONO_CY + (int16_t)lroundf(si * r + co * semi * lato),
+                             grossezza, tinta);
+        }
+
+        for (float r = 0.0f; r <= rPunta; r += AVANZO)
+        {
+            float semi = (r <= rSpalla)
+                         ? RP
+                         : RP * (1.0f - (r - rSpalla) / hPunta);
+            if (semi < 0.0f) semi = 0.0f;
+
+            dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
+                     CRONO_CY + (int16_t)lroundf(si * r), grossezza, tinta);
+
+            for (float k = PASSO; k <= semi + 0.01f; k += PASSO)
+                for (int lato = -1; lato <= 1; lato += 2)
+                    dmDot(g, CRONO_CX + (int16_t)lroundf(co * r - si * k * lato),
+                             CRONO_CY + (int16_t)lroundf(si * r + co * k * lato),
+                             grossezza, tinta);
+
+            if (semi > 2.0f)
+                for (int lato = -1; lato <= 1; lato += 2)
+                    dmDot(g, CRONO_CX + (int16_t)lroundf(co * r - si * semi * lato),
+                             CRONO_CY + (int16_t)lroundf(si * r + co * semi * lato),
                              grossezza, tinta);
         }
     }
