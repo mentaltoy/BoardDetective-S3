@@ -1643,7 +1643,7 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t, bool aPunti)
     // A punti sta un filo piu' larga: le serve spazio per cinque file
     // staccate, mentre da piena bastano meno pixel a fare la stessa
     // forma.
-    const float RP = aPunti ? 11.0f : 8.0f;
+    const float RP = aPunti ? 9.8f : 8.0f;
     const int16_t rPunta = CRONO_RAGGIO - 2;
     const float hPunta = 2.0f * RP * 0.866f;     // altezza di un equilatero di lato 2*RP
     const float rSpalla = rPunta - hPunta;
@@ -1680,10 +1680,25 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t, bool aPunti)
         // passare da tre a uno e sembravano due pixel sfuggiti dal
         // rettangolo, non un triangolo. Con cinque degrada 5-3-1 e il
         // triangolo si legge.
-        const float PASSO = aPunti ? 5.5f : 3.0f;
-        const float AVANZO = aPunti ? 5.5f : 3.5f;
+        const float PASSO = aPunti ? 5.8f : 3.0f;
+        const float AVANZO = aPunti ? PASSO * 0.866f : 3.5f;
 
-        for (float r = -RP; r <= rPunta; r += (r < 0.0f ? (aPunti ? 3.0f : 1.6f) : AVANZO))
+        // A punti le file si dispongono a nido d'ape, non a scacchiera.
+        //
+        // Su una griglia quadrata i vicini in diagonale stanno il 41
+        // per cento piu' lontani di quelli in fila: ruotando la
+        // lancetta la stessa forma sembra ora fitta ora rada, ed e'
+        // quello che la faceva sembrare imprecisa a certi angoli. In
+        // una maglia esagonale ogni punto ha sei vicini tutti alla
+        // stessa distanza, e la densita' non cambia mai comunque la
+        // si giri.
+        //
+        // Si ottiene sfalsando di mezzo passo le file dispari e
+        // avvicinandole di quel tanto - 0,866, che e' l'altezza di un
+        // triangolo equilatero - perche' i punti restino equidistanti
+        // anche in diagonale.
+        int fila = 0;
+        for (float r = -RP; r <= rPunta; r += AVANZO, ++fila)
         {
             float semi;
             if (r < 0.0f)
@@ -1695,32 +1710,41 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t, bool aPunti)
 
             if (semi < 0.0f) semi = 0.0f;
 
-            // Il centro della fila c'e' sempre; gli altri si allineano
-            // da li' verso i lati a passo fisso, cosi' le colonne
-            // restano dritte per tutta la lunghezza e la punta perde
-            // una fila per volta invece di sfilacciarsi.
-            dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
-                     CRONO_CY + (int16_t)lroundf(si * r), grossezza, tinta);
+            if (!aPunti)
+            {
+                // Da piena: centro, file a passo fitto, e i due bordi
+                // esatti che il passo salterebbe.
+                dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
+                         CRONO_CY + (int16_t)lroundf(si * r), grossezza, tinta);
 
-            for (float k = PASSO; k <= semi + (aPunti ? 0.6f : 0.01f); k += PASSO)
-                for (int lato = -1; lato <= 1; lato += 2)
-                {
-                    int16_t px = CRONO_CX + (int16_t)lroundf(co * r - si * k * lato);
-                    int16_t py = CRONO_CY + (int16_t)lroundf(si * r + co * k * lato);
-                    dmDot(g, px, py, grossezza, tinta);
-                }
+                for (float k = PASSO; k <= semi + 0.01f; k += PASSO)
+                    for (int lato = -1; lato <= 1; lato += 2)
+                        dmDot(g, CRONO_CX + (int16_t)lroundf(co * r - si * k * lato),
+                                 CRONO_CY + (int16_t)lroundf(si * r + co * k * lato),
+                                 grossezza, tinta);
 
-            // Da piena i due bordi esatti si aggiungono comunque, o il
-            // passo fisso lascerebbe il profilo frastagliato. A punti
-            // no: li' il profilo e' fatto dai punti stessi, e un punto
-            // fuori griglia si vedrebbe come una sbavatura.
-            if (!aPunti && semi > 2.0f)
+                if (semi > 2.0f)
+                    for (int lato = -1; lato <= 1; lato += 2)
+                        dmDot(g, CRONO_CX + (int16_t)lroundf(co * r - si * semi * lato),
+                                 CRONO_CY + (int16_t)lroundf(si * r + co * semi * lato),
+                                 grossezza, tinta);
+                continue;
+            }
+
+            // A punti: le file pari hanno un punto sull'asse, le
+            // dispari due che lo scavalcano di mezzo passo.
+            bool sfalsata = (fila & 1);
+
+            if (!sfalsata)
+                dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
+                         CRONO_CY + (int16_t)lroundf(si * r), grossezza, tinta);
+
+            float primo = sfalsata ? PASSO * 0.5f : PASSO;
+            for (float k = primo; k <= semi + 0.4f; k += PASSO)
                 for (int lato = -1; lato <= 1; lato += 2)
-                {
-                    int16_t px = CRONO_CX + (int16_t)lroundf(co * r - si * semi * lato);
-                    int16_t py = CRONO_CY + (int16_t)lroundf(si * r + co * semi * lato);
-                    dmDot(g, px, py, grossezza, tinta);
-                }
+                    dmDot(g, CRONO_CX + (int16_t)lroundf(co * r - si * k * lato),
+                             CRONO_CY + (int16_t)lroundf(si * r + co * k * lato),
+                             grossezza, tinta);
         }
     }
 
