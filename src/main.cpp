@@ -1690,19 +1690,26 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t, bool aPunti)
         // rettangolo, non un triangolo. Con cinque degrada 5-3-1 e il
         // triangolo si legge.
         const float PASSO = aPunti ? 5.8f : 3.0f;
-        const float AVANZO = aPunti ? PASSO : 3.5f;
+        const float AVANZO = aPunti ? PASSO * 0.866f : 3.5f;
 
-        // Le file sono allineate, non sfalsate a nido d'ape.
+        // A punti le file si dispongono a nido d'ape, non a scacchiera.
         //
-        // La maglia esagonale tiene la densita' uguale a ogni angolo -
-        // sei vicini tutti alla stessa distanza - ma i suoi bordi
-        // laterali non sono dritti: le file alternano di mezzo passo e
-        // il fianco della lancetta viene seghettato. Con le file
-        // allineate succede il contrario: la densita' cambia un po'
-        // in diagonale, ma i due lati lunghi restano due righe pulite.
+        // Su una griglia quadrata i vicini in diagonale stanno il 41
+        // per cento piu' lontani di quelli in fila: ruotando la
+        // lancetta la stessa forma sembra ora fitta ora rada, ed e'
+        // quello che la faceva sembrare imprecisa a certi angoli. In
+        // una maglia esagonale ogni punto ha sei vicini tutti alla
+        // stessa distanza, e la densita' non cambia mai comunque la
+        // si giri.
         //
-        // Su una lancetta lunga e stretta i fianchi sono la cosa che
-        // si guarda, quindi vincono loro.
+        // Si ottiene sfalsando di mezzo passo le file dispari e
+        // avvicinandole di quel tanto - 0,866, che e' l'altezza di un
+        // triangolo equilatero - perche' i punti restino equidistanti
+        // anche in diagonale.
+        //
+        // Il prezzo sono i fianchi: alternando di mezzo passo non
+        // vengono due righe dritte. Provate allineate, si raddrizzano
+        // ma il corpo perde molto piu' di quanto guadagnino i bordi.
         int fila = 0;
         for (float r = -RP; r <= rPunta; r += AVANZO, ++fila)
         {
@@ -1737,13 +1744,16 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t, bool aPunti)
                 continue;
             }
 
-            // A punti: ogni fila ha il suo punto sull'asse e le altre
-            // in colonna, cosi' i fianchi cadono sempre sulla stessa
-            // distanza dall'asse.
-            dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
-                     CRONO_CY + (int16_t)lroundf(si * r), grossezza, tinta);
+            // A punti: le file pari hanno un punto sull'asse, le
+            // dispari due che lo scavalcano di mezzo passo.
+            bool sfalsata = (fila & 1);
 
-            for (float k = PASSO; k <= semi + 0.4f; k += PASSO)
+            if (!sfalsata)
+                dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
+                         CRONO_CY + (int16_t)lroundf(si * r), grossezza, tinta);
+
+            float primo = sfalsata ? PASSO * 0.5f : PASSO;
+            for (float k = primo; k <= semi + 0.4f; k += PASSO)
                 for (int lato = -1; lato <= 1; lato += 2)
                     dmDot(g, CRONO_CX + (int16_t)lroundf(co * r - si * k * lato),
                              CRONO_CY + (int16_t)lroundf(si * r + co * k * lato),
