@@ -198,21 +198,20 @@ static Arduino_Canvas *comp = new Arduino_Canvas(LCD_W, LCD_H, panel);
 // ------------------------------------------------------------
 
 #if HA_LOGO
-#define N_SCHEDE 10
-#else
 #define N_SCHEDE 9
+#else
+#define N_SCHEDE 8
 #endif
 
 #define SCHEDA_ORA 0
-#define SCHEDA_CRONO 1      // lancetta piena
-#define SCHEDA_CRONO_B 2    // lancetta a punti, per confrontarle
-#define SCHEDA_SOLE 3
-#define SCHEDA_METEO 4
-#define SCHEDA_BARO 5
-#define SCHEDA_ARIA 6
-#define SCHEDA_CLIMA 7     // il salone
-#define SCHEDA_CLIMA2 8    // la camera
-#define SCHEDA_LOGO 9
+#define SCHEDA_CRONO 1
+#define SCHEDA_SOLE 2
+#define SCHEDA_METEO 3
+#define SCHEDA_BARO 4
+#define SCHEDA_ARIA 5
+#define SCHEDA_CLIMA 6     // il salone
+#define SCHEDA_CLIMA2 7    // la camera
+#define SCHEDA_LOGO 8
 
 // Da quale scheda si comanda quale macchina.
 #define CLIMA_DI(scheda) (climi[(scheda) == SCHEDA_CLIMA ? 0 : 1])
@@ -223,8 +222,7 @@ static Arduino_Canvas *comp = new Arduino_Canvas(LCD_W, LCD_H, panel);
 // L'output e' nullptr perche' questi fogli non vanno mai a
 // schermo da soli: passano sempre da "comp".
 static Arduino_Canvas *scheda[N_SCHEDE] = {
-    new Arduino_Canvas(LCD_W, LCD_H, nullptr),
-    new Arduino_Canvas(LCD_W, LCD_H, nullptr),
+        new Arduino_Canvas(LCD_W, LCD_H, nullptr),
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
@@ -1308,7 +1306,74 @@ static const char *GIORNI[7] = {"DOM", "LUN", "MAR", "MER", "GIO", "VEN", "SAB"}
 static const char *MESI[12] = {"GEN", "FEB", "MAR", "APR", "MAG", "GIU",
                                "LUG", "AGO", "SET", "OTT", "NOV", "DIC"};
 
-static void telaio(Arduino_GFX *g, const char *etichetta)
+#define BATT_CX (LCD_W - PADDING - 11 * 4 - 26)
+#define BATT_CY (PADDING + 10)
+
+// Quanto puo' essere larga l'etichetta prima di finire sotto il
+// pallino della rete. Undici pixel sono meta' del pallino nella sua
+// versione piu' larga, quella sbarrata; otto sono il respiro fra le
+// due cose.
+#define ETICHETTA_LARGA (BATT_CX - 11 - 8 - PADDING)
+
+// Nelle schermate delle sveglie il pallino non c'e' - lo disegna
+// solo il carosello - e li' l'etichetta ha tutta la riga.
+#define ETICHETTA_PIENA (LCD_W - 2 * PADDING)
+
+// Un'etichetta che non ci sta si taglia e finisce con tre punti.
+//
+// Rimpicciolirla, come fa testoInColonna, qui non andrebbe bene: le
+// etichette delle schede hanno tutte la stessa taglia, ed e' quello
+// che le fa leggere come una serie invece che come undici scritte
+// scollegate. Meglio che una si accorci, piuttosto che una sia piu'
+// piccola delle altre.
+//
+// I puntini non sono il carattere del font: tre glifi interi
+// sarebbero sessanta pixel, piu' di due lettere. Sono tre punti
+// messi sul passo della scritta, che dentro una matrice di led e'
+// anche il modo giusto di scriverli.
+static void etichettaTagliata(Arduino_GFX *g, int16_t x, int16_t y,
+                              const char *s, int16_t passo, int16_t diam,
+                              uint16_t colore, int16_t gap, int16_t larghezza)
+{
+    if (dmTextWidth(s, passo, gap) <= larghezza)
+    {
+        dmText(g, x, y, s, passo, diam, colore, gap);
+        return;
+    }
+
+    const int16_t passoPunti = passo * 2;
+    const int16_t largPunti = passoPunti * 2 + diam;
+    const int16_t stacco = gap * passo;
+
+    int n = (int)strlen(s);
+    if (n > 30) n = 30;
+    while (n > 0)
+    {
+        int16_t w = (int16_t)((n * (5 + gap) - gap) * passo);
+        if (w + stacco + largPunti <= larghezza) break;
+        --n;
+    }
+
+    // Uno spazio appeso davanti ai puntini si legge come un buco.
+    while (n > 0 && s[n - 1] == ' ') --n;
+
+    char corto[32];
+    memcpy(corto, s, n);
+    corto[n] = '\0';
+    if (n > 0) dmText(g, x, y, corto, passo, diam, colore, gap);
+
+    int16_t w = (n > 0) ? (int16_t)((n * (5 + gap) - gap) * passo) : 0;
+    int16_t px = x + w + stacco + (passo >> 1);
+
+    // In basso, alla stessa altezza a cui sta il punto fermo del font.
+    int16_t py = y + (passo >> 1) + 6 * passo;
+
+    for (int k = 0; k < 3; ++k)
+        dmDot(g, px + k * passoPunti, py, diam, colore);
+}
+
+static void telaio(Arduino_GFX *g, const char *etichetta,
+                   int16_t larghezza = ETICHETTA_LARGA)
 {
     g->fillScreen(COL_SFONDO);
     g->drawRoundRect(BORDO_MARGINE, BORDO_MARGINE,
@@ -1316,7 +1381,8 @@ static void telaio(Arduino_GFX *g, const char *etichetta)
                      BORDO_RAGGIO, COL_CORNICE);
 
     // L'etichetta in alto a sinistra, piccola e molto spaziata.
-    dmText(g, PADDING, PADDING, etichetta, 3, 2, COL_ETICHETTA, 2);
+    etichettaTagliata(g, PADDING, PADDING, etichetta, 3, 2, COL_ETICHETTA, 2,
+                      larghezza);
 }
 
 // Centra un testo garantendo il margine. Se non ci sta, rimpicciolisce
@@ -1367,9 +1433,6 @@ static void testoInColonna(Arduino_GFX *g, int16_t x, int16_t y, const char *s,
 //  Non si spegne fino a sparire: passa al grigio dei punti spenti,
 //  lo stesso di tutti gli altri quadranti. Un pallino che sparisce
 //  del tutto sembrerebbe la rete che cade.
-
-#define BATT_CX (LCD_W - PADDING - 11 * 4 - 26)
-#define BATT_CY (PADDING + 10)
 
 static void indicatoreRete(Arduino_GFX *g, int16_t cx, int16_t cy)
 {
@@ -1617,7 +1680,7 @@ static void cronoTriangolo(Arduino_GFX *g)
 // fino a fondersi con quello centrale. Passando da tre punti a uno da
 // un raggio all'altro si vedeva uno scalino, e una lancetta con uno
 // scalino non e' affilata, e' rotta.
-static void cronoLancetta(Arduino_GFX *g, uint32_t t, bool aPunti)
+static void cronoLancetta(Arduino_GFX *g, uint32_t t)
 {
     float giro;
     if (azzeraInCorso)
@@ -1662,7 +1725,7 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t, bool aPunti)
     // A punti sta un filo piu' larga: le serve spazio per cinque file
     // staccate, mentre da piena bastano meno pixel a fare la stessa
     // forma.
-    const float RP = aPunti ? 9.8f : 8.0f;
+    const float RP = 8.0f;
     const int16_t rPunta = CRONO_RAGGIO - 2;
     const float hPunta = 2.0f * RP * 0.866f;     // altezza di un equilatero di lato 2*RP
     const float rSpalla = rPunta - hPunta;
@@ -1672,93 +1735,8 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t, bool aPunti)
     // cancellerebbe il pieno del precedente.
     for (int passata = 0; passata < 2; ++passata)
     {
-        // ------------------------------------------------------
-        //  LA GRIGLIA STA FERMA, LA LANCETTA CI PASSA SOPRA
-        // ------------------------------------------------------
-        //  Finora i punti erano attaccati alla lancetta: un reticolo
-        //  che girava insieme a lei. Ogni punto scivolava sullo
-        //  schermo e a ogni fotogramma finiva arrotondato al pixel
-        //  intero - ma non tutti nello stesso momento. Cento punti
-        //  che scattano ognuno per conto suo sono esattamente quella
-        //  frittura che si vedeva al centro.
-        //
-        //  Su una matrice di led vera i punti non si muovono: e' la
-        //  lancetta che ci passa attraverso, e sono i led ad
-        //  accendersi e spegnersi. Qui la griglia e' ancorata al
-        //  quadrante e non si muove mai. Nessun punto scivola,
-        //  quindi non resta niente che possa sfarfallare.
-        //
-        //  Il rischio di una griglia fissa e' l'opposto: che la
-        //  lancetta avanzi a gradini, un punto alla volta, e perda
-        //  quello scorrere continuo che deve avere. Per questo un
-        //  punto non si accende di colpo, ma tanto piu' forte quanto
-        //  piu' e' dentro la forma. Il fondo sotto la lancetta e'
-        //  nero perche' lo scava la passata prima, e dmSfuma sfuma
-        //  verso il nero: l'intensita' si calcola, non c'e' bisogno
-        //  di andare a leggere cosa ci fosse sotto. La griglia resta
-        //  ferma, il movimento torna continuo.
-        if (passata == 1 && aPunti)
-        {
-            const float P = 5.8f;         // passo della griglia
-            const float H = P * 0.866f;   // file a nido d'ape, come prima
-            const float RAMPA = 5.0f;     // in quanti pixel un punto passa da spento ad acceso
-
-            const float ESTREMO = rPunta + RP + P;
-            const int JMAX = (int)(ESTREMO / H) + 1;
-            const int IMAX = (int)(ESTREMO / P) + 1;
-
-            for (int j = -JMAX; j <= JMAX; ++j)
-            {
-                float y = CRONO_CY + j * H;
-                float scarto = (j & 1) ? P * 0.5f : 0.0f;
-
-                for (int i = -IMAX; i <= IMAX; ++i)
-                {
-                    float x = CRONO_CX + i * P + scarto;
-                    float dx = x - CRONO_CX, dy = y - CRONO_CY;
-                    if (dx * dx + dy * dy > ESTREMO * ESTREMO) continue;
-
-                    // Le stesse coordinate di sempre, lette al
-                    // contrario: invece di chiedere dove finisce un
-                    // punto della lancetta, si chiede a un punto
-                    // fermo quanto e' dentro la lancetta.
-                    float r = dx * co + dy * si;
-                    float k = -dx * si + dy * co;
-                    if (fabsf(k) > RP + RAMPA) continue;
-
-                    float dentro;
-                    if (r < 0.0f)
-                    {
-                        dentro = RP - sqrtf(r * r + k * k);
-                    }
-                    else
-                    {
-                        float semi = (r <= rSpalla)
-                                     ? RP
-                                     : RP * (1.0f - (r - rSpalla) / hPunta);
-                        float perLato = semi - fabsf(k);
-                        float perLungo = (float)rPunta - r;
-                        dentro = perLato < perLungo ? perLato : perLungo;
-                    }
-
-                    float quanto = dentro / RAMPA + 0.5f;
-                    if (quanto <= 0.10f) continue;
-                    if (quanto > 1.0f) quanto = 1.0f;
-
-                    dmDot(g, (int16_t)lroundf(x), (int16_t)lroundf(y),
-                          4, dmSfuma(colore, quanto));
-                }
-            }
-            continue;
-        }
-
-        // Il vuoto invece resta disegnato fitto e continuo, seguendo
-        // la lancetta come prima. E' solo nero: la sua grana non la
-        // vede nessuno, se ne vede il contorno, e un contorno fatto
-        // di punti fermi si frastaglierebbe sempre allo stesso modo
-        // mentre la lancetta ci scorre dentro.
         uint16_t tinta = (passata == 0) ? COL_SFONDO : colore;
-        int16_t grossezza = (passata == 0) ? (aPunti ? 10 : 11) : 5;
+        int16_t grossezza = (passata == 0) ? 11 : 5;
 
         const float PASSO = 3.0f;
         const float AVANZO = 3.5f;
@@ -1823,9 +1801,9 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t, bool aPunti)
     dmDot(g, CRONO_CX, CRONO_CY, 13, COL_SFONDO);
 }
 
-static void disegnaCrono(Arduino_GFX *g, bool aPunti)
+static void disegnaCrono(Arduino_GFX *g)
 {
-    telaio(g, aPunti ? "CRONO PUNTI" : "CRONO PIENA");
+    telaio(g, "CRONO");
 
     uint32_t t = cronoTempo();
 
@@ -1843,7 +1821,7 @@ static void disegnaCrono(Arduino_GFX *g, bool aPunti)
         disegnaBollo(g, CRONO_CX, CRONO_CY + CRONO_BOLLO, '0' + (cronoNGiri % 10),
                      4, 3, COL_ACCESO);
 
-    cronoLancetta(g, t, aPunti);
+    cronoLancetta(g, t);
     // ---- il tempo in cifre ----
     uint32_t minuti = t / 60000;
     uint32_t secondi = (t / 1000) % 60;
@@ -1890,7 +1868,7 @@ static void disegnaCrono(Arduino_GFX *g, bool aPunti)
     // Finche' corre - o finche' torna verso lo zero - la lancetta
     // chiede il fotogramma successivo.
     if ((cronoAttivo || azzeraInCorso) &&
-        (schedaCorrente == SCHEDA_CRONO || schedaCorrente == SCHEDA_CRONO_B))
+        schedaCorrente == SCHEDA_CRONO)
         numeriInMovimento = true;
 }
 
@@ -2960,8 +2938,7 @@ static void ridisegna(int i)
     switch (i)
     {
     case SCHEDA_ORA:   disegnaOra(scheda[i], t);  break;
-    case SCHEDA_CRONO:   disegnaCrono(scheda[i], false); break;
-    case SCHEDA_CRONO_B: disegnaCrono(scheda[i], true);  break;
+    case SCHEDA_CRONO: disegnaCrono(scheda[i]);   break;
     case SCHEDA_SOLE:  disegnaSole(scheda[i], t); break;
     case SCHEDA_METEO: disegnaMeteo(scheda[i]);   break;
     case SCHEDA_BARO:  disegnaBaro(scheda[i]);   break;
@@ -3057,7 +3034,7 @@ static void disegnaGiri(Arduino_GFX *g)
     // sinistra il nome di dove sei, a destra la carica - o la croce
     // per uscire, quando ci si trova dentro una sezione. E' l'unico
     // punto fermo mentre tutto il resto cambia, e non si tocca.
-    telaio(g, "GIRI");
+    telaio(g, "GIRI", ETICHETTA_PIENA);
 
     disegnaGriglia(g, LCD_W - PADDING - MEZZA_ICONA, PADDING + 8, ICO_CHIUDI,
                    ICONA_COMANDO, 4, 3, COL_SECONDARIO);
@@ -3123,7 +3100,7 @@ static void disegnaGiri(Arduino_GFX *g)
 
 static void disegnaLista(Arduino_GFX *g)
 {
-    telaio(g, "SVEGLIE");
+    telaio(g, "SVEGLIE", ETICHETTA_PIENA);
 
     disegnaGriglia(g, LCD_W - PADDING - MEZZA_ICONA, PADDING + 8, ICO_CHIUDI,
                    ICONA_COMANDO, 4, 3, COL_SECONDARIO);
@@ -3169,7 +3146,7 @@ static void disegnaLista(Arduino_GFX *g)
 
 static void disegnaEditor(Arduino_GFX *g)
 {
-    telaio(g, editorIndice < 0 ? "NUOVA SVEGLIA" : "MODIFICA");
+    telaio(g, editorIndice < 0 ? "NUOVA SVEGLIA" : "MODIFICA", ETICHETTA_PIENA);
 
     disegnaGriglia(g, LCD_W - PADDING - MEZZA_ICONA, PADDING + 8, ICO_CHIUDI,
                    ICONA_COMANDO, 4, 3, COL_SECONDARIO);
@@ -3326,7 +3303,7 @@ static void avviaAnimazioniIngresso()
         bolleInizio = millis();
         ridisegna(SCHEDA_ARIA);
     }
-    else if (schedaCorrente == SCHEDA_CRONO || schedaCorrente == SCHEDA_CRONO_B)
+    else if (schedaCorrente == SCHEDA_CRONO)
     {
         // Come le schede del condizionatore: niente animazione
         // d'ingresso, ma una lancetta che gira sempre. Se nessuno
@@ -3377,31 +3354,24 @@ static void rinfrescaCrono()
 {
     if (!cronoAttivo && !azzeraInCorso) return;
 
-    // Le due schede mostrano lo stesso cronometro con due lancette
-    // diverse: quella che si vede passare va tenuta viva, qualunque
-    // delle due sia.
-    for (int k = 0; k < 2; ++k)
-    {
-        int sc = (k == 0) ? SCHEDA_CRONO : SCHEDA_CRONO_B;
-        if (!schedaVisibile(sc)) continue;
+    if (!schedaVisibile(SCHEDA_CRONO)) return;
 
-        Arduino_GFX *g = scheda[sc];
+    Arduino_GFX *g = scheda[SCHEDA_CRONO];
 
-        // Un cerchio, non un quadrato: gli angoli di un quadrato
-        // inscritto sporgono di meta' diagonale oltre i suoi lati,
-        // arrivavano fin dove stanno le tacche e se le mangiavano
-        // quattro per volta.
-        g->fillCircle(CRONO_CX, CRONO_CY, CRONO_RAGGIO - 28, COL_SFONDO);
-        cronoTrama(g);
-        cronoTacche(g);
-        cronoTriangolo(g);
+    // Un cerchio, non un quadrato: gli angoli di un quadrato
+    // inscritto sporgono di meta' diagonale oltre i suoi lati,
+    // arrivavano fin dove stanno le tacche e se le mangiavano
+    // quattro per volta.
+    g->fillCircle(CRONO_CX, CRONO_CY, CRONO_RAGGIO - 28, COL_SFONDO);
+    cronoTrama(g);
+    cronoTacche(g);
+    cronoTriangolo(g);
 
-        if (cronoNGiri > 0)
-            disegnaBollo(g, CRONO_CX, CRONO_CY + CRONO_BOLLO, '0' + (cronoNGiri % 10),
-                         4, 3, COL_ACCESO);
+    if (cronoNGiri > 0)
+        disegnaBollo(g, CRONO_CX, CRONO_CY + CRONO_BOLLO, '0' + (cronoNGiri % 10),
+                     4, 3, COL_ACCESO);
 
-        cronoLancetta(g, cronoTempo(), sc == SCHEDA_CRONO_B);
-    }
+    cronoLancetta(g, cronoTempo());
 }
 
 static void rinfrescaVisibili()
@@ -3672,7 +3642,7 @@ static void tapNelleSchede()
         return;
     }
 
-    if (schedaCorrente == SCHEDA_CRONO || schedaCorrente == SCHEDA_CRONO_B)
+    if (schedaCorrente == SCHEDA_CRONO)
     {
         // I due angoli in fondo hanno i loro comandi; tutto il resto
         // dello schermo avvia e ferma. Di corsa si guarda il tempo,
@@ -4295,7 +4265,7 @@ static void gestisciSecondoPulsante()
         ultimaAttivita = millis();
 
         if (schermoAcceso && vista == VISTA_SCHEDE &&
-            (schedaCorrente == SCHEDA_CRONO || schedaCorrente == SCHEDA_CRONO_B))
+            schedaCorrente == SCHEDA_CRONO)
         {
             cronoAvviaFerma();
             daRidisegnare[schedaCorrente] = true;
