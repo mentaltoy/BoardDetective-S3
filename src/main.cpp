@@ -314,6 +314,11 @@ static int animDirezione = 0;
 static bool schermoAcceso = true;
 
 static bool retePresente = false;
+
+// Quando riprovare ad agganciare la rete. Non e' un dettaglio:
+// senza, una volta persa non la riprende mai piu'.
+static uint32_t prossimoAggancio = 0;
+#define AGGANCIO_OGNI 20000UL
 static bool oraSincronizzata = false;
 static int batteria = -1;
 static bool alimentato = false;
@@ -4052,6 +4057,7 @@ static void esciDaStandby()
         WiFi.mode(WIFI_STA);
         WiFi.setAutoReconnect(true);
         WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        prossimoAggancio = millis() + AGGANCIO_OGNI;
     }
 
     for (int i = 0; i < N_SCHEDE; ++i)
@@ -4721,6 +4727,27 @@ void loop()
             // aspettare il prossimo giro di mezz'ora.
             if (adessoCe)
                 prossimoMeteo = millis();
+        }
+
+        // Se la rete non c'e', si ritenta ogni venti secondi.
+        //
+        // setAutoReconnect ripesca la rete quando cade sotto i piedi
+        // di una connessione gia' fatta, ma non quando e' il primo
+        // aggancio a non riuscire - al risveglio dallo standby, per
+        // esempio, se in quel momento il router non risponde. Li' la
+        // radio si arrende e resta ferma per sempre: il device
+        // rimane acceso a un metro dal router, con la rete a portata,
+        // e non ci riprova mai piu'. E' successo davvero.
+        if (!adessoCe && strlen(WIFI_SSID) > 0 &&
+            (int32_t)(millis() - prossimoAggancio) >= 0)
+        {
+            prossimoAggancio = millis() + AGGANCIO_OGNI;
+            Serial.println("[wifi] non agganciata, ritento");
+
+            // Prima staccare: una begin() su una connessione a meta'
+            // non riparte, si accoda e basta.
+            WiFi.disconnect();
+            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
         }
         if (t.tm_min != ultimoMinuto)
         {
