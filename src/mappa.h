@@ -92,6 +92,12 @@ struct MappaLivello
     int nLinee = 0;
     bool troncato = false;       // ha smesso di aggiungere per mancanza di spazio
 
+    // Il centro a cui i metri si riferiscono. Se la posizione si
+    // sposta di poco - Google oscilla di qualche metro fra un avvio e
+    // l'altro - non si riscarica niente: si trasla al momento di
+    // disegnare.
+    double lat = 0, lon = 0;
+
     volatile bool pronto = false;
     volatile bool fallito = false;
     uint32_t riprovaA = 0;
@@ -491,15 +497,20 @@ static int mappaSemplifica(int *xs, int *ys, int n, float tolleranza)
 // contrario di quella dei metri.
 //
 // "tolleranza" e' quanto si semplifica, in celle (zero = niente);
-// "squadrato" disegna a otto direzioni invece che libero.
+// "squadrato" disegna a otto direzioni invece che libero. "spostaE" e
+// "spostaN" sono di quanti metri il centro dei dati sta a est e a nord
+// del centro della mappa: servono quando la posizione si e' mossa di
+// poco da quando i dati sono stati presi.
 static void mappaRasterizza(const MappaLivello &liv, uint8_t *celle,
                             int cols, int rows, float metriPerCella,
-                            float tolleranza = 0.0f, bool squadrato = false)
+                            float tolleranza = 0.0f, bool squadrato = false,
+                            float spostaE = 0.0f, float spostaN = 0.0f)
 {
     memset(celle, MAPPA_NIENTE, cols * rows);
     if (!liv.pronto) return;
 
-    const float cx = cols * 0.5f, cy = rows * 0.5f;
+    const float cx = cols * 0.5f + spostaE / metriPerCella;
+    const float cy = rows * 0.5f - spostaN / metriPerCella;
     const float k = 1.0f / metriPerCella;
 
     static int xs[MAPPA_MAX_PUNTI_LINEA], ys[MAPPA_MAX_PUNTI_LINEA];
@@ -591,8 +602,10 @@ static void mappaComponiDomanda(char *out, size_t max, int livello,
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <LittleFS.h>
 
 static MappaLivello mappaLivelli[MAPPA_LIVELLI];
 
@@ -603,6 +616,19 @@ static volatile bool mappaPosizionePronta = false;
 static volatile bool mappaPosizioneDaRete = false;   // ancora da chiedere
 static char mappaCitta[24] = "";
 
+// Da dove viene la posizione, e quanto e' buona. Si scrive sulla
+// scheda: una mappa centrata "piu' o meno qui" deve dirlo.
+enum MappaFonte : uint8_t
+{
+    MAPPA_FONTE_FISSA = 0,   // scritta a mano
+    MAPPA_FONTE_IP,          // dall'indirizzo del fornitore: la citta', forse
+    MAPPA_FONTE_WIFI         // dalle reti intorno: decine di metri
+};
+static volatile uint8_t mappaFonte = MAPPA_FONTE_FISSA;
+static volatile int mappaPrecisione = 0;   // metri, se la fonte lo sa
+static const char *mappaChiaveGoogle = "";
+static bool mappaRipiegoPreciso = false;   // le coordinate di partenza sono di casa, non della citta'
+
 // Quello che il disegno vuole sapere: che livello e' stato chiesto,
 // se ne sta scaricando uno e quanto e' arrivato finora.
 static volatile int mappaLivelloRichiesto = 1;
@@ -612,6 +638,139 @@ static volatile uint32_t mappaByteArrivati = 0;
 // Cresce a ogni cambiamento di stato: chi disegna guarda solo
 // questo numero, e ridisegna quando cambia.
 static volatile uint32_t mappaVersione = 0;
+
+// Quando un server dice di no - troppe richieste, o non ce la fa -
+// si aspetta, e ogni volta di piu': mezzo minuto, uno, due, fino a
+// cinque. Continuare a chiedere a un server che ha appena detto
+// "basta" e' il modo piu' sicuro di restare in castigo.
+static uint32_t mappaPausaFino = 0;
+static uint32_t mappaPausaDurata = 30000UL;
+static bool mappaCacheOk = false;
+
+// Di quanti metri il centro dei dati di un livello sta a est e a
+// nord del centro attuale della mappa.
+static void mappaScostamento(const MappaLivello &liv, float &est, float &nord)
+{
+    est = (float)((liv.lon - mappaLon) * 111320.0 * cos(mappaLat * M_PI / 180.0));
+    nord = (float)((liv.lat - mappaLat) * 110574.0);
+}
+
+// Un livello vale ancora se il suo centro e' vicino a quello di
+// adesso: entro un quarto del raggio i bordi vuoti non si notano.
+// Piu' in la' i dati sono di un altro posto, e si riscaricano.
+static bool mappaLivelloAncoraBuono(int l)
+{
+    float e, n;
+    mappaScostamento(mappaLivelli[l], e, n);
+    float limite = MAPPA_RAGGIO[l] * 0.25f;
+    return (e * e + n * n) <= limite * limite;
+}
+
+// ------------------------------------------------------------
+//  LA CACHE NELLA FLASH
+// ------------------------------------------------------------
+//  Un livello scaricato si scrive in un file: punti, linee, classi e
+//  il centro a cui si riferiscono. Al riavvio si rilegge, e la mappa
+//  c'e' subito - anche senza rete, anche se Overpass e' in castigo.
+//  Sono cento KB per livello in una partizione da tre megabyte che
+//  nessuno usava.
+//
+//  Il numero di versione nel file serve a buttare via i vecchi
+//  quando cambia la forma dei dati: meglio riscaricare che leggere
+//  numeri con un altro significato.
+
+#define MAPPA_CACHE_MAGIA 0x4D415050UL   // "MAPP"
+#define MAPPA_CACHE_VERSIONE 1
+
+struct MappaCacheTesta
+{
+    uint32_t magia;
+    uint16_t versione;
+    uint16_t raggio;
+    double lat, lon;
+    int32_t nLinee, nPunti;
+};
+
+static void mappaCacheNome(int l, char *out, size_t max)
+{
+    snprintf(out, max, "/mappa%d.bin", l);
+}
+
+static void mappaCacheScrivi(int l)
+{
+    if (!mappaCacheOk) return;
+    const MappaLivello &liv = mappaLivelli[l];
+
+    char nome[24];
+    mappaCacheNome(l, nome, sizeof(nome));
+    File f = LittleFS.open(nome, "w");
+    if (!f)
+    {
+        Serial.printf("[mappa] non riesco a scrivere %s\n", nome);
+        return;
+    }
+
+    MappaCacheTesta t = {MAPPA_CACHE_MAGIA, MAPPA_CACHE_VERSIONE, MAPPA_RAGGIO[l],
+                         liv.lat, liv.lon, liv.nLinee, liv.nPunti};
+    f.write((const uint8_t *)&t, sizeof(t));
+    f.write((const uint8_t *)liv.inizio, (liv.nLinee + 1) * sizeof(uint16_t));
+    f.write((const uint8_t *)liv.classe, liv.nLinee);
+    f.write((const uint8_t *)liv.px, liv.nPunti * sizeof(int16_t));
+    f.write((const uint8_t *)liv.py, liv.nPunti * sizeof(int16_t));
+    f.close();
+    Serial.printf("[mappa] livello %d salvato nella flash\n", l);
+}
+
+static bool mappaAllocaLivello(MappaLivello &liv);
+
+static bool mappaCacheLeggi(int l)
+{
+    if (!mappaCacheOk) return false;
+    MappaLivello &liv = mappaLivelli[l];
+
+    char nome[24];
+    mappaCacheNome(l, nome, sizeof(nome));
+    // Prima si guarda se c'e': aprire un file che non esiste fa
+    // stampare alla libreria un errore rosso che non e' un errore.
+    if (!LittleFS.exists(nome)) return false;
+    File f = LittleFS.open(nome, "r");
+    if (!f) return false;
+
+    MappaCacheTesta t;
+    bool ok = f.read((uint8_t *)&t, sizeof(t)) == sizeof(t) &&
+              t.magia == MAPPA_CACHE_MAGIA && t.versione == MAPPA_CACHE_VERSIONE &&
+              t.raggio == MAPPA_RAGGIO[l] &&
+              t.nLinee > 0 && t.nLinee <= MAPPA_MAX_LINEE &&
+              t.nPunti > 1 && t.nPunti <= MAPPA_MAX_PUNTI;
+
+    if (ok && mappaAllocaLivello(liv))
+    {
+        ok = f.read((uint8_t *)liv.inizio, (t.nLinee + 1) * sizeof(uint16_t)) == (size_t)((t.nLinee + 1) * sizeof(uint16_t)) &&
+             f.read((uint8_t *)liv.classe, t.nLinee) == (size_t)t.nLinee &&
+             f.read((uint8_t *)liv.px, t.nPunti * sizeof(int16_t)) == (size_t)(t.nPunti * sizeof(int16_t)) &&
+             f.read((uint8_t *)liv.py, t.nPunti * sizeof(int16_t)) == (size_t)(t.nPunti * sizeof(int16_t));
+    }
+    else
+        ok = false;
+    f.close();
+
+    if (!ok)
+    {
+        Serial.printf("[mappa] %s non torna: lo butto\n", nome);
+        LittleFS.remove(nome);
+        return false;
+    }
+
+    liv.nLinee = t.nLinee;
+    liv.nPunti = t.nPunti;
+    liv.lat = t.lat;
+    liv.lon = t.lon;
+    liv.troncato = false;
+    liv.fallito = false;
+    liv.pronto = true;
+    Serial.printf("[mappa] livello %d dalla flash: %d linee, %d punti\n", l, liv.nLinee, liv.nPunti);
+    return true;
+}
 
 static bool mappaAllocaLivello(MappaLivello &liv)
 {
@@ -674,6 +833,46 @@ static void mappaCodifica(const char *in, String &out)
     }
 }
 
+// A chi chiedere. Il primo e' il server principale di Overpass; il
+// secondo e' un mirror indipendente, con i suoi limiti e i suoi
+// blocchi. Quando uno dice di no si passa al successivo, e la pausa
+// scatta solo dopo che hanno detto di no tutti. Chi risponde resta
+// il preferito finche' non sbaglia.
+struct MappaServer
+{
+    const char *url;
+    bool sicuro;   // https: il certificato non si verifica, vedi Google
+};
+
+static const MappaServer MAPPA_SERVER[] = {
+    {"http://overpass-api.de/api/interpreter", false},
+    {"https://maps.mail.ru/osm/tools/overpass/api/interpreter", true},
+};
+#define MAPPA_N_SERVER ((int)(sizeof(MAPPA_SERVER) / sizeof(MAPPA_SERVER[0])))
+
+static int mappaServerCorrente = 0;
+static int mappaServerFallitiDiFila = 0;
+
+static void mappaServerHaFallito()
+{
+    mappaServerCorrente = (mappaServerCorrente + 1) % MAPPA_N_SERVER;
+    if (++mappaServerFallitiDiFila < MAPPA_N_SERVER)
+    {
+        Serial.printf("[mappa] provo con %s\n", MAPPA_SERVER[mappaServerCorrente].url);
+        return;
+    }
+
+    // Nessuno risponde: da qui in poi si aspetta prima di
+    // ricominciare, e ogni volta di piu'. Riprovare ogni cinque
+    // secondi contro server che ci hanno messi alla porta e' il modo
+    // di restarci.
+    mappaServerFallitiDiFila = 0;
+    mappaPausaFino = millis() + mappaPausaDurata;
+    Serial.printf("[mappa] nessun server risponde: mi fermo %lu s\n",
+                  (unsigned long)(mappaPausaDurata / 1000));
+    if (mappaPausaDurata < 300000UL) mappaPausaDurata *= 2;
+}
+
 static bool mappaScaricaLivello(int livello)
 {
     MappaLivello &liv = mappaLivelli[livello];
@@ -683,6 +882,8 @@ static bool mappaScaricaLivello(int livello)
     liv.nLinee = 0;
     liv.troncato = false;
     liv.inizio[0] = 0;
+    liv.lat = mappaLat;
+    liv.lon = mappaLon;
 
     char domanda[512];
     mappaComponiDomanda(domanda, sizeof(domanda), livello, mappaLat, mappaLon);
@@ -690,28 +891,49 @@ static bool mappaScaricaLivello(int livello)
     String corpo = "data=";
     mappaCodifica(domanda, corpo);
 
+    const MappaServer &server = MAPPA_SERVER[mappaServerCorrente];
+
+    // Il canale: in chiaro o cifrato a seconda del server. Tutti e
+    // due sono client nel senso della libreria, e HTTPClient non fa
+    // differenza.
+    WiFiClient chiaro;
+    WiFiClientSecure cifrato;
+    if (server.sicuro) cifrato.setInsecure();
+    WiFiClient &client = server.sicuro ? (WiFiClient &)cifrato : chiaro;
+
     HTTPClient http;
     // Lungo: Overpass puo' metterci dieci secondi a cominciare a
-    // rispondere, perche' la domanda la esegue davvero.
-    http.setConnectTimeout(6000);
-    http.setTimeout(45000);
+    // rispondere, perche' la domanda la esegue davvero - e il mirror
+    // anche di piu'.
+    http.setConnectTimeout(8000);
+    http.setTimeout(60000);
     http.useHTTP10(false);
 
-    if (!http.begin("http://overpass-api.de/api/interpreter"))
+    if (!http.begin(client, server.url))
         return false;
 
     http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    // Dire chi si e': e' la buona educazione che Overpass chiede a chi
+    // lo usa, e serve a loro per capire chi bussa quando bussa troppo.
+    http.setUserAgent("DotClock-ESP32 (BoardDetective-S3)");
 
-    Serial.printf("[mappa] livello %d, raggio %d m: chiedo...\n", livello, MAPPA_RAGGIO[livello]);
+    Serial.printf("[mappa] livello %d, raggio %d m: chiedo a %s...\n",
+                  livello, MAPPA_RAGGIO[livello], server.url);
     uint32_t t0 = millis();
 
     int codice = http.POST(corpo);
     if (codice != 200)
     {
+        // 429 e 504 sono il server che dice basta; -1 e' una
+        // connessione rifiutata, che e' il server che dice basta piu'
+        // forte. Si passa al prossimo.
         Serial.printf("[mappa] risposta http %d\n", codice);
         http.end();
+        mappaServerHaFallito();
         return false;
     }
+    mappaServerFallitiDiFila = 0;
+    mappaPausaDurata = 30000UL;   // ha risposto: la prossima attesa riparte da capo
 
     // Lo scanner tiene due vettori da duemila punti: e' grosso per lo
     // stack di un compito, quindi vive nell'heap per il tempo che serve.
@@ -726,8 +948,11 @@ static bool mappaScaricaLivello(int livello)
 
     if (scritti < 0 || liv.nLinee == 0)
     {
+        // Anche una risposta che si spezza a meta' e' un no: si passa
+        // al prossimo server, come per un rifiuto.
         Serial.printf("[mappa] scarico interrotto (%d), %lu byte, %d linee\n",
                       scritti, (unsigned long)letti, liv.nLinee);
+        mappaServerHaFallito();
         return false;
     }
 
@@ -740,10 +965,109 @@ static bool mappaScaricaLivello(int livello)
     return true;
 }
 
+// ------------------------------------------------------------
+//  LA POSIZIONE DALLE RETI INTORNO
+// ------------------------------------------------------------
+//  E' il trucco dei telefoni in casa, dove il GPS non prende: si
+//  guardano i router che si vedono - il loro indirizzo fisico e
+//  quanto forte arrivano - e si chiede a chi ha una mappa di tutti i
+//  router del mondo dove sta quel gruppo. Google ce l'ha, e in citta'
+//  risponde con qualche decina di metri di errore. Vuole una chiave
+//  e passa per HTTPS.
+//
+//  Il certificato del server non si verifica: la board non ha un
+//  elenco di autorita' fidate, e portarselo dietro costa piu' di
+//  quel che protegge. Quello che passa e' un elenco di router
+//  vicini e una posizione che finisce su uno schermo. La chiave
+//  viaggia nell'indirizzo, quindi conviene che in Google sia
+//  limitata a questa sola API.
+
+static bool mappaChiediPosizioneWifi()
+{
+    if (!mappaChiaveGoogle || !mappaChiaveGoogle[0]) return false;
+
+    Serial.println("[mappa] guardo le reti intorno...");
+    int n = WiFi.scanNetworks(false, true);
+    if (n <= 1)
+    {
+        Serial.printf("[mappa] viste %d reti: troppo poche per una posizione\n", n);
+        WiFi.scanDelete();
+        return false;
+    }
+
+    // Al massimo venti, le piu' forti prima: sono quelle che contano
+    // per la posizione, e la risposta non migliora con le altre.
+    // "considerIp" a false: se le reti non bastano vogliamo un no
+    // secco, non la stessa risposta dell'IP con un altro nome.
+    DynamicJsonDocument richiesta(4096);
+    richiesta["considerIp"] = false;
+    JsonArray reti = richiesta.createNestedArray("wifiAccessPoints");
+
+    int messe = 0;
+    for (int passata = 0; passata < 2 && messe < 20; ++passata)
+        for (int i = 0; i < n && messe < 20; ++i)
+        {
+            bool forte = WiFi.RSSI(i) > -75;
+            if ((passata == 0) != forte) continue;
+            JsonObject r = reti.createNestedObject();
+            r["macAddress"] = WiFi.BSSIDstr(i);
+            r["signalStrength"] = WiFi.RSSI(i);
+            r["channel"] = WiFi.channel(i);
+            ++messe;
+        }
+    WiFi.scanDelete();
+
+    String corpo;
+    serializeJson(richiesta, corpo);
+    Serial.printf("[mappa] %d reti viste, %d mandate a Google\n", n, messe);
+
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    HTTPClient http;
+    http.setConnectTimeout(8000);
+    http.setTimeout(10000);
+
+    String url = "https://www.googleapis.com/geolocation/v1/geolocate?key=";
+    url += mappaChiaveGoogle;
+    if (!http.begin(client, url)) return false;
+    http.addHeader("Content-Type", "application/json");
+
+    int codice = http.POST(corpo);
+    String risposta = http.getString();
+    http.end();
+
+    if (codice != 200)
+    {
+        // 404 e' "non so dove sono queste reti"; 400 e 403 sono la
+        // chiave sbagliata o l'API non abilitata. Si stampa tutto,
+        // che e' l'unico modo di capire quale dei due.
+        Serial.printf("[mappa] Google risponde %d: %s\n", codice,
+                      risposta.substring(0, 160).c_str());
+        return false;
+    }
+
+    StaticJsonDocument<512> doc;
+    if (deserializeJson(doc, risposta) || doc["location"].isNull())
+    {
+        Serial.println("[mappa] Google: risposta illeggibile");
+        return false;
+    }
+
+    mappaLat = doc["location"]["lat"] | 0.0;
+    mappaLon = doc["location"]["lng"] | 0.0;
+    mappaPrecisione = (int)(doc["accuracy"] | 0.0);
+    mappaFonte = MAPPA_FONTE_WIFI;
+
+    Serial.printf("[mappa] posizione dalle reti: %.5f, %.5f, entro %d m\n",
+                  mappaLat, mappaLon, mappaPrecisione);
+    return true;
+}
+
 // La posizione dall'indirizzo IP. E' quella del fornitore, non la
 // tua: da casa puo' sbagliare di centinaia di chilometri. Ma e'
 // gratis, non chiede chiavi e da' anche il nome della citta'.
-static bool mappaChiediPosizione()
+static bool mappaChiediPosizioneIp()
 {
     HTTPClient http;
     http.setConnectTimeout(4000);
@@ -771,6 +1095,8 @@ static bool mappaChiediPosizione()
 
     mappaLat = doc["lat"] | 0.0;
     mappaLon = doc["lon"] | 0.0;
+    mappaFonte = MAPPA_FONTE_IP;
+    mappaPrecisione = 0;
 
     // Il nome in maiuscolo e solo ASCII: e' quello che il font sa
     // scrivere. Una lettera accentata diventa uno spazio.
@@ -844,6 +1170,14 @@ static int mappaLivelloSostituto(int voluto)
 // respira un attimo, per lo stesso motivo.
 static void mappaTask(void *)
 {
+    // Prima di tutto quello che c'e' gia' nella flash: la mappa
+    // compare subito, e la rete serve solo per quello che manca.
+    for (int l = 0; l < MAPPA_LIVELLI; ++l)
+        mappaCacheLeggi(l);
+    ++mappaVersione;
+
+    bool posizioneVerificata = false;
+
     for (;;)
     {
         if (WiFi.status() != WL_CONNECTED)
@@ -852,15 +1186,55 @@ static void mappaTask(void *)
             continue;
         }
 
+        // Appena la posizione e' quella definitiva, i livelli letti
+        // dalla flash si controllano: quelli presi altrove si
+        // riscaricano, quelli presi qui vicino si tengono e si
+        // traslano al momento di disegnare.
+        if (mappaPosizionePronta && !posizioneVerificata)
+        {
+            posizioneVerificata = true;
+            for (int l = 0; l < MAPPA_LIVELLI; ++l)
+                if (mappaLivelli[l].pronto && !mappaLivelloAncoraBuono(l))
+                {
+                    Serial.printf("[mappa] livello %d era di un altro posto: lo riscarico\n", l);
+                    mappaLivelli[l].pronto = false;
+                }
+            ++mappaVersione;
+        }
+
+        // Prima le reti intorno, che sono precise; se non si puo' -
+        // niente chiave, o Google non conosce questa zona - l'IP, che
+        // almeno la citta' la azzecca quasi sempre. Se nemmeno quello,
+        // resta la posizione di ripiego con cui si e' partiti, e si
+        // riprova fra venti secondi.
+        //
+        // Ma l'IP si chiede solo se il ripiego e' vago: se le
+        // coordinate di casa sono scritte a mano, sono meglio di
+        // qualunque cosa possa dire l'indirizzo del fornitore, e se il
+        // WiFi non risponde si tengono quelle.
         if (!mappaPosizionePronta)
         {
-            if (mappaChiediPosizione())
+            if (mappaChiediPosizioneWifi() ||
+                (!mappaRipiegoPreciso && mappaChiediPosizioneIp()))
             {
+                mappaPosizionePronta = true;
+                ++mappaVersione;
+            }
+            else if (mappaRipiegoPreciso)
+            {
+                Serial.println("[mappa] la rete non sa dove siamo: valgono le coordinate scritte a mano");
                 mappaPosizionePronta = true;
                 ++mappaVersione;
             }
             else
                 vTaskDelay(pdMS_TO_TICKS(20000));
+            continue;
+        }
+
+        // In castigo non si chiede niente.
+        if ((int32_t)(millis() - mappaPausaFino) < 0)
+        {
+            vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
@@ -875,13 +1249,19 @@ static void mappaTask(void *)
 
             bool ok = mappaScaricaLivello(l);
 
+            // Se non e' arrivato, il livello resta il primo della fila:
+            // la colpa e' del server, e ad aspettare ci pensa la pausa
+            // dei server. Questi cinque secondi servono solo a non
+            // ripetere all'istante la stessa domanda allo stesso posto.
             liv.pronto = ok;
             liv.fallito = !ok;
-            liv.riprovaA = millis() + 30000UL;
+            liv.riprovaA = millis() + 5000UL;
             mappaScaricando = -1;
             ++mappaVersione;
 
-            vTaskDelay(pdMS_TO_TICKS(ok ? 1500 : 5000));
+            if (ok) mappaCacheScrivi(l);
+
+            vTaskDelay(pdMS_TO_TICKS(ok ? 2000 : 5000));
             continue;
         }
 
@@ -891,18 +1271,33 @@ static void mappaTask(void *)
 
 // Parte con la posizione gia' decisa - se la conosci - o con la
 // promessa di chiederla alla rete.
-static void mappaBegin(double lat, double lon, const char *citta, bool chiediAllaRete)
+static void mappaBegin(double lat, double lon, const char *citta, bool chiediAllaRete,
+                       const char *chiaveGoogle = "", bool ripiegoPreciso = false)
 {
     mappaLat = lat;
     mappaLon = lon;
     strncpy(mappaCitta, citta ? citta : "", sizeof(mappaCitta) - 1);
+    mappaChiaveGoogle = chiaveGoogle ? chiaveGoogle : "";
+    mappaRipiegoPreciso = ripiegoPreciso;
+    mappaFonte = MAPPA_FONTE_FISSA;
 
     mappaPosizionePronta = !chiediAllaRete;
     mappaPosizioneDaRete = chiediAllaRete;
 
+    // La partizione dati. La prima volta e' vuota e va formattata: ci
+    // mette qualche secondo, una volta sola.
+    mappaCacheOk = LittleFS.begin(true);
+    if (mappaCacheOk)
+        Serial.printf("[mappa] flash: %lu KB usati su %lu\n",
+                      (unsigned long)(LittleFS.usedBytes() / 1024),
+                      (unsigned long)(LittleFS.totalBytes() / 1024));
+    else
+        Serial.println("[mappa] partizione dati non disponibile: niente cache");
+
     // Lo scanner alloca i suoi vettori nell'heap, ma il compito parla
-    // con HTTPClient e String: otto KB di stack, come lo specchio web.
-    xTaskCreatePinnedToCore(mappaTask, "mappa", 8192, nullptr, 1, nullptr, 0);
+    // con HTTPClient, String e - per Google - con TLS, che nella
+    // stretta di mano vuole parecchio stack. Sedici KB.
+    xTaskCreatePinnedToCore(mappaTask, "mappa", 16384, nullptr, 1, nullptr, 0);
 }
 
 static void mappaChiediLivello(int livello)

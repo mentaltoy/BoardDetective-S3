@@ -87,13 +87,33 @@
 #define LON 12.4964
 #define CITTA "ROMA"
 
-// Da dove prende la posizione la scheda della mappa. Se in secrets.h
-// ci sono MAPPA_LAT e MAPPA_LON si usano quelle e la rete non si
-// interroga. Altrimenti, con 1, si chiede a un servizio che la ricava
-// dall'indirizzo IP - che dice dov'e' il fornitore di rete, non dove
-// sei tu: da una linea Telecom a Roma risponde Milano. Con 0 si usano
-// LAT e LON qui sopra.
-#define MAPPA_DA_IP 1
+// Da dove prende la posizione la scheda della mappa.
+//
+// Con 1 la chiede alla rete: prima dalle reti WiFi intorno, passando
+// per Google, se in secrets.h c'e' GOOGLE_KEY - decine di metri di
+// errore; se no dall'indirizzo IP - che dice dov'e' il fornitore, non
+// dove sei tu: da una linea Telecom a Roma risponde Milano. Finche' la
+// rete non risponde, e se non risponde mai, vale il ripiego: MAPPA_LAT
+// e MAPPA_LON da secrets.h se ci sono, altrimenti LAT e LON qui sopra.
+//
+// Con 0 non chiede niente a nessuno e usa direttamente il ripiego -
+// che per un oggetto che sta fermo su una scrivania e' la posizione
+// piu' precisa che esista.
+#define MAPPA_DA_RETE 1
+
+#if defined(MAPPA_LAT) && defined(MAPPA_LON)
+#define MAPPA_RIPIEGO_LAT MAPPA_LAT
+#define MAPPA_RIPIEGO_LON MAPPA_LON
+#define MAPPA_RIPIEGO_PRECISO true    // e' casa: l'IP non puo' fare di meglio
+#else
+#define MAPPA_RIPIEGO_LAT LAT
+#define MAPPA_RIPIEGO_LON LON
+#define MAPPA_RIPIEGO_PRECISO false   // e' la citta': l'IP vale lo stesso
+#endif
+
+#ifndef GOOGLE_KEY
+#define GOOGLE_KEY ""
+#endif
 
 // La regola dell'ora legale europea, scritta nel formato che usa
 // il sistema: un'ora avanti dall'ultima domenica di marzo
@@ -2351,8 +2371,12 @@ static void disegnaMappa(Arduino_Canvas *g)
 
     if (da && mappaCelle)
     {
+        // I dati possono essere stati presi qualche metro piu' in la'
+        // di dove siamo adesso: si traslano, non si riscaricano.
+        float spostaE, spostaN;
+        mappaScostamento(*da, spostaE, spostaN);
         mappaRasterizza(*da, mappaCelle, MAPPA_COLS, MAPPA_ROWS, mappaMetriPerCella(),
-                        MAPPA_TOLLERANZA, MAPPA_SQUADRATA != 0);
+                        MAPPA_TOLLERANZA, MAPPA_SQUADRATA != 0, spostaE, spostaN);
 
         // Tre pesi di strada, tre segni diversi: le arterie punti
         // grossi e bianchi, le medie punti piccoli e chiari, le vie
@@ -2390,6 +2414,25 @@ static void disegnaMappa(Arduino_Canvas *g)
         for (int j = 0; j < MAPPA_ROWS; ++j)
             for (int i = 0; i < MAPPA_COLS; ++i)
                 g->drawPixel(mappaPixelX(i), mappaPixelY(j), COL_TRAMA);
+    }
+
+    // Da dove viene il centro della mappa, in alto a destra, piccolo:
+    // FISSA se e' scritto a mano, IP se e' la citta' del fornitore,
+    // WIFI con i metri di errore se l'hanno detto le reti intorno.
+    // Una mappa che dice "sei qui" deve dire anche quanto ne e' sicura.
+    if (liv.pronto)
+    {
+        char fonte[20];
+        if (mappaFonte == MAPPA_FONTE_WIFI)
+            snprintf(fonte, sizeof(fonte), "WIFI %d M", (int)mappaPrecisione);
+        else
+            strcpy(fonte, mappaFonte == MAPPA_FONTE_IP ? "DA IP" : "FISSA");
+
+        const int16_t largo = dmTextWidth(fonte, 2, 2);
+        const int16_t x = MAPPA_X0 + MAPPA_COLS * MAPPA_PASSO - largo - 6;
+        const int16_t y = MAPPA_Y0 + 4;
+        g->fillRect(x - 6, y - 3, largo + 12, dmTextHeight(2) + 6, COL_SFONDO);
+        dmText(g, x, y, fonte, 2, 2, COL_ETICHETTA, 2);
     }
 
     // Perche' quello che vedi non e' ancora quello che hai chiesto.
@@ -5265,14 +5308,9 @@ void setup()
 
     // La mappa parte adesso e fa da sola: aspetta la rete, trova la
     // posizione, scarica il primo livello. Da dove prende la posizione
-    // lo decide MAPPA_DA_IP qui sopra, o secrets.h se dice la sua.
-#if defined(MAPPA_LAT) && defined(MAPPA_LON)
-    mappaBegin(MAPPA_LAT, MAPPA_LON, CITTA, false);
-#elif MAPPA_DA_IP
-    mappaBegin(LAT, LON, "", true);
-#else
-    mappaBegin(LAT, LON, CITTA, false);
-#endif
+    // lo decide MAPPA_DA_RETE, in cima al file.
+    mappaBegin(MAPPA_RIPIEGO_LAT, MAPPA_RIPIEGO_LON, CITTA, MAPPA_DA_RETE != 0,
+               GOOGLE_KEY, MAPPA_RIPIEGO_PRECISO);
     prossimoMeteo = millis() + (scaricaMeteo() ? 30UL * 60UL * 1000UL : 2UL * 60UL * 1000UL);
     scaricaAria();
 
