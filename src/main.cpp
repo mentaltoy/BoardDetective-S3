@@ -978,8 +978,9 @@ static void connettiWifi()
     int n = WiFi.scanNetworks(false, false);
     if (n > 0) reteRaccogliScansione(n);
     const char *scelta = reteMigliore();
-    Serial.printf("[wifi] viste %d reti, mi aggancio a \"%s\"\n", nReteViste,
-                  scelta ? scelta : reteUltima);
+    Serial.printf("[wifi] viste %d reti, %s\"%s\"\n", nReteViste,
+                  scelta ? "mi aggancio a " : "nessuna conosciuta, provo ",
+                  scelta ? scelta : reteUltimaNota());
     if (scelta) reteAggancia(scelta);
     else reteAgganciaUltima();
 

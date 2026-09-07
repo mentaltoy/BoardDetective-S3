@@ -259,10 +259,23 @@ static bool reteScansiona()
     if (reteScansioneInCorso) return true;
     if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);
 
-    // Puo' dire di no se qualcun altro sta gia' guardando - la mappa,
-    // per esempio, che chiede la posizione alle reti intorno. Si
-    // riprovera' al prossimo giro.
-    if (WiFi.scanNetworks(true, false) == WIFI_SCAN_FAILED) return false;
+    // La radio non scansiona mentre sta tentando di agganciarsi: il
+    // driver rifiuta e basta. E con la riconnessione automatica un
+    // tentativo su una rete che non c'e' non finisce mai - e' quello
+    // che succedeva fuori casa: partita cercando casa, la board
+    // restava in tentativo per sempre e ogni scansione successiva
+    // moriva in silenzio. L'hotspot poteva accendersi quanto voleva.
+    // Quindi, se non si e' agganciati, prima si smette di provare.
+    if (WiFi.status() != WL_CONNECTED) WiFi.disconnect();
+
+    // Puo' dire di no anche se qualcun altro sta gia' guardando - la
+    // mappa, per esempio, che chiede la posizione alle reti intorno.
+    // Si riprovera' al prossimo giro.
+    if (WiFi.scanNetworks(true, false) == WIFI_SCAN_FAILED)
+    {
+        Serial.println("[rete] scansione rifiutata dalla radio");
+        return false;
+    }
 
     reteScansioneInCorso = true;
     return true;
@@ -318,6 +331,14 @@ static bool reteAgganciaUltima()
     if (reteUltima[0] && reteAggancia(reteUltima)) return true;
     if (nReteNote > 0) return reteAggancia(reteNote[0].ssid);
     return false;
+}
+
+// Che rete proverebbe reteAgganciaUltima: serve solo per dirlo.
+static const char *reteUltimaNota()
+{
+    if (reteUltima[0] && reteIndiceNota(reteUltima) >= 0) return reteUltima;
+    if (nReteNote > 0) return reteNote[0].ssid;
+    return "";
 }
 
 // Guardarsi intorno e poi agganciarsi alla prima della lista fra le
@@ -579,6 +600,11 @@ static void reteAggiorna()
             strcpy(reteFallita, reteVoluta);
             reteVoluta[0] = '\0';
             ++reteVersione;
+
+            // Si smette di insistere: la radio libera puo' guardarsi
+            // intorno, e sara' la scansione a decidere a chi
+            // riprovare.
+            WiFi.disconnect();
         }
     }
 }
