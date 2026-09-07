@@ -50,6 +50,7 @@
 #include "imu.h"
 #include "web.h"
 #include "clima.h"
+#include "mappa.h"
 
 // Il logo compare come quarta scheda solo se src/logo.h esiste.
 // Lo genera scripts/logo2c.py da un'immagine qualsiasi; senza,
@@ -85,6 +86,14 @@
 #define LAT 41.9028   // Roma
 #define LON 12.4964
 #define CITTA "ROMA"
+
+// Da dove prende la posizione la scheda della mappa. Se in secrets.h
+// ci sono MAPPA_LAT e MAPPA_LON si usano quelle e la rete non si
+// interroga. Altrimenti, con 1, si chiede a un servizio che la ricava
+// dall'indirizzo IP - che dice dov'e' il fornitore di rete, non dove
+// sei tu: da una linea Telecom a Roma risponde Milano. Con 0 si usano
+// LAT e LON qui sopra.
+#define MAPPA_DA_IP 1
 
 // La regola dell'ora legale europea, scritta nel formato che usa
 // il sistema: un'ora avanti dall'ultima domenica di marzo
@@ -145,6 +154,14 @@
 // che risponde deve essere molto piu' grande del simbolo disegnato.
 #define BERSAGLIO 46
 
+// Il disco del cronometro e del timer. Sta qui insieme alle altre
+// misure dello schermo, e non accanto al codice che lo disegna,
+// perche' non serve solo a disegnarlo: serve anche a sapere se il
+// dito e' caduto dentro il quadrante o fuori.
+#define QUADRANTE_CX (LCD_W / 2)
+#define QUADRANTE_CY 216
+#define QUADRANTE_RAGGIO 136
+
 // ------------------------------------------------------------
 //  IL PASSO DEI QUADRANTI
 // ------------------------------------------------------------
@@ -198,20 +215,27 @@ static Arduino_Canvas *comp = new Arduino_Canvas(LCD_W, LCD_H, panel);
 // ------------------------------------------------------------
 
 #if HA_LOGO
-#define N_SCHEDE 9
+#define N_SCHEDE 11
 #else
-#define N_SCHEDE 8
+#define N_SCHEDE 10
 #endif
 
 #define SCHEDA_ORA 0
 #define SCHEDA_CRONO 1
-#define SCHEDA_SOLE 2
-#define SCHEDA_METEO 3
-#define SCHEDA_BARO 4
-#define SCHEDA_ARIA 5
-#define SCHEDA_CLIMA 6     // il salone
-#define SCHEDA_CLIMA2 7    // la camera
-#define SCHEDA_LOGO 8
+#define SCHEDA_TIMER 2
+#define SCHEDA_SOLE 3
+#define SCHEDA_METEO 4
+#define SCHEDA_BARO 5
+#define SCHEDA_ARIA 6
+#define SCHEDA_CLIMA 7     // il salone
+#define SCHEDA_CLIMA2 8    // la camera
+#define SCHEDA_LOGO 9
+// La mappa e' l'ultima, con o senza il logo davanti.
+#if HA_LOGO
+#define SCHEDA_MAPPA 10
+#else
+#define SCHEDA_MAPPA 9
+#endif
 
 // Da quale scheda si comanda quale macchina.
 #define CLIMA_DI(scheda) (climi[(scheda) == SCHEDA_CLIMA ? 0 : 1])
@@ -230,9 +254,11 @@ static Arduino_Canvas *scheda[N_SCHEDE] = {
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
+    new Arduino_Canvas(LCD_W, LCD_H, nullptr),
 #if HA_LOGO
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
 #endif
+    new Arduino_Canvas(LCD_W, LCD_H, nullptr),   // la mappa
 };
 static bool daRidisegnare[N_SCHEDE];
 
@@ -269,10 +295,25 @@ static int editorCampo = 0;          // 0 = ore, 1 = minuti
 static int allarmeIndice = -1;
 static int allarmeUltimoMinuto = -1;
 
+// Chi sta suonando. La schermata dell'allarme e' una sola perche' il
+// gesto e' uno solo - tocca e smetti - e due schermate identiche con
+// due nomi diversi sarebbero due cose da imparare invece di una.
+// Cambia la scritta, non il modo di spegnerlo.
+static bool allarmeDalTimer = false;
+
 static Touch touch;
 static bool touchOk = false;
 
 static int schedaCorrente = 0;
+
+// La scheda accanto, in una direzione. Il carosello e' un anello:
+// dopo l'ultima viene la prima e prima della prima viene l'ultima.
+// Prima finiva ai due capi, e per tornare dall'ultima alla prima
+// c'erano dieci scorrimenti: su un anello ce n'e' uno.
+static inline int schedaAccanto(int direzione)
+{
+    return (schedaCorrente + direzione + N_SCHEDE) % N_SCHEDE;
+}
 
 // Quanto siamo spostati rispetto alla scheda corrente, in pixel.
 // Positivo = stiamo scivolando verso la scheda successiva.
@@ -367,6 +408,7 @@ static DmRullo rulloAria;
 static DmRullo rulloClima[N_CLIMI];
 static DmRullo rulloModo[N_CLIMI];
 static DmRullo rulloCrono;
+static DmRullo rulloTimer;
 
 // ------------------------------------------------------------
 //  IL CRONOMETRO
@@ -451,6 +493,190 @@ static void cronoGiro()
 
     if (cronoNGiri < MAX_GIRI)
         cronoGiri[cronoNGiri++] = cronoGiroUltimo;
+}
+
+// ------------------------------------------------------------
+//  IL TIMER
+// ------------------------------------------------------------
+//  Il cronometro conta da zero in avanti e non finisce mai; il timer
+//  parte da una durata che gli dai tu e finisce suonando. Sono la
+//  stessa meccanica letta al contrario, e per questo stanno su
+//  quadranti identici, uno accanto all'altro.
+//
+//  DOVE GIRA IL TEMPO
+//  Il cronometro tiene un tempo accumulato; il timer tiene invece il
+//  millesimo in cui scade. E' la stessa scelta di fondo - guardare
+//  l'orologio e sottrarre, invece di sommare pezzetti - solo che qui
+//  il traguardo e' fisso e quindi conviene ricordare quello. Da
+//  fermo il traguardo non esiste ancora: c'e' solo quanto resta.
+//
+//  UN GIRO E' UN'ORA
+//  Sul cronometro un giro di lancetta e' un minuto, qui e' un'ora.
+//  Non e' un'incoerenza: e' la stessa lancetta che indica il numero
+//  scritto sul quadrante, e sessanta tacche vogliono dire sessanta
+//  di qualcosa. La differenza e' che un cronometro lo si legge al
+//  secondo e un timer lo si imposta al minuto.
+
+#define TIMER_MASSIMO 3600000UL   // un giro intero di quadrante
+
+static uint32_t timerDurata = 0;    // quanto e' stato impostato
+static bool timerAttivo = false;
+static uint32_t timerFine = 0;      // il millesimo in cui scade, mentre corre
+static uint32_t timerResto = 0;     // quanto resta, da fermo
+
+// Quanto manca, adesso. Mai negativo: sotto lo zero un timer non ha
+// niente da dire, ha solo finito.
+static uint32_t timerRimasto()
+{
+    if (!timerAttivo) return timerResto;
+
+    int32_t manca = (int32_t)(timerFine - millis());
+    return manca > 0 ? (uint32_t)manca : 0;
+}
+
+// I secondi che si leggono a schermo, arrotondati per eccesso. Al
+// contrario di un cronometro, che mostra i secondi gia' compiuti: qui
+// "00:01" deve restare scritto per tutto l'ultimo secondo, e lo zero
+// arrivare nell'istante in cui suona. Un timer che mostra zero mentre
+// sta ancora contando ha gia' mentito.
+static uint32_t timerSecondi()
+{
+    return (timerRimasto() + 999UL) / 1000UL;
+}
+
+static void timerAvviaFerma()
+{
+    // Senza una durata non c'e' niente da far partire: il tocco cade
+    // nel vuoto invece di avviare un conto alla rovescia da zero, che
+    // suonerebbe subito.
+    if (timerRimasto() == 0) return;
+
+    if (timerAttivo)
+    {
+        timerResto = timerRimasto();
+        timerAttivo = false;
+    }
+    else
+    {
+        timerFine = millis() + timerResto;
+        timerAttivo = true;
+    }
+}
+
+// Impostare la durata: da fermo, e sempre un numero tondo di minuti.
+// La lancetta cade su una tacca perche' le tacche sul quadrante ci
+// sono gia' e sono sessanta - dire mezzo minuto vorrebbe dire
+// puntare in mezzo al niente.
+static void timerImposta(uint32_t millisecondi)
+{
+    if (millisecondi > TIMER_MASSIMO) millisecondi = TIMER_MASSIMO;
+
+    timerDurata = millisecondi;
+    timerResto = millisecondi;
+
+    if (timerAttivo) timerFine = millis() + timerResto;
+}
+
+// Riporta alla durata impostata e ferma: e' il "da capo" di un
+// timer, che non e' lo zero ma il punto di partenza. Azzerare
+// davvero si fa girando il quadrante fino in fondo.
+static void timerAzzera()
+{
+    timerAttivo = false;
+    timerResto = timerDurata;
+}
+
+// Un minuto in piu', mentre gia' corre. E' il comando che serve
+// davvero a un timer da cucina: non hai sbagliato la durata, e' la
+// cosa che ci mette di piu' del previsto.
+static void timerAggiungiMinuto()
+{
+    if (timerDurata >= TIMER_MASSIMO) return;
+
+    timerDurata += 60000UL;
+    if (timerDurata > TIMER_MASSIMO) timerDurata = TIMER_MASSIMO;
+
+    if (timerAttivo) timerFine += 60000UL;
+    else timerResto += 60000UL;
+}
+
+// ------------------------------------------------------------
+//  GIRARE IL QUADRANTE
+// ------------------------------------------------------------
+//  La durata si imposta trascinando il dito attorno al disco, come
+//  si carica un timer da cucina. Non ci sono un piu' e un meno da
+//  premere trenta volte: c'e' il quadrante, e la lancetta segue il
+//  dito.
+//
+//  IL CONTO E' RELATIVO, NON ASSOLUTO
+//  Non si prende l'angolo del dito e lo si chiama "durata". Se lo
+//  facessimo, passando sopra il dodici la durata salterebbe da
+//  cinquantanove a zero mentre il dito continua nella stessa
+//  direzione. Si guarda invece di quanto e' ruotato il dito
+//  dall'ultima lettura e lo si somma: cosi' il quadrante puo' essere
+//  scavalcato senza che il numero impazzisca, e ai due capi - zero e
+//  sessanta - si ferma e basta.
+//
+//  DOVE COMINCIA IL GESTO
+//  Solo dentro il disco, e solo a timer fermo. Fuori dal disco - le
+//  fasce sopra, sotto e ai lati - il dito scorre fra le schede come
+//  in tutto il resto del programma, altrimenti da questa scheda non
+//  si uscirebbe piu'.
+
+static bool timerInRotazione = false;
+static float timerAngoloPrec = 0;   // dov'era il dito, in frazione di giro
+static float timerGiro = 0;         // quanto si e' girato in tutto, 0..1
+
+// Dove sta il dito attorno al centro, contato da mezzogiorno e in
+// senso orario. atan2 misura da ore tre e cresce in senso orario -
+// sullo schermo la y va in giu', quindi il verso e' gia' quello
+// giusto - e il quarto di giro lo riporta sullo zero del quadrante.
+static float timerAngolo(int16_t x, int16_t y)
+{
+    float a = atan2f((float)(y - QUADRANTE_CY), (float)(x - QUADRANTE_CX)) +
+              (float)M_PI_2;
+    float giro = a / (2.0f * (float)M_PI);
+    return giro - floorf(giro);
+}
+
+static bool timerDentroIlDisco(int16_t x, int16_t y)
+{
+    int32_t dx = x - QUADRANTE_CX;
+    int32_t dy = y - QUADRANTE_CY;
+    return (dx * dx + dy * dy) <= (int32_t)QUADRANTE_RAGGIO * QUADRANTE_RAGGIO;
+}
+
+static void timerRotazioneInizia(int16_t x, int16_t y)
+{
+    timerInRotazione = true;
+    timerGiro = (float)timerDurata / (float)TIMER_MASSIMO;
+    timerAngoloPrec = timerAngolo(x, y);
+}
+
+// Torna vero solo quando la durata e' davvero cambiata. Il dito manda
+// decine di posizioni al secondo, ma la lancetta si muove di tacca in
+// tacca: ridisegnare a ogni posizione vorrebbe dire rifare la scheda
+// venti volte per un pixel che non si sposta.
+static bool timerRotazioneSegue(int16_t x, int16_t y)
+{
+    float adesso = timerAngolo(x, y);
+    float passo = adesso - timerAngoloPrec;
+
+    // Mezzo giro in un colpo solo nessuno lo fa: se il conto viene
+    // cosi' grande vuol dire che il dito ha scavalcato il dodici, e
+    // il verso vero e' l'altro.
+    if (passo > 0.5f) passo -= 1.0f;
+    else if (passo < -0.5f) passo += 1.0f;
+
+    timerAngoloPrec = adesso;
+
+    timerGiro += passo;
+    if (timerGiro < 0.0f) timerGiro = 0.0f;
+    if (timerGiro > 1.0f) timerGiro = 1.0f;
+
+    uint32_t prima = timerDurata;
+    timerImposta((uint32_t)lroundf(timerGiro * 60.0f) * 60000UL);
+    return timerDurata != prima;
 }
 
 // Anche i numeri della sveglia scorrono. Mentre tieni premuto pero'
@@ -1560,30 +1786,33 @@ static void disegnaVentola(Arduino_GFX *g, int16_t cx, int16_t cy,
 }
 
 // ------------------------------------------------------------
-//  SCHEDA 2: IL CRONOMETRO
+//  IL QUADRANTE
 // ------------------------------------------------------------
-//  Minuti e secondi scorrono come sull'orologio; i decimi no.
-//  A dieci cambi al secondo un'animazione non farebbe in tempo a
-//  finire che gia' ne parte un'altra, e si vedrebbero cifre
-//  interrotte a meta' corsa invece di un numero che corre. Le cose
-//  veloci devono essere nette.
-
-#define CRONO_CX (LCD_W / 2)
-#define CRONO_CY 216
-#define CRONO_RAGGIO 136
+//  Un disco da sessanta tacche, la trama sotto, il triangolo sullo
+//  zero e una lancetta. Lo usano in due: il cronometro, dove la
+//  lancetta corre in avanti e un giro vuol dire un minuto, e il
+//  timer, dove torna indietro e un giro vuol dire un'ora.
+//
+//  Sono la stessa cosa disegnata due volte, quindi si disegna una
+//  volta sola. Le due schede si distinguono per quello che
+//  raccontano, non per come sono fatte - ed e' giusto cosi': chi
+//  guarda deve riconoscere subito che sono parenti.
 
 // Sopra il quadrante c'e' l'etichetta, sotto le cifre: la stessa
 // distanza da tutte e due, o l'occhio vede il disco scivolare da una
 // parte.
-#define CRONO_CIFRE_Y 372
-#define CRONO_PULSANTI_Y 386
-#define CRONO_BOLLO 70
+#define QUADRANTE_CIFRE_Y 372
+#define QUADRANTE_PULSANTI_Y 386
+// Dove sta il bollo dentro il disco: sui quadranti veri li' ci sta il
+// nome della marca, ed e' l'unico posto dentro il cerchio dove
+// qualcosa puo' stare senza dare fastidio alla lancetta.
+#define QUADRANTE_BOLLO 70
 
 // Una tacca: punti in fila lungo il raggio. Sui quadranti veri le
 // tacche sono trattini, non pallini - e la differenza fra il minuto
 // e il quinto di minuto si legge dalla loro lunghezza prima ancora
 // che dal loro spessore.
-static void cronoTacca(Arduino_GFX *g, float angolo, int16_t rDa, int16_t rA,
+static void quadranteTacca(Arduino_GFX *g, float angolo, int16_t rDa, int16_t rA,
                        int16_t diam, uint16_t colore)
 {
     float co = cosf(angolo), si = sinf(angolo);
@@ -1598,15 +1827,15 @@ static void cronoTacca(Arduino_GFX *g, float angolo, int16_t rDa, int16_t rA,
         int16_t d = (passata == 0) ? diam + 5 : diam;
 
         for (int16_t r = rDa; r <= rA; r += 4)
-            dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
-                     CRONO_CY + (int16_t)lroundf(si * r), d, tinta);
+            dmDot(g, QUADRANTE_CX + (int16_t)lroundf(co * r),
+                     QUADRANTE_CY + (int16_t)lroundf(si * r), d, tinta);
 
         // Il punto sul bordo esterno si disegna comunque: con il passo
         // fisso l'ultimo cadeva dove capitava, e le tacche corte
         // finivano due pixel piu' dentro di quelle lunghe - si vedeva
         // che il cerchio esterno non era uno solo.
-        dmDot(g, CRONO_CX + (int16_t)lroundf(co * rA),
-                 CRONO_CY + (int16_t)lroundf(si * rA), d, tinta);
+        dmDot(g, QUADRANTE_CX + (int16_t)lroundf(co * rA),
+                 QUADRANTE_CY + (int16_t)lroundf(si * rA), d, tinta);
     }
 }
 
@@ -1616,7 +1845,7 @@ static void cronoTacca(Arduino_GFX *g, float angolo, int16_t rDa, int16_t rA,
 // fondo e non un buco. E' l'idea del Tapisserie degli orologi buoni
 // ridotta a quello che questo schermo sa fare: se la si nota, e' gia'
 // troppo forte.
-static void cronoTrama(Arduino_GFX *g)
+static void quadranteTrama(Arduino_GFX *g)
 {
     const int16_t passo = 10;
     // Fin quasi alle tacche: prima si fermava trenta pixel prima e
@@ -1625,20 +1854,20 @@ static void cronoTrama(Arduino_GFX *g)
     // punti della trama arrivavano a mescolarsi con quelli delle
     // tacche corte, e le tacche perdevano il loro stacco. Diciotto
     // lascia il respiro che serve a leggerle come cose diverse.
-    const int16_t limite = CRONO_RAGGIO - 18;
+    const int16_t limite = QUADRANTE_RAGGIO - 18;
     const int32_t limite2 = (int32_t)limite * limite;
 
     for (int16_t dy = -limite; dy <= limite; dy += passo)
         for (int16_t dx = -limite; dx <= limite; dx += passo)
             if ((int32_t)dx * dx + (int32_t)dy * dy <= limite2)
-                dmDot(g, CRONO_CX + dx, CRONO_CY + dy, 3, COL_TRAMA);
+                dmDot(g, QUADRANTE_CX + dx, QUADRANTE_CY + dy, 3, COL_TRAMA);
 }
 
 // Le sessanta tacche: ogni cinque piu' lunga e piu' grossa. La
 // differenza si legge dalla lunghezza prima ancora che dallo
 // spessore, ed e' quello che permette di leggere un quadrante senza
 // contare le tacche una per una.
-static void cronoTacche(Arduino_GFX *g)
+static void quadranteTacche(Arduino_GFX *g)
 {
     for (int i = 0; i < 60; ++i)
     {
@@ -1650,28 +1879,28 @@ static void cronoTacche(Arduino_GFX *g)
         // meno di uno da cinque. Con i centri allineati, i due giri di
         // tacche finivano su due cerchi diversi.
         if ((i % 5) == 0)
-            cronoTacca(g, a, CRONO_RAGGIO - 24, CRONO_RAGGIO, 5, COL_SECONDARIO);
+            quadranteTacca(g, a, QUADRANTE_RAGGIO - 24, QUADRANTE_RAGGIO, 5, COL_SECONDARIO);
         else
-            cronoTacca(g, a, CRONO_RAGGIO - 10, CRONO_RAGGIO + 1, 3, COL_ETICHETTA);
+            quadranteTacca(g, a, QUADRANTE_RAGGIO - 10, QUADRANTE_RAGGIO + 1, 3, COL_ETICHETTA);
     }
 }
 
 // Il triangolo sopra lo zero: dice dov'e' il sessanta e si trova
 // senza cercarlo anche mentre la lancetta corre. La punta guarda in
 // fuori, verso la tacca; la base sta verso il centro.
-static void cronoTriangolo(Arduino_GFX *g)
+static void quadranteTriangolo(Arduino_GFX *g)
 {
     const float a = -90.0f * (float)M_PI / 180.0f;
     const float co = cosf(a), si = sinf(a);
 
-    const int16_t righe[3] = {CRONO_RAGGIO - 36, CRONO_RAGGIO - 44, CRONO_RAGGIO - 52};
+    const int16_t righe[3] = {QUADRANTE_RAGGIO - 36, QUADRANTE_RAGGIO - 44, QUADRANTE_RAGGIO - 52};
     const int lati[3] = {0, 1, 2};
 
     for (int riga = 0; riga < 3; ++riga)
         for (int k = -lati[riga]; k <= lati[riga]; ++k)
         {
-            int16_t px = CRONO_CX + (int16_t)lroundf(co * righe[riga] - si * k * 7);
-            int16_t py = CRONO_CY + (int16_t)lroundf(si * righe[riga] + co * k * 7);
+            int16_t px = QUADRANTE_CX + (int16_t)lroundf(co * righe[riga] - si * k * 7);
+            int16_t py = QUADRANTE_CY + (int16_t)lroundf(si * righe[riga] + co * k * 7);
             dmDot(g, px, py, 5, COL_ACCESO);
         }
 }
@@ -1685,37 +1914,14 @@ static void cronoTriangolo(Arduino_GFX *g)
 // fino a fondersi con quello centrale. Passando da tre punti a uno da
 // un raggio all'altro si vedeva uno scalino, e una lancetta con uno
 // scalino non e' affilata, e' rotta.
-static void cronoLancetta(Arduino_GFX *g, uint32_t t)
+// La forma della lancetta non sa niente di cosa sta misurando: le si
+// dice a che punto del giro sta - zero e' mezzogiorno, uno e' il giro
+// intero - e di che colore la vuoi. Cosa voglia dire quel giro lo
+// decide la scheda: un minuto per il cronometro, un'ora per il timer.
+static void quadranteLancetta(Arduino_GFX *g, float giro, uint16_t colore)
 {
-    float giro;
-    if (azzeraInCorso)
-    {
-        uint32_t passato = millis() - azzeraInizio;
-        if (passato >= azzeraDurata)
-        {
-            azzeraInCorso = false;
-            giro = 0.0f;
-        }
-        else
-        {
-            // Velocita' costante, senza accelerare ne' frenare: e' come
-            // torna indietro la lancetta di un cronografo vero,
-            // trascinata da un meccanismo che gira sempre uguale. Una
-            // curva morbida qui sembrerebbe una scelta di stile su un
-            // gesto che invece e' meccanico.
-            float p = (float)passato / (float)azzeraDurata;
-            giro = azzeraDa * (1.0f - p);
-            numeriInMovimento = true;
-        }
-    }
-    else
-    {
-        giro = (t % 60000UL) / 60000.0f;
-    }
-
     float a = (giro * 360.0f - 90.0f) * (float)M_PI / 180.0f;
     float co = cosf(a), si = sinf(a);
-    uint16_t colore = cronoAttivo ? COL_ROSSO : COL_ACCESO;
 
     // La forma e' geometrica, non approssimata: un semicerchio dietro
     // il centro, due lati paralleli larghi quanto il suo diametro, e
@@ -1731,7 +1937,7 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
     // staccate, mentre da piena bastano meno pixel a fare la stessa
     // forma.
     const float RP = 8.0f;
-    const int16_t rPunta = CRONO_RAGGIO - 2;
+    const int16_t rPunta = QUADRANTE_RAGGIO - 2;
     const float hPunta = 2.0f * RP * 0.866f;     // altezza di un equilatero di lato 2*RP
     const float rSpalla = rPunta - hPunta;
 
@@ -1760,19 +1966,19 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
             float semi = sqrtf(RP * RP - r * r);
             if (semi < 0.0f) semi = 0.0f;
 
-            dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
-                     CRONO_CY + (int16_t)lroundf(si * r), grossezza, tinta);
+            dmDot(g, QUADRANTE_CX + (int16_t)lroundf(co * r),
+                     QUADRANTE_CY + (int16_t)lroundf(si * r), grossezza, tinta);
 
             for (float k = CODA; k <= semi + 0.01f; k += CODA)
                 for (int lato = -1; lato <= 1; lato += 2)
-                    dmDot(g, CRONO_CX + (int16_t)lroundf(co * r - si * k * lato),
-                             CRONO_CY + (int16_t)lroundf(si * r + co * k * lato),
+                    dmDot(g, QUADRANTE_CX + (int16_t)lroundf(co * r - si * k * lato),
+                             QUADRANTE_CY + (int16_t)lroundf(si * r + co * k * lato),
                              grossezza, tinta);
 
             if (semi > 2.0f)
                 for (int lato = -1; lato <= 1; lato += 2)
-                    dmDot(g, CRONO_CX + (int16_t)lroundf(co * r - si * semi * lato),
-                             CRONO_CY + (int16_t)lroundf(si * r + co * semi * lato),
+                    dmDot(g, QUADRANTE_CX + (int16_t)lroundf(co * r - si * semi * lato),
+                             QUADRANTE_CY + (int16_t)lroundf(si * r + co * semi * lato),
                              grossezza, tinta);
         }
 
@@ -1783,19 +1989,19 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
                          : RP * (1.0f - (r - rSpalla) / hPunta);
             if (semi < 0.0f) semi = 0.0f;
 
-            dmDot(g, CRONO_CX + (int16_t)lroundf(co * r),
-                     CRONO_CY + (int16_t)lroundf(si * r), grossezza, tinta);
+            dmDot(g, QUADRANTE_CX + (int16_t)lroundf(co * r),
+                     QUADRANTE_CY + (int16_t)lroundf(si * r), grossezza, tinta);
 
             for (float k = PASSO; k <= semi + 0.01f; k += PASSO)
                 for (int lato = -1; lato <= 1; lato += 2)
-                    dmDot(g, CRONO_CX + (int16_t)lroundf(co * r - si * k * lato),
-                             CRONO_CY + (int16_t)lroundf(si * r + co * k * lato),
+                    dmDot(g, QUADRANTE_CX + (int16_t)lroundf(co * r - si * k * lato),
+                             QUADRANTE_CY + (int16_t)lroundf(si * r + co * k * lato),
                              grossezza, tinta);
 
             if (semi > 2.0f)
                 for (int lato = -1; lato <= 1; lato += 2)
-                    dmDot(g, CRONO_CX + (int16_t)lroundf(co * r - si * semi * lato),
-                             CRONO_CY + (int16_t)lroundf(si * r + co * semi * lato),
+                    dmDot(g, QUADRANTE_CX + (int16_t)lroundf(co * r - si * semi * lato),
+                             QUADRANTE_CY + (int16_t)lroundf(si * r + co * semi * lato),
                              grossezza, tinta);
         }
     }
@@ -1803,7 +2009,41 @@ static void cronoLancetta(Arduino_GFX *g, uint32_t t)
     // Il foro al centro: sugli orologi veri e' il buco in cui si
     // infila l'asse, e senza, il perno sembra una goccia appoggiata
     // invece di un pezzo montato su qualcosa.
-    dmDot(g, CRONO_CX, CRONO_CY, 13, COL_SFONDO);
+    dmDot(g, QUADRANTE_CX, QUADRANTE_CY, 13, COL_SFONDO);
+}
+
+// Dove sta la lancetta del cronografo: un giro e' un minuto. Mentre
+// torna a zero non lo dice il tempo misurato ma l'animazione, che ha
+// preso il comando del quadrante fino a quando non ha finito.
+static void cronoLancetta(Arduino_GFX *g, uint32_t t)
+{
+    float giro;
+    if (azzeraInCorso)
+    {
+        uint32_t passato = millis() - azzeraInizio;
+        if (passato >= azzeraDurata)
+        {
+            azzeraInCorso = false;
+            giro = 0.0f;
+        }
+        else
+        {
+            // Velocita' costante, senza accelerare ne' frenare: e' come
+            // torna indietro la lancetta di un cronografo vero,
+            // trascinata da un meccanismo che gira sempre uguale. Una
+            // curva morbida qui sembrerebbe una scelta di stile su un
+            // gesto che invece e' meccanico.
+            float p = (float)passato / (float)azzeraDurata;
+            giro = azzeraDa * (1.0f - p);
+            numeriInMovimento = true;
+        }
+    }
+    else
+    {
+        giro = (t % 60000UL) / 60000.0f;
+    }
+
+    quadranteLancetta(g, giro, cronoAttivo ? COL_ROSSO : COL_ACCESO);
 }
 
 static void disegnaCrono(Arduino_GFX *g)
@@ -1812,18 +2052,16 @@ static void disegnaCrono(Arduino_GFX *g)
 
     uint32_t t = cronoTempo();
 
-    cronoTrama(g);
-    cronoTacche(g);
+    quadranteTrama(g);
+    quadranteTacche(g);
 
-    cronoTriangolo(g);
+    quadranteTriangolo(g);
 
-    // Quanti giri hai segnato, a ore sei: sui quadranti veri li' ci
-    // sta il nome della marca, ed e' l'unico posto dentro il disco
-    // dove qualcosa puo' stare senza dare fastidio. E' anche il
+    // Quanti giri hai segnato, nel posto del bollo. E' anche il
     // pulsante per aprire l'elenco - un bersaglio tondo in mezzo allo
     // schermo si prende con il dito senza guardare.
     if (cronoNGiri > 0)
-        disegnaBollo(g, CRONO_CX, CRONO_CY + CRONO_BOLLO, '0' + (cronoNGiri % 10),
+        disegnaBollo(g, QUADRANTE_CX, QUADRANTE_CY + QUADRANTE_BOLLO, '0' + (cronoNGiri % 10),
                      4, 3, COL_ACCESO);
 
     cronoLancetta(g, t);
@@ -1846,7 +2084,7 @@ static void disegnaCrono(Arduino_GFX *g)
     const int16_t largoDecimo = dmTextWidth("0", passo, 1);
     const int16_t STACCO = 12;
     const int16_t x0 = (LCD_W - (largoGrande + STACCO + largoDecimo)) / 2;
-    const int16_t yCifre = CRONO_CIFRE_Y;
+    const int16_t yCifre = QUADRANTE_CIFRE_Y;
 
     if (dmRullo(g, rulloCrono, buf, x0, yCifre, passo, 3, COL_ACCESO, 1, 240, 30))
         numeriInMovimento = true;
@@ -1860,11 +2098,11 @@ static void disegnaCrono(Arduino_GFX *g)
     // I due comandi in fondo, come le anse di un cronografo: azzerare
     // a sinistra, segnare il giro a destra. Spenti quando non
     // servirebbero a niente.
-    disegnaGriglia(g, PADDING + MEZZA_ICONA, CRONO_PULSANTI_Y, ICO_CHIUDI,
+    disegnaGriglia(g, PADDING + MEZZA_ICONA, QUADRANTE_PULSANTI_Y, ICO_CHIUDI,
                    ICONA_COMANDO, 4, 3,
                    (!cronoAttivo && t > 0) ? COL_SECONDARIO : COL_SPENTO);
 
-    disegnaGriglia(g, LCD_W - PADDING - MEZZA_ICONA, CRONO_PULSANTI_Y, ICO_PIU,
+    disegnaGriglia(g, LCD_W - PADDING - MEZZA_ICONA, QUADRANTE_PULSANTI_Y, ICO_PIU,
                    ICONA_COMANDO, 4, 3,
                    cronoAttivo ? COL_SECONDARIO : COL_SPENTO);
 
@@ -1875,6 +2113,338 @@ static void disegnaCrono(Arduino_GFX *g)
     if ((cronoAttivo || azzeraInCorso) &&
         schedaCorrente == SCHEDA_CRONO)
         numeriInMovimento = true;
+}
+
+// ------------------------------------------------------------
+//  SCHEDA 3: IL TIMER
+// ------------------------------------------------------------
+//  Lo stesso quadrante del cronometro, letto al contrario: la
+//  lancetta parte da dove l'hai messa e si srotola all'indietro
+//  verso il dodici. Arrivata li', suona.
+//
+//  Niente decimi. Su un cronometro il decimo e' il dato, qui e'
+//  rumore: nessuno fa cuocere la pasta con la precisione del decimo,
+//  e una cifra che sfarfalla dieci volte al secondo su una cosa che
+//  dura dieci minuti chiede attenzione senza darne in cambio.
+
+static void disegnaTimer(Arduino_GFX *g)
+{
+    telaio(g, "TIMER");
+
+    uint32_t resto = timerRimasto();
+
+    quadranteTrama(g);
+    quadranteTacche(g);
+    quadranteTriangolo(g);
+
+    // A quadrante vuoto il gesto va detto: e' l'unico comando del
+    // programma che non ha un simbolo da toccare, e un disco che non
+    // sembra girevole non lo prova nessuno. Sparisce appena c'e' una
+    // durata, perche' da li' in poi l'ha capito.
+    if (timerDurata == 0)
+        testoCentrato(g, QUADRANTE_CY + QUADRANTE_BOLLO - 8,
+                      "GIRA IL QUADRANTE", 2, 2, COL_ETICHETTA, 2);
+
+    quadranteLancetta(g, (float)resto / (float)TIMER_MASSIMO,
+                      timerAttivo ? COL_ROSSO : COL_ACCESO);
+
+    // ---- quanto manca, in cifre ----
+    uint32_t secondi = timerSecondi();
+
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%02lu:%02lu",
+             (unsigned long)(secondi / 60), (unsigned long)(secondi % 60));
+
+    const int16_t passo = 4;
+    const int16_t largo = dmTextWidth(buf, passo, 1);
+    const int16_t x0 = (LCD_W - largo) / 2;
+
+    if (dmRullo(g, rulloTimer, buf, x0, QUADRANTE_CIFRE_Y, passo, 3,
+                timerAttivo ? COL_ACCESO : COL_SECONDARIO, 1, 240, 30))
+        numeriInMovimento = true;
+
+    // I due comandi in fondo, nello stesso posto del cronografo.
+    // A sinistra il ritorno alla durata impostata - non allo zero:
+    // il "da capo" di un timer e' il punto da cui era partito.
+    // A destra il minuto in piu', che e' il ripensamento normale su
+    // una cosa che sta gia' cuocendo.
+    disegnaGriglia(g, PADDING + MEZZA_ICONA, QUADRANTE_PULSANTI_Y, ICO_CHIUDI,
+                   ICONA_COMANDO, 4, 3,
+                   (timerDurata > 0 && resto != timerDurata)
+                       ? COL_SECONDARIO : COL_SPENTO);
+
+    disegnaGriglia(g, LCD_W - PADDING - MEZZA_ICONA, QUADRANTE_PULSANTI_Y, ICO_PIU,
+                   ICONA_COMANDO, 4, 3,
+                   (timerDurata < TIMER_MASSIMO) ? COL_SECONDARIO : COL_SPENTO);
+}
+
+// ------------------------------------------------------------
+//  SCHEDA: LA MAPPA
+// ------------------------------------------------------------
+//  Le strade intorno a casa, disegnate sulla griglia del pannello.
+//  I dati li procura mappa.h su un core suo; qui si decide soltanto
+//  come appaiono: che spessore ha una strada, di che colore e' il
+//  fiume, dove stanno i comandi.
+//
+//  Il centro della mappa e' il centro del quadrante: la stessa
+//  posizione a schermo del perno del cronometro. Non e' un caso -
+//  e' il punto in cui l'occhio si aspetta di trovare "l'adesso" su
+//  tutte le schede tonde di questo oggetto.
+//
+//  IL PIN CHE PULSA
+//  Un anello che si allarga e sbiadisce intorno al punto rosso, ogni
+//  secondo e mezzo. Rifare tutta la mappa venti volte al secondo per
+//  un anello sarebbe un'assurdita': si conserva una copia del
+//  quadrato intorno al pin, e a ogni battito si rimette quella e ci
+//  si disegna sopra l'anello. Ottanta pixel di lato, non trecento.
+
+// Il passo e' largo, piu' del testo: la mappa deve essere minimale
+// prima che precisa, e i punti devono stare ognuno per se'. A passo
+// 3 le vie sembravano linee tirate a mano, a 4 punti fitti, a 6 sono
+// punti - e la citta' si legge lo stesso, perche' quel che conta di
+// una citta' e' la forma delle strade grandi, non il dettaglio.
+//
+// Le strade vengono anche semplificate e raddrizzate: tolti i vertici
+// che non spostano il tracciato di piu' di mezza cella e poi, come su
+// una mappa della metro, disegnate solo in otto direzioni - dritto e a
+// quarantacinque gradi. Una via che va a trenta gradi diventa un tratto
+// diagonale e uno orizzontale. E' un'approssimazione voluta: su una
+// griglia di quarantotto punti una curva vera fa gradini a caso, una
+// diagonale pulita no. Sono due manopole, si puo' giocare.
+#define MAPPA_PASSO 6
+#define MAPPA_COLS 48
+#define MAPPA_ROWS 48
+#define MAPPA_TOLLERANZA 0.7f   // in celle; 0 per non semplificare
+#define MAPPA_SQUADRATA 1       // 1 = otto direzioni, 0 = linee libere
+#define MAPPA_X0 ((LCD_W - MAPPA_COLS * MAPPA_PASSO) / 2)
+#define MAPPA_Y0 72
+#define MAPPA_CX (MAPPA_X0 + MAPPA_COLS * MAPPA_PASSO / 2)
+#define MAPPA_CY (MAPPA_Y0 + MAPPA_ROWS * MAPPA_PASSO / 2)
+
+#define MAPPA_RITAGLIO 80      // il quadrato intorno al pin che si rifa' a ogni battito
+#define MAPPA_BATTITO 1500     // periodo del pulsare, in millesimi
+
+static int mappaLivello = 1;                 // quello che stiamo guardando
+static uint32_t mappaVersioneVista = 0;      // l'ultima versione disegnata
+static uint8_t *mappaCelle = nullptr;
+static uint16_t *mappaRitaglio = nullptr;
+static bool mappaRitaglioValido = false;
+
+static inline float mappaMetriPerCella()
+{
+    return (2.0f * MAPPA_RAGGIO[mappaLivello]) / MAPPA_ROWS;
+}
+
+// Il centro di una cella, in pixel: in mezzo al suo quadratino, non
+// nell'angolo.
+static inline int16_t mappaPixelX(int i) { return MAPPA_X0 + i * MAPPA_PASSO + MAPPA_PASSO / 2; }
+static inline int16_t mappaPixelY(int j) { return MAPPA_Y0 + j * MAPPA_PASSO + MAPPA_PASSO / 2; }
+
+// Il punto rosso: il marcatore del progetto, con il suo vuoto sotto.
+static void mappaPin(Arduino_GFX *g)
+{
+    spazioTondo(g, MAPPA_CX, MAPPA_CY, 9, 32000);
+    dmMarcatore(g, MAPPA_CX, MAPPA_CY, 6, 4, COL_ROSSO);
+}
+
+static void mappaSalvaRitaglio(Arduino_Canvas *g)
+{
+    if (!mappaRitaglio)
+        mappaRitaglio = (uint16_t *)ps_malloc(MAPPA_RITAGLIO * MAPPA_RITAGLIO * sizeof(uint16_t));
+    if (!mappaRitaglio) return;
+
+    uint16_t *fb = g->getFramebuffer();
+    const int16_t x0 = MAPPA_CX - MAPPA_RITAGLIO / 2;
+    const int16_t y0 = MAPPA_CY - MAPPA_RITAGLIO / 2;
+    for (int r = 0; r < MAPPA_RITAGLIO; ++r)
+        memcpy(mappaRitaglio + r * MAPPA_RITAGLIO,
+               fb + (y0 + r) * LCD_W + x0,
+               MAPPA_RITAGLIO * sizeof(uint16_t));
+    mappaRitaglioValido = true;
+}
+
+// Un battito: rimette il quadrato salvato e ci disegna l'anello a
+// dove e' arrivato. Il raggio massimo sta dentro il ritaglio, o
+// l'anello lascerebbe tracce che nessuno cancella.
+static void mappaPulsa(Arduino_Canvas *g)
+{
+    if (!mappaRitaglioValido) return;
+
+    g->draw16bitRGBBitmap(MAPPA_CX - MAPPA_RITAGLIO / 2, MAPPA_CY - MAPPA_RITAGLIO / 2,
+                          mappaRitaglio, MAPPA_RITAGLIO, MAPPA_RITAGLIO);
+
+    float t = (millis() % MAPPA_BATTITO) / (float)MAPPA_BATTITO;
+    float raggio = 11.0f + t * 24.0f;
+
+    // Si spegne piu' in fretta di quanto si allarga: la curva al
+    // quadrato fa sembrare l'anello un'onda che si disperde, non un
+    // cerchio che si ingrandisce.
+    uint16_t colore = dmSfuma(COL_ROSSO, (1.0f - t) * (1.0f - t));
+
+    int n = (int)(2.0f * (float)M_PI * raggio / 7.0f);
+    if (n < 12) n = 12;
+    for (int k = 0; k < n; ++k)
+    {
+        float a = (float)k / (float)n * 2.0f * (float)M_PI;
+        dmDot(g, MAPPA_CX + (int16_t)lroundf(cosf(a) * raggio),
+                 MAPPA_CY + (int16_t)lroundf(sinf(a) * raggio), 3, colore);
+    }
+}
+
+// La barra di scala, in basso a sinistra: una fila di punti lunga
+// un numero tondo di metri, con la misura scritta accanto. Su una
+// mappa senza nomi di vie e' l'unica cosa che dice quanto e' grande
+// quello che stai guardando.
+static void mappaScala(Arduino_GFX *g)
+{
+    float metriPerPixel = mappaMetriPerCella() / MAPPA_PASSO;
+
+    static const uint16_t TONDI[] = {100, 200, 500, 1000, 2000, 5000};
+    int metri = TONDI[0];
+    for (uint16_t v : TONDI)
+        if (v / metriPerPixel <= 96.0f) metri = v;
+
+    const int16_t lungo = (int16_t)lroundf(metri / metriPerPixel);
+    const int16_t y = QUADRANTE_PULSANTI_Y;
+    const int16_t x0 = PADDING;
+
+    // I punti della barra hanno il passo della mappa, e i due capi
+    // sono i punti che sporgono: e' della stessa materia di quel che
+    // misura.
+    for (int16_t x = x0; x <= x0 + lungo; x += MAPPA_PASSO)
+        dmDot(g, x, y, 2, COL_SECONDARIO);
+    for (int16_t dy = -MAPPA_PASSO; dy <= MAPPA_PASSO; dy += MAPPA_PASSO)
+    {
+        dmDot(g, x0, y + dy, 2, COL_SECONDARIO);
+        dmDot(g, x0 + lungo, y + dy, 2, COL_SECONDARIO);
+    }
+
+    char buf[12];
+    if (metri >= 1000) snprintf(buf, sizeof(buf), "%d KM", metri / 1000);
+    else snprintf(buf, sizeof(buf), "%d M", metri);
+    dmText(g, x0 + lungo + 10, y - 7, buf, 2, 2, COL_ETICHETTA, 2);
+}
+
+static void disegnaMappa(Arduino_Canvas *g)
+{
+    // L'etichetta e' la citta', come sulla scheda dell'ora: se la
+    // posizione e' arrivata dalla rete e' quella che ha detto lei.
+    telaio(g, mappaCitta[0] ? mappaCitta : "MAPPA");
+
+    if (!mappaCelle)
+        mappaCelle = (uint8_t *)ps_malloc(MAPPA_COLS * MAPPA_ROWS);
+
+    const MappaLivello &liv = mappaLivelli[mappaLivello];
+    mappaRitaglioValido = false;
+
+    // Se il livello che vuoi non c'e' ancora si disegna il piu' vicino
+    // che c'e', riscalato: meno dettaglio o i bordi vuoti, ma una
+    // mappa subito, invece di uno schermo nero che chiede di
+    // aspettare. Quando arriva quello vero, si ridisegna e basta.
+    const MappaLivello *da = nullptr;
+    if (liv.pronto) da = &liv;
+    else
+    {
+        int s = mappaLivelloSostituto(mappaLivello);
+        if (s >= 0) da = &mappaLivelli[s];
+    }
+
+    if (da && mappaCelle)
+    {
+        mappaRasterizza(*da, mappaCelle, MAPPA_COLS, MAPPA_ROWS, mappaMetriPerCella(),
+                        MAPPA_TOLLERANZA, MAPPA_SQUADRATA != 0);
+
+        // Tre pesi di strada, tre segni diversi: le arterie punti
+        // grossi e bianchi, le medie punti piccoli e chiari, le vie
+        // punti piccoli del grigio dei led spenti - ci sono, si
+        // leggono, non chiedono niente. Grosso-chiaro, piccolo-chiaro,
+        // piccolo-scuro: si distinguono anche con la coda dell'occhio.
+        // Il fiume ha il colore della Luna, che qui e' l'unico blu del
+        // progetto. La ferrovia e' a tratti alterni, come si disegna
+        // una ferrovia.
+        for (int j = 0; j < MAPPA_ROWS; ++j)
+            for (int i = 0; i < MAPPA_COLS; ++i)
+            {
+                int16_t x = mappaPixelX(i), y = mappaPixelY(j);
+                switch (mappaCelle[j * MAPPA_COLS + i])
+                {
+                case MAPPA_ACQUA:  dmDot(g, x, y, 3, dmSfuma(COL_LUNA, 0.8f)); break;
+                case MAPPA_FERRO:
+                    if ((i + j) & 1) dmDot(g, x, y, 2, COL_ETICHETTA);
+                    else g->drawPixel(x, y, COL_TRAMA);
+                    break;
+                case MAPPA_MINORE: dmDot(g, x, y, 2, COL_SPENTO); break;
+                case MAPPA_MEDIA:  dmDot(g, x, y, 2, COL_SECONDARIO); break;
+                case MAPPA_GRANDE: dmDot(g, x, y, 3, COL_ACCESO); break;
+                default:           g->drawPixel(x, y, COL_TRAMA); break;
+                }
+            }
+
+        mappaScala(g);
+        mappaPin(g);
+        mappaSalvaRitaglio(g);
+    }
+    else
+    {
+        // La trama da sola: non c'e' ancora niente da mostrare.
+        for (int j = 0; j < MAPPA_ROWS; ++j)
+            for (int i = 0; i < MAPPA_COLS; ++i)
+                g->drawPixel(mappaPixelX(i), mappaPixelY(j), COL_TRAMA);
+    }
+
+    // Perche' quello che vedi non e' ancora quello che hai chiesto.
+    // Con una mappa sotto e' una riga piccola in un angolo, su un
+    // fondo nero che la stacca dalle strade; senza mappa sta in
+    // mezzo, grande, perche' e' l'unica cosa che c'e'.
+    if (!liv.pronto)
+    {
+        const char *riga1;
+        char riga2[24] = "";
+
+        if (!mappaPosizionePronta)
+            riga1 = retePresente ? "CERCO LA POSIZIONE" : "SENZA RETE";
+        else if (mappaScaricando >= 0)
+        {
+            riga1 = "SCARICO LA MAPPA";
+            snprintf(riga2, sizeof(riga2), "%lu KB", (unsigned long)(mappaByteArrivati / 1024));
+        }
+        else if (liv.fallito)
+        {
+            riga1 = "MAPPA NON ARRIVATA";
+            strcpy(riga2, "RIPROVO FRA POCO");
+        }
+        else
+            riga1 = retePresente ? "IN ARRIVO" : "SENZA RETE";
+
+        if (da)
+        {
+            char riga[48];
+            if (riga2[0]) snprintf(riga, sizeof(riga), "%s %s", riga1, riga2);
+            else strncpy(riga, riga1, sizeof(riga) - 1), riga[sizeof(riga) - 1] = 0;
+
+            const int16_t largo = dmTextWidth(riga, 2, 2);
+            const int16_t x = MAPPA_X0 + MAPPA_COLS * MAPPA_PASSO - largo - 6;
+            const int16_t y = MAPPA_Y0 + 4;
+            g->fillRect(x - 6, y - 3, largo + 12, dmTextHeight(2) + 6, COL_SFONDO);
+            dmText(g, x, y, riga, 2, 2, COL_ETICHETTA, 2);
+        }
+        else
+        {
+            testoCentrato(g, MAPPA_CY - 18, riga1, 3, 2, COL_SECONDARIO, 2);
+            if (riga2[0])
+                testoCentrato(g, MAPPA_CY + 12, riga2, 2, 2, COL_ETICHETTA, 2);
+        }
+    }
+
+    // I due comandi in basso a destra: piu' vicino e piu' lontano,
+    // dentro un bollo pieno come il contatore delle sveglie - il
+    // segno e' ritagliato nel disco, non appoggiato sopra. Su una
+    // scheda che e' tutta linee sottili, due dischi pieni si vedono
+    // come comandi al primo sguardo. Spenti al capo della corsa.
+    disegnaBollo(g, LCD_W - PADDING - MEZZA_ICONA - 56, QUADRANTE_PULSANTI_Y, '-', 4, 3,
+                 mappaLivello < MAPPA_LIVELLI - 1 ? COL_ACCESO : COL_SPENTO);
+    disegnaBollo(g, LCD_W - PADDING - MEZZA_ICONA, QUADRANTE_PULSANTI_Y, '+', 4, 3,
+                 mappaLivello > 0 ? COL_ACCESO : COL_SPENTO);
 }
 
 // ------------------------------------------------------------
@@ -2944,6 +3514,8 @@ static void ridisegna(int i)
     {
     case SCHEDA_ORA:   disegnaOra(scheda[i], t);  break;
     case SCHEDA_CRONO: disegnaCrono(scheda[i]);   break;
+    case SCHEDA_TIMER: disegnaTimer(scheda[i]);   break;
+    case SCHEDA_MAPPA: disegnaMappa(scheda[i]);   break;
     case SCHEDA_SOLE:  disegnaSole(scheda[i], t); break;
     case SCHEDA_METEO: disegnaMeteo(scheda[i]);   break;
     case SCHEDA_BARO:  disegnaBaro(scheda[i]);   break;
@@ -2987,6 +3559,13 @@ static void disegnaPallini(Arduino_GFX *g, float posizione, float opacita)
 
     for (int i = 0; i < N_SCHEDE; ++i)
         dmDot(g, x0 + i * passo, y, 6, dmSfuma(COL_SPENTO, opacita));
+
+    // Sull'anello la posizione puo' uscire dai due capi: scivolando
+    // a sinistra dalla prima scheda il pallino rosso esce dal primo
+    // punto e rientra dall'ultimo, che e' esattamente dove si sta
+    // andando.
+    if (posizione < 0) posizione += N_SCHEDE;
+    if (posizione >= N_SCHEDE) posizione -= N_SCHEDE;
 
     float px = x0 + posizione * passo;
     dmDot(g, (int16_t)lroundf(px), y, 10, dmSfuma(COL_ROSSO, opacita));
@@ -3205,11 +3784,21 @@ static void disegnaAllarme(Arduino_GFX *g, const struct tm &t)
     disegnaGriglia(g, LCD_W / 2, 110, ICO_CAMPANA, ICONA_COMANDO, 7, 6,
                    acceso ? COL_ROSSO : COL_SPENTO);
 
+    // Al centro, il numero che spiega perche' sta suonando: l'ora per
+    // la sveglia, la durata trascorsa per il timer. Chi si sveglia di
+    // soprassalto ha bisogno di sapere che ore sono; chi ha messo su
+    // la pasta, di sapere che erano dieci minuti.
     char buf[8];
-    snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
+    if (allarmeDalTimer)
+        snprintf(buf, sizeof(buf), "%02lu:%02lu",
+                 (unsigned long)(timerDurata / 60000UL),
+                 (unsigned long)((timerDurata / 1000UL) % 60UL));
+    else
+        snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
+
     testoCentrato(g, 200, buf, 10, 7, acceso ? COL_ACCESO : COL_SPENTO);
 
-    testoCentrato(g, 300, "SVEGLIA", 4, 3, COL_ROSSO);
+    testoCentrato(g, 300, allarmeDalTimer ? "TIMER" : "SVEGLIA", 4, 3, COL_ROSSO);
     testoCentrato(g, 370, "TOCCA PER SPEGNERE", 2, 2, COL_ETICHETTA, 2);
 }
 
@@ -3232,8 +3821,8 @@ static bool schedaVisibile(int i)
     if (i == schedaCorrente) return true;
 
     int off = (int)lroundf(scorrimento);
-    if (off > 0 && i == schedaCorrente + 1) return true;
-    if (off < 0 && i == schedaCorrente - 1) return true;
+    if (off > 0 && i == schedaAccanto(1)) return true;
+    if (off < 0 && i == schedaAccanto(-1)) return true;
     return false;
 }
 
@@ -3308,13 +3897,13 @@ static void avviaAnimazioniIngresso()
         bolleInizio = millis();
         ridisegna(SCHEDA_ARIA);
     }
-    else if (schedaCorrente == SCHEDA_CRONO)
+    else if (schedaCorrente == SCHEDA_CRONO || schedaCorrente == SCHEDA_TIMER)
     {
         // Come le schede del condizionatore: niente animazione
         // d'ingresso, ma una lancetta che gira sempre. Se nessuno
         // chiede il primo disegno, lei resta ferma per sempre -
         // perche' e' disegnandosi che chiede il fotogramma dopo.
-        daRidisegnare[SCHEDA_CRONO] = true;
+        daRidisegnare[schedaCorrente] = true;
     }
     else if (schedaCorrente == SCHEDA_CLIMA || schedaCorrente == SCHEDA_CLIMA2)
     {
@@ -3367,21 +3956,39 @@ static void rinfrescaCrono()
     // inscritto sporgono di meta' diagonale oltre i suoi lati,
     // arrivavano fin dove stanno le tacche e se le mangiavano
     // quattro per volta.
-    g->fillCircle(CRONO_CX, CRONO_CY, CRONO_RAGGIO - 28, COL_SFONDO);
-    cronoTrama(g);
-    cronoTacche(g);
-    cronoTriangolo(g);
+    g->fillCircle(QUADRANTE_CX, QUADRANTE_CY, QUADRANTE_RAGGIO - 28, COL_SFONDO);
+    quadranteTrama(g);
+    quadranteTacche(g);
+    quadranteTriangolo(g);
 
     if (cronoNGiri > 0)
-        disegnaBollo(g, CRONO_CX, CRONO_CY + CRONO_BOLLO, '0' + (cronoNGiri % 10),
+        disegnaBollo(g, QUADRANTE_CX, QUADRANTE_CY + QUADRANTE_BOLLO, '0' + (cronoNGiri % 10),
                      4, 3, COL_ACCESO);
 
     cronoLancetta(g, cronoTempo());
 }
 
+// Il timer mentre scorri: come il cronografo, ma la lancetta si
+// muove cosi' piano - un giro e' un'ora - che rifarla a ogni
+// fotogramma non cambierebbe un pixel. Si rifa' quando cambia il
+// secondo scritto sotto, che e' l'unica cosa che si vede muoversi.
+static void rinfrescaTimer()
+{
+    if (!timerAttivo) return;
+    if (!schedaVisibile(SCHEDA_TIMER)) return;
+
+    static uint32_t ultimoSecondo = 0;
+    uint32_t secondi = timerSecondi();
+    if (secondi == ultimoSecondo) return;
+    ultimoSecondo = secondi;
+
+    ridisegna(SCHEDA_TIMER);
+}
+
 static void rinfrescaVisibili()
 {
     rinfrescaCrono();
+    rinfrescaTimer();
 
     if (schedaVisibile(SCHEDA_ORA))
     {
@@ -3425,20 +4032,11 @@ static void componi()
     // e' mosso il dito. Poi la vicina, incollata al suo fianco.
     // Le coordinate negative non sono un problema: la libreria
     // ritaglia da sola la parte che esce dallo schermo.
+    // C'e' sempre una vicina: il carosello e' un anello.
     if (off > 0)
-    {
-        if (schedaCorrente + 1 < N_SCHEDE)
-            comp->draw16bitRGBBitmap(LCD_W - off, 0, scheda[schedaCorrente + 1]->getFramebuffer(), LCD_W, LCD_H);
-        else
-            comp->fillRect(LCD_W - off, 0, off, LCD_H, COL_SFONDO);
-    }
+        comp->draw16bitRGBBitmap(LCD_W - off, 0, scheda[schedaAccanto(1)]->getFramebuffer(), LCD_W, LCD_H);
     else if (off < 0)
-    {
-        if (schedaCorrente - 1 >= 0)
-            comp->draw16bitRGBBitmap(-LCD_W - off, 0, scheda[schedaCorrente - 1]->getFramebuffer(), LCD_W, LCD_H);
-        else
-            comp->fillRect(0, 0, -off, LCD_H, COL_SFONDO);
-    }
+        comp->draw16bitRGBBitmap(-LCD_W - off, 0, scheda[schedaAccanto(-1)]->getFramebuffer(), LCD_W, LCD_H);
 
     comp->draw16bitRGBBitmap(-off, 0, scheda[schedaCorrente]->getFramebuffer(), LCD_W, LCD_H);
 
@@ -3481,7 +4079,7 @@ static void aggiornaAnimazione()
     uint32_t passato = millis() - animInizio;
     if (passato >= animDurata)
     {
-        schedaCorrente += animDirezione;
+        schedaCorrente = schedaAccanto(animDirezione);
         scorrimento = 0;
         animazioneAttiva = false;
         animDirezione = 0;
@@ -3654,14 +4252,14 @@ static void tapNelleSchede()
         // non il dito, e il bersaglio piu' grande va al gesto piu'
         // comune.
         if (!cronoAttivo && cronoTempo() > 0 &&
-            dentroRett(tapX, tapY, PADDING + MEZZA_ICONA, CRONO_PULSANTI_Y, 56, 34))
+            dentroRett(tapX, tapY, PADDING + MEZZA_ICONA, QUADRANTE_PULSANTI_Y, 56, 34))
             cronoAzzera();
         else if (cronoAttivo &&
                  dentroRett(tapX, tapY, LCD_W - PADDING - MEZZA_ICONA,
-                            CRONO_PULSANTI_Y, 56, 34))
+                            QUADRANTE_PULSANTI_Y, 56, 34))
             cronoGiro();
         else if (cronoNGiri > 0 &&
-                 dentro(tapX, tapY, CRONO_CX, CRONO_CY + CRONO_BOLLO, 40))
+                 dentro(tapX, tapY, QUADRANTE_CX, QUADRANTE_CY + QUADRANTE_BOLLO, 40))
         {
             vista = VISTA_GIRI;
             listaScorrimento = 0;
@@ -3671,6 +4269,45 @@ static void tapNelleSchede()
             cronoAvviaFerma();
 
         daRidisegnare[schedaCorrente] = true;
+        return;
+    }
+
+    if (schedaCorrente == SCHEDA_TIMER)
+    {
+        // Gli stessi due angoli del cronografo, con gli stessi
+        // bersagli: due schede gemelle non possono chiedere due mire
+        // diverse. In mezzo, tutto il resto avvia e ferma.
+        if (timerDurata > 0 && timerRimasto() != timerDurata &&
+            dentroRett(tapX, tapY, PADDING + MEZZA_ICONA, QUADRANTE_PULSANTI_Y, 56, 34))
+            timerAzzera();
+        else if (timerDurata < TIMER_MASSIMO &&
+                 dentroRett(tapX, tapY, LCD_W - PADDING - MEZZA_ICONA,
+                            QUADRANTE_PULSANTI_Y, 56, 34))
+            timerAggiungiMinuto();
+        else
+            timerAvviaFerma();
+
+        daRidisegnare[schedaCorrente] = true;
+        return;
+    }
+
+    if (schedaCorrente == SCHEDA_MAPPA)
+    {
+        // Piu' a destra, meno accanto: piu' vuol dire piu' vicino, e
+        // i livelli sono numerati dal piu' stretto al piu' largo.
+        if (mappaLivello > 0 &&
+            dentroRett(tapX, tapY, LCD_W - PADDING - MEZZA_ICONA, QUADRANTE_PULSANTI_Y, 28, 34))
+            --mappaLivello;
+        else if (mappaLivello < MAPPA_LIVELLI - 1 &&
+                 dentroRett(tapX, tapY, LCD_W - PADDING - MEZZA_ICONA - 56, QUADRANTE_PULSANTI_Y, 28, 34))
+            ++mappaLivello;
+        else
+            return;
+
+        // Se il livello c'e' gia' si vede subito; se no il compito
+        // lo va a prendere e la scheda dice che sta scaricando.
+        mappaChiediLivello(mappaLivello);
+        daRidisegnare[SCHEDA_MAPPA] = true;
         return;
     }
 
@@ -3861,7 +4498,8 @@ static void gestisciToccoModale()
         case VISTA_ALLARME:
             audioFerma();
             vista = VISTA_SCHEDE;
-            daRidisegnare[SCHEDA_ORA] = true;
+            daRidisegnare[allarmeDalTimer ? SCHEDA_TIMER : SCHEDA_ORA] = true;
+            allarmeDalTimer = false;
             componi();
             break;
         case VISTA_GIRI:
@@ -4089,6 +4727,7 @@ static void controllaSveglie(const struct tm &t)
 
         allarmeUltimoMinuto = minuto;
         allarmeIndice = i;
+        allarmeDalTimer = false;
         vista = VISTA_ALLARME;
         vistaDaRidisegnare = true;
 
@@ -4102,6 +4741,37 @@ static void controllaSveglie(const struct tm &t)
         Serial.printf("[sveglia] scattata: %02d:%02d\n", sveglie[i].ore, sveglie[i].minuti);
         return;
     }
+}
+
+// ------------------------------------------------------------
+//  QUANDO SCADE IL TIMER
+// ------------------------------------------------------------
+//  Vive fuori dalle schede, come le sveglie: un timer che smette di
+//  contare perche' stavi guardando il meteo non e' un timer. E vale
+//  anche a schermo spento - li' il conto va avanti da solo, perche'
+//  il tempo del processore non si ferma nel sonno leggero, e al
+//  momento buono lo schermo si riaccende da se'.
+
+static void controllaTimer()
+{
+    if (vista == VISTA_ALLARME) return;
+    if (!timerAttivo) return;
+    if (timerRimasto() > 0) return;
+
+    timerAttivo = false;
+    timerResto = 0;
+
+    allarmeDalTimer = true;
+    vista = VISTA_ALLARME;
+    vistaDaRidisegnare = true;
+    daRidisegnare[SCHEDA_TIMER] = true;
+
+    if (!schermoAcceso)
+        esciDaStandby();
+
+    audioAvvia();
+    Serial.printf("[timer] scaduto dopo %lu minuti\n",
+                  (unsigned long)(timerDurata / 60000UL));
 }
 
 static void gestisciTocco()
@@ -4131,6 +4801,14 @@ static void gestisciTocco()
         ditoUltimoT = adesso;
         velocita = 0;
 
+        // Dentro il disco del timer, a conto fermo, il dito non
+        // scorre le schede: carica il quadrante. Fuori dal disco no,
+        // o da questa scheda non si uscirebbe piu'.
+        timerInRotazione = false;
+        if (schedaCorrente == SCHEDA_TIMER && !timerAttivo &&
+            timerDentroIlDisco(tp.x, tp.y))
+            timerRotazioneInizia(tp.x, tp.y);
+
         // Utile la prima volta: se lo scorrimento andasse storto,
         // qui si vede subito se le coordinate arrivano ruotate.
         Serial.printf("[touch] x=%d y=%d\n", tp.x, tp.y);
@@ -4139,20 +4817,45 @@ static void gestisciTocco()
         // rinfrescarle adesso, prima che comincino a scorrere.
         for (int d = -1; d <= 1; d += 2)
         {
-            int i = schedaCorrente + d;
-            if (i >= 0 && i < N_SCHEDE && daRidisegnare[i])
+            int i = schedaAccanto(d);
+            if (daRidisegnare[i])
                 ridisegna(i);
         }
     }
     else if (tp.premuto && ditoGiu)
     {
-        float nuovo = scorrimentoPartenza + (ditoPartenzaX - tp.x);
+        if (timerInRotazione)
+        {
+            // Il dito sta caricando il quadrante: le schede non si
+            // muovono. Se pero' resta quasi fermo resta un tocco, e
+            // al rilascio fara' partire il conto come farebbe
+            // altrove sulla scheda.
+            if (abs(tp.x - ditoPartenzaX) > 8 || abs(tp.y - tapY) > 8)
+                eraTap = false;
 
-        // Ai due capi non c'e' niente da mostrare: il contenuto
-        // segue il dito solo in parte, e si sente che e' finita.
-        if ((schedaCorrente == 0 && nuovo < 0) ||
-            (schedaCorrente == N_SCHEDE - 1 && nuovo > 0))
-            nuovo *= 0.32f;
+            // Finche' il gesto puo' ancora essere un tocco, la durata
+            // non si tocca. Otto pixel sul bordo del disco valgono
+            // mezzo minuto abbondante: senza questa attesa, chi
+            // appoggia il dito per far partire il conto se lo
+            // ritrova spostato di un minuto senza aver girato niente.
+            // L'angolo di partenza resta quello del dito appoggiato,
+            // quindi appena diventa uno scorrimento non si perde
+            // nulla della strada gia' fatta.
+            if (eraTap) return;
+
+            if (timerRotazioneSegue(tp.x, tp.y))
+            {
+                ridisegna(SCHEDA_TIMER);
+                componi();
+            }
+            return;
+        }
+
+        // Niente freno ai capi: il carosello non ha capi. Prima il
+        // contenuto seguiva il dito a meta' oltre la prima e l'ultima
+        // scheda, per far sentire che era finito - adesso dopo
+        // l'ultima c'e' la prima, e si sente che continua.
+        float nuovo = scorrimentoPartenza + (ditoPartenzaX - tp.x);
 
         if (abs(tp.x - ditoPartenzaX) > 8)
             eraTap = false;
@@ -4176,6 +4879,16 @@ static void gestisciTocco()
     else if (!tp.premuto && ditoGiu)
     {
         ditoGiu = false;
+
+        if (timerInRotazione)
+        {
+            timerInRotazione = false;
+
+            // Il dito ha girato: la durata e' quella e basta, non c'e'
+            // nessuna scheda da far scattare. Se invece non si e'
+            // mosso era un tocco, e si comporta da tocco.
+            if (!eraTap) return;
+        }
 
         if (eraTap)
         {
@@ -4201,9 +4914,6 @@ static void gestisciTocco()
         else if (velocita < -sogliaSpinta && scorrimento < -12) direzione = -1;
         else if (scorrimento > sogliaStrada) direzione = 1;
         else if (scorrimento < -sogliaStrada) direzione = -1;
-
-        if (schedaCorrente + direzione < 0 || schedaCorrente + direzione >= N_SCHEDE)
-            direzione = 0;
 
         avviaAnimazione(direzione);
     }
@@ -4235,7 +4945,8 @@ static void gestisciTocco()
 //  non la puo' impedire. Per questo qui si guarda solo il colpo
 //  secco.
 //
-//  Fa una cosa sola: avvia e ferma il cronografo. Altrove non fa
+//  Fa una cosa sola: avvia e ferma il conto che hai davanti - il
+//  cronografo o il timer, a seconda della scheda. Altrove non fa
 //  niente, che e' meglio di un comando che cambia significato a
 //  seconda di dove ti trovi.
 
@@ -4271,9 +4982,15 @@ static void gestisciSecondoPulsante()
         ultimaAttivita = millis();
 
         if (schermoAcceso && vista == VISTA_SCHEDE &&
-            schedaCorrente == SCHEDA_CRONO)
+            (schedaCorrente == SCHEDA_CRONO || schedaCorrente == SCHEDA_TIMER))
         {
-            cronoAvviaFerma();
+            // Fa la stessa cosa su tutte e due: avvia e ferma il
+            // conto che hai davanti. Non e' un comando che cambia
+            // significato a seconda di dove ti trovi - il significato
+            // e' identico, cambia solo quale conto.
+            if (schedaCorrente == SCHEDA_CRONO) cronoAvviaFerma();
+            else timerAvviaFerma();
+
             daRidisegnare[schedaCorrente] = true;
         }
     }
@@ -4545,6 +5262,17 @@ void setup()
 
     connettiWifi();
     sincronizzaOra();
+
+    // La mappa parte adesso e fa da sola: aspetta la rete, trova la
+    // posizione, scarica il primo livello. Da dove prende la posizione
+    // lo decide MAPPA_DA_IP qui sopra, o secrets.h se dice la sua.
+#if defined(MAPPA_LAT) && defined(MAPPA_LON)
+    mappaBegin(MAPPA_LAT, MAPPA_LON, CITTA, false);
+#elif MAPPA_DA_IP
+    mappaBegin(LAT, LON, "", true);
+#else
+    mappaBegin(LAT, LON, CITTA, false);
+#endif
     prossimoMeteo = millis() + (scaricaMeteo() ? 30UL * 60UL * 1000UL : 2UL * 60UL * 1000UL);
     scaricaAria();
 
@@ -4606,6 +5334,7 @@ void loop()
     // suona perche' l'utente stava guardando un'altra schermata
     // non e' una sveglia.
     controllaSveglie(adesso);
+    controllaTimer();
 
     // A schermo spento non c'e' niente da calcolare: si ascolta
     // solo il pulsante. Ridisegnare un'immagine che nessuno vede
@@ -4764,6 +5493,56 @@ void loop()
     if (fisicaAttiva && schedaCorrente == SCHEDA_LOGO)
         fisicaPasso();
 #endif
+
+    // La mappa: il suo compito alza un numero ogni volta che ha
+    // qualcosa di nuovo - la posizione, un livello arrivato - e qui
+    // si guarda solo quello. Mentre scarica, il contatore dei KB si
+    // aggiorna quattro volte al secondo, cosi' si vede che si muove.
+    if (mappaVersione != mappaVersioneVista)
+    {
+        mappaVersioneVista = mappaVersione;
+        daRidisegnare[SCHEDA_MAPPA] = true;
+    }
+    if (mappaScaricando >= 0 && schedaCorrente == SCHEDA_MAPPA &&
+        !mappaLivelli[mappaLivello].pronto)
+    {
+        static uint32_t prossimoContatore = 0;
+        if ((int32_t)(millis() - prossimoContatore) >= 0)
+        {
+            prossimoContatore = millis() + 250;
+            daRidisegnare[SCHEDA_MAPPA] = true;
+        }
+    }
+
+    // Il pin che pulsa, solo mentre la mappa e' quella in vista e
+    // non c'e' un ridisegno intero in arrivo - quello rifa' anche il
+    // ritaglio, e il battito riparte da li'.
+    if (schedaCorrente == SCHEDA_MAPPA && mappaRitaglioValido &&
+        !daRidisegnare[SCHEDA_MAPPA])
+    {
+        static uint32_t prossimoBattito = 0;
+        if ((int32_t)(millis() - prossimoBattito) >= 0)
+        {
+            prossimoBattito = millis() + 40;
+            mappaPulsa(scheda[SCHEDA_MAPPA]);
+            componi();
+        }
+    }
+
+    // Il conto alla rovescia batte per conto suo: il suo secondo non
+    // cade insieme a quello dell'orologio - dipende da quando hai
+    // premuto avvia - e agganciarlo a quello farebbe saltare o
+    // ripetere una cifra ogni tanto.
+    if (timerAttivo)
+    {
+        static uint32_t ultimoSecondoTimer = 0;
+        uint32_t secondi = timerSecondi();
+        if (secondi != ultimoSecondoTimer)
+        {
+            ultimoSecondoTimer = secondi;
+            daRidisegnare[SCHEDA_TIMER] = true;
+        }
+    }
 
     if (daRidisegnare[schedaCorrente] || numeriInMovimento)
     {
