@@ -17,3 +17,6 @@
 
 # credenziali locali: mai su git
 src/secrets.h
+
+# impostazioni locali di Claude Code: personali, non del progetto
+.claude/settings.local.json
