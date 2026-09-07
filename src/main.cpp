@@ -76,6 +76,11 @@
 #define WIFI_PASSWORD ""
 #endif
 
+// Le reti: quelle scritte qui sopra, quelle imparate dal telefono, e
+// il portale con cui le si impara. Sta dopo secrets.h perche' e' da
+// li' che prende le prime.
+#include "rete.h"
+
 // ------------------------------------------------------------
 //  DOVE SIAMO
 // ------------------------------------------------------------
@@ -300,13 +305,24 @@ enum Vista
     VISTA_LISTA,      // l'elenco delle sveglie
     VISTA_EDITOR,     // imposta un orario
     VISTA_ALLARME,    // sta suonando
-    VISTA_GIRI        // l'elenco dei giri del cronografo
+    VISTA_GIRI,       // l'elenco dei giri del cronografo
+    VISTA_RETI        // le reti WiFi intorno
 };
 
 static Vista vista = VISTA_SCHEDE;
 static bool vistaDaRidisegnare = true;
 
 static float listaScorrimento = 0;   // di quanto e' scorsa la lista, in pixel
+
+// La schermata delle reti ha due facce: l'elenco, e l'attesa del
+// telefono mentre il portale e' aperto.
+enum RetiFase { RETI_ELENCO = 0, RETI_PORTALE };
+static RetiFase retiFase = RETI_ELENCO;
+static uint32_t reteVersioneVista = 0;
+
+// Su quale rete la mappa ha deciso la posizione. Se ci si aggancia a
+// un'altra si e' forse in un altro posto, e la posizione si richiede.
+static char reteDellaPosizione[33] = "";
 static int editorIndice = -1;        // quale sveglia si sta modificando, -1 = nuova
 static uint8_t editorOre = 7;
 static uint8_t editorMinuti = 0;
@@ -530,14 +546,20 @@ static void cronoGiro()
 //  il traguardo e' fisso e quindi conviene ricordare quello. Da
 //  fermo il traguardo non esiste ancora: c'e' solo quanto resta.
 //
-//  UN GIRO E' UN'ORA
-//  Sul cronometro un giro di lancetta e' un minuto, qui e' un'ora.
-//  Non e' un'incoerenza: e' la stessa lancetta che indica il numero
-//  scritto sul quadrante, e sessanta tacche vogliono dire sessanta
-//  di qualcosa. La differenza e' che un cronometro lo si legge al
-//  secondo e un timer lo si imposta al minuto.
+//  UN GIRO E' UN MINUTO
+//  Come sul cronometro: e' la stessa lancetta sullo stesso quadrante,
+//  e sessanta tacche vogliono dire sessanta secondi. Il timer si
+//  imposta al secondo, perche' e' al secondo che si legge.
+//
+//  E OLTRE IL MINUTO SI CONTINUA A GIRARE
+//  Il quadrante non finisce al sessanta: fatto un giro se ne
+//  comincia un altro, come su un timer da cucina che si carica a
+//  dieci minuti. La lancetta mostra sempre i secondi dentro il
+//  minuto in corso, e i minuti pieni si scrivono a parte, dentro il
+//  disco.
 
-#define TIMER_MASSIMO 3600000UL   // un giro intero di quadrante
+#define TIMER_GIRO 60000UL         // un giro intero di quadrante: un minuto
+#define TIMER_MASSIMO (24UL * 60UL * TIMER_GIRO)
 
 static uint32_t timerDurata = 0;    // quanto e' stato impostato
 static bool timerAttivo = false;
@@ -583,9 +605,9 @@ static void timerAvviaFerma()
     }
 }
 
-// Impostare la durata: da fermo, e sempre un numero tondo di minuti.
+// Impostare la durata: da fermo, e sempre un numero tondo di secondi.
 // La lancetta cade su una tacca perche' le tacche sul quadrante ci
-// sono gia' e sono sessanta - dire mezzo minuto vorrebbe dire
+// sono gia' e sono sessanta - dire mezzo secondo vorrebbe dire
 // puntare in mezzo al niente.
 static void timerImposta(uint32_t millisecondi)
 {
@@ -621,31 +643,51 @@ static void timerAggiungiMinuto()
 }
 
 // ------------------------------------------------------------
-//  GIRARE IL QUADRANTE
+//  TIRARE LA LANCETTA
 // ------------------------------------------------------------
-//  La durata si imposta trascinando il dito attorno al disco, come
-//  si carica un timer da cucina. Non ci sono un piu' e un meno da
-//  premere trenta volte: c'e' il quadrante, e la lancetta segue il
-//  dito.
+//  La lancetta del timer e' a lollipop: un'asta sottile con un
+//  anello in punta, come la lancetta dei secondi dei cronografi da
+//  pilota. L'anello non e' decorazione: e' la maniglia. La durata si
+//  imposta prendendo l'anello con il dito e portandolo in giro per
+//  il quadrante, come si carica un timer da cucina. Non ci sono un
+//  piu' e un meno da premere trenta volte: c'e' la lancetta, e va
+//  dove la porti.
 //
 //  IL CONTO E' RELATIVO, NON ASSOLUTO
 //  Non si prende l'angolo del dito e lo si chiama "durata". Se lo
 //  facessimo, passando sopra il dodici la durata salterebbe da
 //  cinquantanove a zero mentre il dito continua nella stessa
 //  direzione. Si guarda invece di quanto e' ruotato il dito
-//  dall'ultima lettura e lo si somma: cosi' il quadrante puo' essere
-//  scavalcato senza che il numero impazzisca, e ai due capi - zero e
-//  sessanta - si ferma e basta.
+//  dall'ultima lettura e lo si somma: cosi' il dodici si scavalca
+//  senza che il numero impazzisca - e ogni volta che lo si scavalca
+//  in avanti si e' aggiunto un minuto, all'indietro se ne e' tolto
+//  uno. Sotto lo zero non si va, e in cima ci sono ventiquattro ore.
 //
 //  DOVE COMINCIA IL GESTO
-//  Solo dentro il disco, e solo a timer fermo. Fuori dal disco - le
-//  fasce sopra, sotto e ai lati - il dito scorre fra le schede come
-//  in tutto il resto del programma, altrimenti da questa scheda non
-//  si uscirebbe piu'.
+//  Solo sull'anello, e solo a timer fermo. Dappertutto altrove il
+//  dito scorre fra le schede come in tutto il resto del programma:
+//  la lancetta si prende per la maniglia, non per il quadrante.
+
+// Dove sta l'anello lungo la lancetta e quanto e' grande. Sta sotto
+// le tacche, non sopra: a punti, due cose sovrapposte diventano una
+// cosa sola illeggibile.
+//
+// E' un filo piu' grande dei bolli dei comandi - quello con il numero
+// delle sveglie accanto alla campanella, il piu' e il meno dello zoom
+// della mappa, che fanno trentacinque pixel da un bordo all'altro.
+// Qui i centri dei punti stanno a raggio diciassette, trentanove in
+// tutto: e' una maniglia, e una maniglia si prende meglio di un
+// bottone. Sta comunque sotto le tacche.
+#define LOLLIPOP_RAGGIO (QUADRANTE_RAGGIO - 46)
+#define LOLLIPOP_ANELLO 17
+// Quanto vicino all'anello deve cadere il dito per averlo preso. Un
+// dito copre quasi mezzo centimetro: la presa va ben oltre l'anello
+// disegnato, o lo si manca tre volte su quattro.
+#define LOLLIPOP_PRESA 44
 
 static bool timerInRotazione = false;
 static float timerAngoloPrec = 0;   // dov'era il dito, in frazione di giro
-static float timerGiro = 0;         // quanto si e' girato in tutto, 0..1
+static float timerGiro = 0;         // quanto si e' girato in tutto, in giri
 
 // Dove sta il dito attorno al centro, contato da mezzogiorno e in
 // senso orario. atan2 misura da ore tre e cresce in senso orario -
@@ -659,17 +701,44 @@ static float timerAngolo(int16_t x, int16_t y)
     return giro - floorf(giro);
 }
 
-static bool timerDentroIlDisco(int16_t x, int16_t y)
+// Che frazione di giro mostra la lancetta adesso: i secondi che si
+// leggono nelle cifre, tolti i minuti pieni. Il disegno e la presa
+// devono essere d'accordo su questo numero, o si prende una lancetta
+// che non c'e'.
+//
+// Secondi interi, non millesimi: la lancetta scatta di tacca in
+// tacca, come su un timer meccanico. Presa dai millesimi scivolava,
+// perche' la scheda si ridisegna anche mentre le cifre scorrono e a
+// ogni fotogramma la lancetta si spostava di un pelo.
+static float timerFrazioneDiGiro()
 {
-    int32_t dx = x - QUADRANTE_CX;
-    int32_t dy = y - QUADRANTE_CY;
-    return (dx * dx + dy * dy) <= (int32_t)QUADRANTE_RAGGIO * QUADRANTE_RAGGIO;
+    return (float)(timerSecondi() % 60UL) / 60.0f;
+}
+
+// Dove sta l'anello a schermo, in questo momento.
+static void timerAnello(int16_t &px, int16_t &py)
+{
+    float a = (timerFrazioneDiGiro() * 360.0f - 90.0f) * (float)M_PI / 180.0f;
+    px = QUADRANTE_CX + (int16_t)lroundf(cosf(a) * LOLLIPOP_RAGGIO);
+    py = QUADRANTE_CY + (int16_t)lroundf(sinf(a) * LOLLIPOP_RAGGIO);
+}
+
+static bool timerSullAnello(int16_t x, int16_t y)
+{
+    int16_t px, py;
+    timerAnello(px, py);
+    int32_t dx = x - px;
+    int32_t dy = y - py;
+    return (dx * dx + dy * dy) <= (int32_t)LOLLIPOP_PRESA * LOLLIPOP_PRESA;
 }
 
 static void timerRotazioneInizia(int16_t x, int16_t y)
 {
     timerInRotazione = true;
-    timerGiro = (float)timerDurata / (float)TIMER_MASSIMO;
+    // Si parte da quello che la lancetta mostra, non dalla durata
+    // impostata: se il conto era fermo a meta', e' da li' che il dito
+    // la sta prendendo.
+    timerGiro = (float)timerRimasto() / (float)TIMER_GIRO;
     timerAngoloPrec = timerAngolo(x, y);
 }
 
@@ -691,11 +760,12 @@ static bool timerRotazioneSegue(int16_t x, int16_t y)
     timerAngoloPrec = adesso;
 
     timerGiro += passo;
+    const float massimo = (float)(TIMER_MASSIMO / TIMER_GIRO);
     if (timerGiro < 0.0f) timerGiro = 0.0f;
-    if (timerGiro > 1.0f) timerGiro = 1.0f;
+    if (timerGiro > massimo) timerGiro = massimo;
 
     uint32_t prima = timerDurata;
-    timerImposta((uint32_t)lroundf(timerGiro * 60.0f) * 60000UL);
+    timerImposta((uint32_t)lroundf(timerGiro * 60.0f) * 1000UL);
     return timerDurata != prima;
 }
 
@@ -892,16 +962,26 @@ static bool calcolaSole(int giornoDellAnno, bool alba, float fusoOre, float &ris
 
 static void connettiWifi()
 {
-    if (strlen(WIFI_SSID) == 0)
+    reteCarica();
+    if (nReteNote == 0)
     {
         Serial.println("[wifi] nessuna credenziale: salto (vedi secrets.h.example)");
         return;
     }
 
-    Serial.printf("[wifi] connessione a \"%s\"", WIFI_SSID);
+    // Prima si guarda che reti ci sono: costa due secondi e risparmia
+    // i quindici di un tentativo a vuoto sulla rete di casa quando si
+    // e' altrove. Fra le conosciute si prende la piu' forte; se non se
+    // ne vede nessuna si prova comunque l'ultima buona, che potrebbe
+    // essere nascosta.
     WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);   // se cade, ci riprova da solo
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    int n = WiFi.scanNetworks(false, false);
+    if (n > 0) reteRaccogliScansione(n);
+    const char *scelta = reteMigliore();
+    Serial.printf("[wifi] viste %d reti, mi aggancio a \"%s\"\n", nReteViste,
+                  scelta ? scelta : reteUltima);
+    if (scelta) reteAggancia(scelta);
+    else reteAgganciaUltima();
 
     uint32_t limite = millis() + 15000;
     while (WiFi.status() != WL_CONNECTED && millis() < limite)
@@ -913,9 +993,16 @@ static void connettiWifi()
 
     retePresente = (WiFi.status() == WL_CONNECTED);
     if (retePresente)
+    {
         Serial.printf("[wifi] ok, ip %s\n", WiFi.localIP().toString().c_str());
+        strncpy(reteDellaPosizione, WiFi.SSID().c_str(), 32);
+    }
     else
         Serial.println("[wifi] non riuscita: si va avanti con l'ora dell'RTC");
+
+    // Se e' andata, reteAggiorna se ne accorge al primo giro e segna
+    // questa come ultima rete buona. Se no, il tentativo e' ancora
+    // aperto e continua per conto suo.
 }
 
 // Il server chiama questa quando l'ora e' arrivata davvero. E'
@@ -2032,6 +2119,69 @@ static void quadranteLancetta(Arduino_GFX *g, float giro, uint16_t colore)
     dmDot(g, QUADRANTE_CX, QUADRANTE_CY, 13, COL_SFONDO);
 }
 
+// La lancetta a lollipop: un'asta sottile, un anello in punta e un
+// contrappeso corto dietro il perno. E' la forma della lancetta dei
+// secondi sui cronografi da pilota, e qui c'e' per una ragione
+// pratica prima che estetica: l'anello e' la maniglia con cui si
+// carica il timer, e una maniglia deve sembrare una maniglia.
+//
+// L'anello sta sotto le tacche, non sopra. Sugli orologi veri il
+// lollipop corre sopra la minuteria, ma a punti due disegni
+// sovrapposti fanno una macchia sola.
+static void quadranteLollipop(Arduino_GFX *g, float giro, uint16_t colore)
+{
+    float a = (giro * 360.0f - 90.0f) * (float)M_PI / 180.0f;
+    float co = cosf(a), si = sinf(a);
+
+    const int16_t hx = QUADRANTE_CX + (int16_t)lroundf(co * LOLLIPOP_RAGGIO);
+    const int16_t hy = QUADRANTE_CY + (int16_t)lroundf(si * LOLLIPOP_RAGGIO);
+
+    // L'asta finisce dove comincia l'anello: se entrasse dentro,
+    // l'anello non sarebbe piu' vuoto.
+    const float rAsta = LOLLIPOP_RAGGIO - LOLLIPOP_ANELLO - 3;
+    const float rCoda = -18.0f;
+
+    // Diciotto punti da cinque a passo sei: un pixel di aria fra l'uno
+    // e l'altro, la stessa aria dei bolli, che hanno punti da tre a
+    // passo quattro.
+    const int nAnello = 18;
+
+    // L'anello buca il quadrante: sotto ha un disco nero, come il
+    // marcatore dei secondi e tutto quello che passa sopra un fondo
+    // di punti. Senza, la trama e le tacche spuntavano da dentro
+    // l'anello e non si capiva piu' cosa fosse davanti e cosa dietro.
+    spazioTondo(g, hx, hy, LOLLIPOP_ANELLO + 5, 32000);
+
+    // Due passate, come la freccia: prima il vuoto, poi il pieno.
+    for (int passata = 0; passata < 2; ++passata)
+    {
+        uint16_t tinta = (passata == 0) ? COL_SFONDO : colore;
+        int16_t grossezza = (passata == 0) ? 10 : 5;
+
+        for (float r = rCoda; r <= rAsta; r += 3.5f)
+            dmDot(g, QUADRANTE_CX + (int16_t)lroundf(co * r),
+                     QUADRANTE_CY + (int16_t)lroundf(si * r), grossezza, tinta);
+
+        for (int k = 0; k < nAnello; ++k)
+        {
+            // Girati con la lancetta e sfalsati di mezzo passo: cosi'
+            // l'asta entra nell'anello fra due punti e non addosso a
+            // uno. Con l'anello fermo, a certe ore l'asta si
+            // schiacciava contro un punto e a certe altre no.
+            float b = a + ((float)k + 0.5f) * 2.0f * (float)M_PI / (float)nAnello;
+            dmDot(g, hx + (int16_t)lroundf(cosf(b) * LOLLIPOP_ANELLO),
+                     hy + (int16_t)lroundf(sinf(b) * LOLLIPOP_ANELLO),
+                     grossezza, tinta);
+        }
+    }
+
+    // Il perno: un disco con il foro dell'asse. L'asta e' troppo
+    // sottile per nasconderci dentro un foro come fa la freccia, quindi
+    // il perno si vede tutto, com'e' sui lollipop veri.
+    dmDot(g, QUADRANTE_CX, QUADRANTE_CY, 15, colore);
+    dmDot(g, QUADRANTE_CX, QUADRANTE_CY, 5, COL_SFONDO);
+}
+
 // Dove sta la lancetta del cronografo: un giro e' un minuto. Mentre
 // torna a zero non lo dice il tempo misurato ma l'animazione, che ha
 // preso il comando del quadrante fino a quando non ha finito.
@@ -2158,22 +2308,46 @@ static void disegnaTimer(Arduino_GFX *g)
     quadranteTriangolo(g);
 
     // A quadrante vuoto il gesto va detto: e' l'unico comando del
-    // programma che non ha un simbolo da toccare, e un disco che non
-    // sembra girevole non lo prova nessuno. Sparisce appena c'e' una
-    // durata, perche' da li' in poi l'ha capito.
+    // programma che non ha un simbolo da toccare, e un anello che
+    // non sembra una maniglia non lo prova nessuno. Sparisce appena
+    // c'e' una durata, perche' da li' in poi l'ha capito.
+    //
+    // Nello stesso posto, oltre il minuto, stanno i minuti pieni: la
+    // lancetta mostra solo i secondi dentro il minuto in corso, e da
+    // sola direbbe "trenta secondi" di un timer da un minuto e mezzo.
+    // Oltre l'ora si scrivono come ore e minuti, che a leggere "+90
+    // MIN" ci si mette piu' di quanto duri.
+    char buf[16];
     if (timerDurata == 0)
         testoCentrato(g, QUADRANTE_CY + QUADRANTE_BOLLO - 8,
-                      "GIRA IL QUADRANTE", 2, 2, COL_ETICHETTA, 2);
+                      "TIRA L'ANELLO", 2, 2, COL_ETICHETTA, 2);
+    else if (timerSecondi() >= 60)
+    {
+        unsigned long minuti = timerSecondi() / 60;
+        if (minuti < 60)
+            snprintf(buf, sizeof(buf), "+%lu MIN", minuti);
+        else
+            snprintf(buf, sizeof(buf), "+%lu:%02lu H", minuti / 60, minuti % 60);
+        testoCentrato(g, QUADRANTE_CY + QUADRANTE_BOLLO - 8, buf, 3, 2,
+                      timerAttivo ? COL_SECONDARIO : COL_ETICHETTA, 2);
+    }
 
-    quadranteLancetta(g, (float)resto / (float)TIMER_MASSIMO,
+    quadranteLollipop(g, timerFrazioneDiGiro(),
                       timerAttivo ? COL_ROSSO : COL_ACCESO);
 
     // ---- quanto manca, in cifre ----
+    // Fino all'ora minuti e secondi; oltre, anche le ore davanti. Le
+    // cifre si allargano di due posti una volta sola, passando l'ora,
+    // e non a ogni scatto.
     uint32_t secondi = timerSecondi();
 
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%02lu:%02lu",
-             (unsigned long)(secondi / 60), (unsigned long)(secondi % 60));
+    if (secondi >= 3600)
+        snprintf(buf, sizeof(buf), "%lu:%02lu:%02lu",
+                 (unsigned long)(secondi / 3600),
+                 (unsigned long)((secondi / 60) % 60), (unsigned long)(secondi % 60));
+    else
+        snprintf(buf, sizeof(buf), "%02lu:%02lu",
+                 (unsigned long)(secondi / 60), (unsigned long)(secondi % 60));
 
     const int16_t passo = 4;
     const int16_t largo = dmTextWidth(buf, passo, 1);
@@ -3763,6 +3937,118 @@ static void disegnaLista(Arduino_GFX *g)
 }
 
 // ------------------------------------------------------------
+//  SCHERMATA: LE RETI
+// ------------------------------------------------------------
+//  Si apre toccando il pallino della rete, in alto a destra. Elenca
+//  le reti intorno, le piu' forti prima; quelle conosciute si
+//  toccano e ci si aggancia, quelle nuove aprono il portale e si
+//  finisce dal telefono. Il perche' sta in rete.h.
+
+// Le tacche del segnale: quattro colonne di punti, alte una, due,
+// tre e quattro. Accese quante ne merita il segnale.
+static void disegnaSegnale(Arduino_GFX *g, int16_t x, int16_t cy, int rssi, uint16_t colore)
+{
+    int tacche = (rssi > -55) ? 4 : (rssi > -65) ? 3 : (rssi > -75) ? 2 : 1;
+    const int16_t passo = 5;
+    for (int c = 0; c < 4; ++c)
+        for (int r = 0; r <= c; ++r)
+            dmDot(g, x + c * passo, cy + 8 - r * passo, 3, c < tacche ? colore : COL_SPENTO);
+}
+
+// Il nome di una rete come lo sa scrivere questo carattere: tutto
+// maiuscolo, e quello che non conosce diventa un trattino.
+static void reteNomeLeggibile(const char *ssid, char *out, size_t max)
+{
+    size_t o = 0;
+    for (const char *s = ssid; *s && o + 1 < max; ++s)
+    {
+        unsigned char c = (unsigned char)*s;
+        if (c >= 'a' && c <= 'z') c -= 32;
+        else if (c < 32 || c > 96) c = '-';
+        out[o++] = (char)c;
+    }
+    out[o] = '\0';
+}
+
+static void disegnaReti(Arduino_GFX *g)
+{
+    telaio(g, "RETI", ETICHETTA_PIENA);
+
+    disegnaGriglia(g, LCD_W - PADDING - MEZZA_ICONA, PADDING + 8, ICO_CHIUDI,
+                   ICONA_COMANDO, 4, 3, COL_SECONDARIO);
+
+    bool lampo = ((millis() / 420) % 2) == 0;
+    char nome[33];
+
+    if (retiFase == RETI_PORTALE)
+    {
+        // Le istruzioni per il telefono, e niente altro: e' l'unica
+        // cosa da fare in questo momento.
+        testoCentrato(g, 112, "DAL TELEFONO", 2, 2, COL_ETICHETTA, 2);
+        testoCentrato(g, 136, "COLLEGATI ALLA RETE", 2, 2, COL_ETICHETTA, 2);
+        testoCentrato(g, 162, RETE_AP_NOME, 5, 4, COL_ACCESO);
+        testoCentrato(g, 206, "PASSWORD " RETE_AP_PASS, 3, 2, COL_SECONDARIO, 2);
+
+        testoCentrato(g, 250, "POI APRI", 2, 2, COL_ETICHETTA, 2);
+        testoCentrato(g, 274, WiFi.softAPIP().toString().c_str(), 4, 3, COL_ACCESO);
+
+        if (retePortaleSsid[0])
+        {
+            reteNomeLeggibile(retePortaleSsid, nome, sizeof(nome));
+            testoCentrato(g, 318, "E SCRIVI LA PASSWORD DI", 2, 2, COL_ETICHETTA, 2);
+            testoCentrato(g, 340, nome, 3, 2, COL_SECONDARIO, 2);
+        }
+
+        testoCentrato(g, LCD_H - PADDING - 24,
+                      retePortaleRicevutoA ? "RICEVUTA" : "ASPETTO",
+                      2, 2, lampo ? COL_SECONDARIO : COL_SPENTO, 2);
+        return;
+    }
+
+    if (nReteViste == 0)
+        testoCentrato(g, 200, reteScansioneInCorso ? "CERCO LE RETI" : "NESSUNA RETE",
+                      4, 3, COL_SPENTO);
+
+    String connessa = (WiFi.status() == WL_CONNECTED) ? WiFi.SSID() : String("");
+
+    for (int i = 0; i < nReteViste; ++i)
+    {
+        int16_t y = LISTA_ALTO + i * LISTA_RIGA - (int16_t)lroundf(listaScorrimento);
+        int16_t cy = y + LISTA_RIGA / 2;
+        if (cy < LISTA_ALTO - 10 || cy > LISTA_BASSO + 10) continue;
+
+        const char *ssid = reteViste[i].ssid;
+        bool collegata = connessa == ssid;
+        bool voluta = strcmp(reteVoluta, ssid) == 0;
+        bool nota = reteIndiceNota(ssid) >= 0;
+
+        uint16_t colore = collegata ? COL_ACCESO : nota ? COL_SECONDARIO : COL_ETICHETTA;
+        reteNomeLeggibile(ssid, nome, sizeof(nome));
+        etichettaTagliata(g, PADDING, cy - 24, nome, 4, 3, colore, 1,
+                          LCD_W - 2 * PADDING - 36);
+
+        const char *sotto = collegata ? "COLLEGATA"
+                          : voluta    ? "MI COLLEGO"
+                          : nota      ? "CONOSCIUTA"
+                                      : "NUOVA";
+        dmText(g, PADDING, cy + 8, sotto, 2, 2,
+               (voluta && !lampo) ? COL_SPENTO : COL_ETICHETTA, 2);
+
+        disegnaSegnale(g, LCD_W - PADDING - 16, cy, reteViste[i].rssi, colore);
+    }
+
+    // In fondo, cosa sta succedendo - o il comando per guardare di
+    // nuovo, che e' l'unica cosa da fare quando non succede niente.
+    const char *piede;
+    uint16_t colPiede = COL_SECONDARIO;
+    if (reteScansioneInCorso)       { piede = "CERCO LE RETI"; if (!lampo) colPiede = COL_SPENTO; }
+    else if (reteVoluta[0])         { piede = "MI COLLEGO";    if (!lampo) colPiede = COL_SPENTO; }
+    else if (reteFallita[0])        { piede = "NON RISPONDE, RIPROVA"; colPiede = COL_ROSSO; }
+    else                            { piede = "CERCA ANCORA"; }
+    testoCentrato(g, LCD_H - PADDING - 24, piede, 2, 2, colPiede, 2);
+}
+
+// ------------------------------------------------------------
 //  SCHERMATA: IMPOSTA UN ORARIO
 // ------------------------------------------------------------
 
@@ -4173,6 +4459,23 @@ static void apriLista()
     vistaDaRidisegnare = true;
 }
 
+static void apriReti()
+{
+    vista = VISTA_RETI;
+    retiFase = RETI_ELENCO;
+    listaScorrimento = 0;
+    vistaDaRidisegnare = true;
+    reteScansiona();
+}
+
+static void chiudiReti()
+{
+    retePortaleChiudi();
+    vista = VISTA_SCHEDE;
+    daRidisegnare[schedaCorrente] = true;
+    componi();
+}
+
 static void apriEditor(int indice)
 {
     editorIndice = indice;
@@ -4233,6 +4536,14 @@ static void vaiAlCondizionatore()
 // Il tocco secco sulla barra in fondo alla scheda dell'ora.
 static void tapNelleSchede()
 {
+    // Il pallino della rete sta nell'involucro, non in una scheda:
+    // da qualunque scheda lo si tocchi, apre le reti.
+    if (dentro(tapX, tapY, BATT_CX, BATT_CY, 30))
+    {
+        apriReti();
+        return;
+    }
+
 #if HA_LOGO
     if (schedaCorrente == SCHEDA_LOGO && !fisicaAttiva)
     {
@@ -4468,6 +4779,50 @@ static void tapNellaLista()
     }
 }
 
+static void tapNelleReti()
+{
+    if (dentro(tapX, tapY, LCD_W - PADDING - MEZZA_ICONA, PADDING + 8, BERSAGLIO))
+    {
+        chiudiReti();
+        return;
+    }
+
+    if (retiFase == RETI_PORTALE) return;
+
+    // Il piede: cerca ancora, o riprova.
+    if (dentroRett(tapX, tapY, LCD_W / 2, LCD_H - PADDING - 24, 150, 22))
+    {
+        if (reteScansioneInCorso || reteVoluta[0]) return;
+        if (reteFallita[0] && reteIndiceNota(reteFallita) >= 0)
+            reteAggancia(reteFallita);
+        else
+            reteScansiona();
+        vistaDaRidisegnare = true;
+        return;
+    }
+
+    for (int i = 0; i < nReteViste; ++i)
+    {
+        int16_t cy = LISTA_ALTO + i * LISTA_RIGA - (int16_t)lroundf(listaScorrimento)
+                     + LISTA_RIGA / 2;
+        if (tapY < cy - LISTA_RIGA / 2 || tapY > cy + LISTA_RIGA / 2) continue;
+        if (cy < LISTA_ALTO - 10 || cy > LISTA_BASSO + 10) continue;
+
+        const char *ssid = reteViste[i].ssid;
+        if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == ssid) return;
+
+        if (reteIndiceNota(ssid) >= 0)
+            reteAggancia(ssid);
+        else
+        {
+            retiFase = RETI_PORTALE;
+            retePortaleApri(ssid);
+        }
+        vistaDaRidisegnare = true;
+        return;
+    }
+}
+
 static void gestisciToccoModale()
 {
     static bool giu = false;
@@ -4499,10 +4854,13 @@ static void gestisciToccoModale()
         if (abs(tp.y - partenzaY) > 8 || abs(tp.x - tapX) > 8)
             mosso = true;
 
-        if ((vista == VISTA_LISTA || vista == VISTA_GIRI) && mosso)
+        bool elencoReti = (vista == VISTA_RETI && retiFase == RETI_ELENCO);
+        if ((vista == VISTA_LISTA || vista == VISTA_GIRI || elencoReti) && mosso)
         {
             float massimo = (vista == VISTA_GIRI)
                                 ? (float)(cronoNGiri * 46) - 240.0f
+                            : elencoReti
+                                ? (float)(nReteViste * LISTA_RIGA) - (LISTA_BASSO - LISTA_ALTO)
                                 : (float)(nSveglie * LISTA_RIGA) - (LISTA_BASSO - LISTA_ALTO);
             if (massimo < 0) massimo = 0;
             listaScorrimento = scorrimentoPartenzaY + (partenzaY - tp.y);
@@ -4555,6 +4913,7 @@ static void gestisciToccoModale()
             break;
         case VISTA_LISTA:  tapNellaLista(); break;
         case VISTA_EDITOR: tapNellEditor(); break;
+        case VISTA_RETI:   tapNelleReti(); break;
         default: break;
         }
     }
@@ -4578,6 +4937,7 @@ static void disegnaVista()
     case VISTA_GIRI:    disegnaGiri(comp);  break;
     case VISTA_EDITOR:  disegnaEditor(comp); break;
     case VISTA_ALLARME: disegnaAllarme(comp, t); break;
+    case VISTA_RETI:    disegnaReti(comp); break;
     default: return;
     }
     comp->flush();
@@ -4619,6 +4979,13 @@ static void entraInStandby()
     // board si spegnerebbe e basta.
     if (ldoNormali & LDO_DA_SPEGNERE)
         axpScrivi(0x90, ldoNormali & ~LDO_DA_SPEGNERE);
+
+    // Con la radio se ne va anche il portale, se era aperto, e la
+    // schermata delle reti non ha piu' senso: al risveglio si
+    // riparte dalle schede.
+    retePortaleChiudi();
+    reteVoluta[0] = '\0';
+    if (vista == VISTA_RETI) vista = VISTA_SCHEDE;
 
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
@@ -4733,11 +5100,12 @@ static void esciDaStandby()
 
     // La riconnessione non blocca: parte e va per conto suo, e
     // l'indicatore si accorgera' da solo quando la rete e' tornata.
-    if (strlen(WIFI_SSID) > 0)
+    // Si riprova l'ultima rete buona senza guardarsi intorno: quasi
+    // sempre si e' ancora nello stesso posto. Se non e' cosi', il
+    // giro dei venti secondi guarda e sceglie.
+    if (nReteNote > 0)
     {
-        WiFi.mode(WIFI_STA);
-        WiFi.setAutoReconnect(true);
-        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        reteAgganciaUltima();
         prossimoAggancio = millis() + AGGANCIO_OGNI;
     }
 
@@ -4844,12 +5212,12 @@ static void gestisciTocco()
         ditoUltimoT = adesso;
         velocita = 0;
 
-        // Dentro il disco del timer, a conto fermo, il dito non
-        // scorre le schede: carica il quadrante. Fuori dal disco no,
-        // o da questa scheda non si uscirebbe piu'.
+        // Sull'anello della lancetta del timer, a conto fermo, il
+        // dito non scorre le schede: tira la lancetta. Altrove no, o
+        // da questa scheda non si uscirebbe piu'.
         timerInRotazione = false;
         if (schedaCorrente == SCHEDA_TIMER && !timerAttivo &&
-            timerDentroIlDisco(tp.x, tp.y))
+            timerSullAnello(tp.x, tp.y))
             timerRotazioneInizia(tp.x, tp.y);
 
         // Utile la prima volta: se lo scorrimento andasse storto,
@@ -4877,10 +5245,10 @@ static void gestisciTocco()
                 eraTap = false;
 
             // Finche' il gesto puo' ancora essere un tocco, la durata
-            // non si tocca. Otto pixel sul bordo del disco valgono
-            // mezzo minuto abbondante: senza questa attesa, chi
-            // appoggia il dito per far partire il conto se lo
-            // ritrova spostato di un minuto senza aver girato niente.
+            // non si tocca. Otto pixel sull'anello valgono un paio di
+            // secondi: senza questa attesa, chi appoggia il dito
+            // sull'anello per far partire il conto se lo ritrova
+            // spostato senza aver tirato niente.
             // L'angolo di partenza resta quello del dito appoggiato,
             // quindi appena diventa uno scorrimento non si perde
             // nulla della strada gia' fatta.
@@ -5223,6 +5591,10 @@ void setup()
     Serial.println();
     Serial.println("============================================");
     Serial.println("  DOT CLOCK - ESP32-S3-Touch-AMOLED-1.8");
+    // Quando e' stato compilato quello che sta girando: e' l'unico
+    // modo di sapere se un aggiornamento via rete e' stato preso
+    // davvero o se il bootloader e' tornato all'immagine di prima.
+    Serial.printf("  compilato %s %s\n", __DATE__, __TIME__);
     Serial.println("============================================");
 
     pinMode(BTN_BOOT, INPUT_PULLUP);
@@ -5391,12 +5763,36 @@ void loop()
     // anche la radio, quindi l'aggiornamento via wifi - da' solo
     // fastidio. E nemmeno mentre una sveglia sta suonando, che sarebbe
     // il modo piu' sicuro di non sentirla.
-    if (!alimentato && vista != VISTA_ALLARME &&
+    // E nemmeno mentre il telefono sta scrivendo una password o
+    // l'aggancio e' a meta': sarebbe spegnere la radio proprio mentre
+    // qualcuno ci sta parlando.
+    bool reteAlLavoro = (vista == VISTA_RETI && (retePortaleAperto() || reteVoluta[0]));
+    if (!alimentato && vista != VISTA_ALLARME && !reteAlLavoro &&
         (millis() - ultimaAttivita) > SPEGNIMENTO_AUTO)
     {
         Serial.println("[standby] nessuno tocca da un minuto e mezzo");
         entraInStandby();
         return;
+    }
+
+    // La rete lavora a ogni giro, in qualunque schermata: la
+    // scansione da finire, il portale da servire, il tentativo di
+    // aggancio da controllare.
+    reteAggiorna();
+    if (vista == VISTA_RETI)
+    {
+        if (reteVersione != reteVersioneVista)
+        {
+            reteVersioneVista = reteVersione;
+            vistaDaRidisegnare = true;
+        }
+        // Il portale si e' chiuso da solo - password ricevuta - e si
+        // torna all'elenco, dove si vede l'aggancio andare.
+        if (retiFase == RETI_PORTALE && !retePortaleAperto())
+        {
+            retiFase = RETI_ELENCO;
+            vistaDaRidisegnare = true;
+        }
     }
 
     // Nelle schermate della sveglia il carosello e' sospeso.
@@ -5414,6 +5810,7 @@ void loop()
         // ridisegna quando cambia lo stato, non a ritmo fisso.
         static bool ultimoLampeggio = false;
         bool lampeggia = (vista == VISTA_EDITOR || vista == VISTA_ALLARME ||
+                          vista == VISTA_RETI ||
                           (vista == VISTA_GIRI && cronoAttivo));
         bool ora = ((millis() / 420) % 2) == 0;
 
@@ -5493,7 +5890,21 @@ void loop()
             // Appena torna, i dati si riprendono subito invece di
             // aspettare il prossimo giro di mezz'ora.
             if (adessoCe)
+            {
                 prossimoMeteo = millis();
+
+                // Un'altra rete e' forse un altro posto: la mappa
+                // richiede la posizione, e i livelli di casa - se
+                // casa non e' piu' qui - si riscaricano.
+                String ssid = WiFi.SSID();
+                if (reteDellaPosizione[0] && ssid != reteDellaPosizione)
+                {
+                    Serial.printf("[wifi] rete diversa (\"%s\"): la mappa richiede la posizione\n",
+                                  ssid.c_str());
+                    mappaRichiediPosizione();
+                }
+                strncpy(reteDellaPosizione, ssid.c_str(), 32);
+            }
         }
 
         // Se la rete non c'e', si ritenta ogni venti secondi.
@@ -5505,16 +5916,17 @@ void loop()
         // radio si arrende e resta ferma per sempre: il device
         // rimane acceso a un metro dal router, con la rete a portata,
         // e non ci riprova mai piu'. E' successo davvero.
-        if (!adessoCe && strlen(WIFI_SSID) > 0 &&
+        //
+        // Non si ritenta alla cieca la rete di casa: si guarda che
+        // reti ci sono e si prende la piu' forte fra le conosciute.
+        // Non mentre un tentativo e' gia' in corso, e non mentre il
+        // portale e' aperto: li' la radio ha da fare.
+        if (!adessoCe && nReteNote > 0 && !reteVoluta[0] && !retePortaleAperto() &&
             (int32_t)(millis() - prossimoAggancio) >= 0)
         {
             prossimoAggancio = millis() + AGGANCIO_OGNI;
-            Serial.println("[wifi] non agganciata, ritento");
-
-            // Prima staccare: una begin() su una connessione a meta'
-            // non riparte, si accoda e basta.
-            WiFi.disconnect();
-            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+            Serial.println("[wifi] non agganciata, guardo che reti ci sono");
+            reteRitenta();
         }
         if (t.tm_min != ultimoMinuto)
         {

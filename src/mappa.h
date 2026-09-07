@@ -614,6 +614,10 @@ static MappaLivello mappaLivelli[MAPPA_LIVELLI];
 static double mappaLat = 0, mappaLon = 0;
 static volatile bool mappaPosizionePronta = false;
 static volatile bool mappaPosizioneDaRete = false;   // ancora da chiedere
+// I livelli letti dalla flash sono stati confrontati con la posizione
+// definitiva? Si abbassa insieme a "pronta" quando la posizione va
+// richiesta, cosi' il confronto si rifa'.
+static volatile bool mappaPosizioneVerificata = false;
 static char mappaCitta[24] = "";
 
 // Da dove viene la posizione, e quanto e' buona. Si scrive sulla
@@ -1176,8 +1180,6 @@ static void mappaTask(void *)
         mappaCacheLeggi(l);
     ++mappaVersione;
 
-    bool posizioneVerificata = false;
-
     for (;;)
     {
         if (WiFi.status() != WL_CONNECTED)
@@ -1190,9 +1192,9 @@ static void mappaTask(void *)
         // dalla flash si controllano: quelli presi altrove si
         // riscaricano, quelli presi qui vicino si tengono e si
         // traslano al momento di disegnare.
-        if (mappaPosizionePronta && !posizioneVerificata)
+        if (mappaPosizionePronta && !mappaPosizioneVerificata)
         {
-            posizioneVerificata = true;
+            mappaPosizioneVerificata = true;
             for (int l = 0; l < MAPPA_LIVELLI; ++l)
                 if (mappaLivelli[l].pronto && !mappaLivelloAncoraBuono(l))
                 {
@@ -1267,6 +1269,18 @@ static void mappaTask(void *)
 
         vTaskDelay(pdMS_TO_TICKS(150));
     }
+}
+
+// Si e' cambiata rete, e forse posto: la posizione si richiede da
+// capo. I livelli gia' in memoria restano finche' la nuova risposta
+// non dice che sono di un altro posto - e se la posizione era fissa
+// non c'e' niente da richiedere.
+static void mappaRichiediPosizione()
+{
+    if (!mappaPosizioneDaRete) return;
+    mappaPosizionePronta = false;
+    mappaPosizioneVerificata = false;
+    ++mappaVersione;
 }
 
 // Parte con la posizione gia' decisa - se la conosci - o con la
