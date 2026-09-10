@@ -6084,7 +6084,25 @@ void setup()
     // deve trovarle alimentate.
     axpScrivi(0x92, 0x1C);                    // ALDO1: 0,5 V + 28 x 0,1 V = 3,3 V
     axpScrivi(0x90, axpLeggi(0x90) | 0x01);   // ALDO1 acceso
+    axpScrivi(0x91, axpLeggi(0x91) | 0x01);   // DLDO2 acceso, com'e' di fabbrica
     delay(30);
+
+    // L'expander di I/O si riporta allo stato di accensione: tutti i
+    // piedini in ingresso con la resistenza di pull-up, che e' come la
+    // board si trova quando tutto funziona. Ne' il gestore di
+    // alimentazione ne' l'expander si resettano con l'ESP32: quello
+    // che ci scrive una prova dal seriale resta finche' non si toglie
+    // la batteria. Su EXIO1 c'e' l'abilitazione dell'alimentazione
+    // del display - lasciarlo basso vuol dire uno schermo nero che
+    // nessun riavvio riaccende. E' successo.
+    Wire.beginTransmission(EXP_ADDR);
+    Wire.write(0x01);
+    Wire.write(0xFF);
+    Wire.endTransmission();
+    Wire.beginTransmission(EXP_ADDR);
+    Wire.write(0x03);
+    Wire.write(0xFF);
+    Wire.endTransmission();
 
     ldoNormali = axpLeggi(0x90);
     Serial.printf("[axp] regolatori secondari: 0x%02X\n", ldoNormali);
