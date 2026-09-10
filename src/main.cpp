@@ -47,6 +47,7 @@
 #include "rtc.h"
 #include "sveglia.h"
 #include "audio.h"
+#include "nastro.h"
 #include "imu.h"
 #include "web.h"
 #include "clima.h"
@@ -240,9 +241,9 @@ static Arduino_Canvas *comp = new Arduino_Canvas(LCD_W, LCD_H, panel);
 // ------------------------------------------------------------
 
 #if HA_LOGO
-#define N_SCHEDE 11
+#define N_SCHEDE 12
 #else
-#define N_SCHEDE 10
+#define N_SCHEDE 11
 #endif
 
 #define SCHEDA_ORA 0
@@ -261,6 +262,8 @@ static Arduino_Canvas *comp = new Arduino_Canvas(LCD_W, LCD_H, panel);
 #else
 #define SCHEDA_MAPPA 9
 #endif
+// Il registratore viene dopo la mappa, chiude il giro.
+#define SCHEDA_NASTRO (SCHEDA_MAPPA + 1)
 
 // Da quale scheda si comanda quale macchina.
 #define CLIMA_DI(scheda) (climi[(scheda) == SCHEDA_CLIMA ? 0 : 1])
@@ -284,6 +287,7 @@ static Arduino_Canvas *scheda[N_SCHEDE] = {
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),
 #endif
     new Arduino_Canvas(LCD_W, LCD_H, nullptr),   // la mappa
+    new Arduino_Canvas(LCD_W, LCD_H, nullptr),   // il registratore
 };
 static bool daRidisegnare[N_SCHEDE];
 
@@ -368,6 +372,13 @@ static int16_t tapX = 0, tapY = 0;      // il dito si e' mosso poco: e' un tocco
 // se ne vanno da soli. Una schermata di orologio deve essere ferma;
 // i comandi servono nel momento in cui li usi, non prima.
 #define PALLINI_ATTESA 1000   // quanto restano dopo l'ultimo tocco
+
+// Con 0 i pallini non si disegnano affatto. Sono spenti da quando le
+// schede sono diventate undici: a quel numero una fila di puntini
+// che compare a ogni tocco non dice piu' "sei qui", disturba e basta.
+// Il codice resta, per riaccenderli se si trova un modo migliore di
+// dire dove si e'.
+#define PALLINI 0
 
 // Dopo quanto lo schermo si spegne da solo.
 //
@@ -688,6 +699,14 @@ static void timerAggiungiMinuto()
 static bool timerInRotazione = false;
 static float timerAngoloPrec = 0;   // dov'era il dito, in frazione di giro
 static float timerGiro = 0;         // quanto si e' girato in tutto, in giri
+
+// La bobina del registratore in mano al dito: stessa idea, stesso
+// conto relativo. "In presa" da quando il dito si appoggia sulla
+// bobina; "in scratch" da quando si e' mosso abbastanza da non
+// essere piu' un tocco.
+static bool nastroInPresa = false;
+static bool nastroInScratch = false;
+static float nastroAngoloPrec = 0;
 
 // Dove sta il dito attorno al centro, contato da mezzogiorno e in
 // senso orario. atan2 misura da ore tre e cresce in senso orario -
@@ -2374,6 +2393,201 @@ static void disegnaTimer(Arduino_GFX *g)
 }
 
 // ------------------------------------------------------------
+//  SCHEDA: IL NASTRO
+// ------------------------------------------------------------
+//  Un registratore visto di fronte: due bobine, il punto rosso, il
+//  motore in basso a destra e il nastro che ci gira intorno. Le
+//  bobine e il motore sono cerchi pieni e puliti - e' l'unica
+//  scheda che si permette una linea continua - mentre il nastro e'
+//  fatto di punti, come tutto il resto: cosi' si vede che e' il
+//  nastro a muoversi, non le bobine. In basso a sinistra l'anello
+//  dei dodici punti: mentre registri e' il livello del microfono,
+//  mentre ascolti e' a che punto sei. Il motore, i comandi e il
+//  perche' del tutto stanno in nastro.h.
+
+#define NASTRO_R 60
+#define NASTRO_SX_CX 116
+#define NASTRO_DX_CX 248
+#define NASTRO_CY 172
+#define NASTRO_SPIA_X (LCD_W - PADDING - 12)
+#define NASTRO_SPIA_Y 118
+#define NASTRO_MOTORE_X (LCD_W - PADDING - MEZZA_ICONA)
+#define NASTRO_MOTORE_Y 386
+#define NASTRO_MOTORE_R 18
+#define NASTRO_ANELLO_CX 96
+#define NASTRO_ANELLO_CY 366
+#define NASTRO_ANELLO_R 36
+#define NASTRO_PASSO_PUNTI 7    // fra un punto e l'altro lungo il nastro
+#define NASTRO_PIXEL_AL_SECONDO 40   // quanto corre il nastro a schermo
+
+// Un cerchio pulito, spesso due pixel: e' il segno delle bobine.
+static void nastroCerchio(Arduino_GFX *g, int16_t cx, int16_t cy, int16_t r, uint16_t colore)
+{
+    g->drawCircle(cx, cy, r, colore);
+    g->drawCircle(cx, cy, r - 1, colore);
+}
+
+// Il punto di tangenza fra due cerchi, sul lato scelto: e' dove il
+// nastro lascia una bobina per andare al motore. La geometria e'
+// quella delle tangenti esterne; il segno sceglie quale delle due.
+static void nastroTangente(float cx1, float cy1, float r1, float cx2, float cy2, float r2,
+                           int segno, float &x1, float &y1, float &x2, float &y2, float &angolo)
+{
+    float dx = cx2 - cx1, dy = cy2 - cy1;
+    float d = sqrtf(dx * dx + dy * dy);
+    float t = atan2f(dy, dx) + segno * acosf((r1 - r2) / d);
+    x1 = cx1 + r1 * cosf(t);
+    y1 = cy1 + r1 * sinf(t);
+    x2 = cx2 + r2 * cosf(t);
+    y2 = cy2 + r2 * sinf(t);
+    angolo = t;
+}
+
+static void disegnaNastro(Arduino_GFX *g)
+{
+    telaio(g, "REGISTRATORE");
+
+    bool lampo = ((millis() / 420) % 2) == 0;
+    uint8_t stato = nastroStato;
+    float giri = nastroGiri();
+    float th = giri * 2.0f * (float)M_PI;
+
+    // ---- il nastro: dalla bobina sinistra al motore, intorno al
+    //      motore, e su fino alla bobina destra ----
+    float ax, ay, bx, by, aA;   // sinistra -> motore
+    float cx, cy, dx, dy, aC;   // motore -> destra
+    nastroTangente(NASTRO_SX_CX, NASTRO_CY, NASTRO_R, NASTRO_MOTORE_X, NASTRO_MOTORE_Y, NASTRO_MOTORE_R,
+                   +1, ax, ay, bx, by, aA);
+    nastroTangente(NASTRO_DX_CX, NASTRO_CY, NASTRO_R, NASTRO_MOTORE_X, NASTRO_MOTORE_Y, NASTRO_MOTORE_R,
+                   -1, dx, dy, cx, cy, aC);
+    // Intorno al motore si passa dal lato di fuori: dall'angolo di
+    // arrivo si scende fino a quello di partenza.
+    if (aC > aA) aC -= 2.0f * (float)M_PI;
+
+    float l1 = sqrtf((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
+    float l2 = NASTRO_MOTORE_R * (aA - aC);
+    float l3 = sqrtf((dx - cx) * (dx - cx) + (dy - cy) * (dy - cy));
+    float totale = l1 + l2 + l3;
+
+    // I punti scorrono con il nastro: la fase e' la posizione nel
+    // nastro tradotta in pixel, e ricomincia a ogni passo.
+    float fase = fmodf(nastroPosizione / (float)AUDIO_RATE * NASTRO_PIXEL_AL_SECONDO,
+                       (float)NASTRO_PASSO_PUNTI);
+    if (fase < 0) fase += NASTRO_PASSO_PUNTI;
+
+    for (float s = fase; s < totale; s += NASTRO_PASSO_PUNTI)
+    {
+        float px, py;
+        if (s < l1)
+        {
+            float f = s / l1;
+            px = ax + (bx - ax) * f;
+            py = ay + (by - ay) * f;
+        }
+        else if (s < l1 + l2)
+        {
+            float a = aA - (s - l1) / NASTRO_MOTORE_R;
+            px = NASTRO_MOTORE_X + NASTRO_MOTORE_R * cosf(a);
+            py = NASTRO_MOTORE_Y + NASTRO_MOTORE_R * sinf(a);
+        }
+        else
+        {
+            float f = (s - l1 - l2) / l3;
+            px = cx + (dx - cx) * f;
+            py = cy + (dy - cy) * f;
+        }
+        dmDot(g, (int16_t)lroundf(px), (int16_t)lroundf(py), 3, COL_SECONDARIO);
+    }
+
+    // ---- le bobine ----
+    nastroCerchio(g, NASTRO_SX_CX, NASTRO_CY, NASTRO_R, COL_ACCESO);
+    nastroCerchio(g, NASTRO_DX_CX, NASTRO_CY, NASTRO_R, COL_ACCESO);
+    nastroCerchio(g, NASTRO_DX_CX, NASTRO_CY, 24, COL_ACCESO);
+
+    // I raggi di quella sinistra girano con il nastro: e' quella che
+    // si prende in mano.
+    const float L = 34.0f;
+    for (int k = 0; k < 4; ++k)
+    {
+        float a = th + k * (float)M_PI / 4.0f;
+        float co = cosf(a), si = sinf(a);
+        int16_t x0 = NASTRO_SX_CX - (int16_t)lroundf(co * L), y0 = NASTRO_CY - (int16_t)lroundf(si * L);
+        int16_t x1 = NASTRO_SX_CX + (int16_t)lroundf(co * L), y1 = NASTRO_CY + (int16_t)lroundf(si * L);
+        g->drawLine(x0, y0, x1, y1, COL_ACCESO);
+        // Un secondo tratto accanto: a un pixel la linea sparisce
+        // sull'AMOLED, a due si vede.
+        if (fabsf(co) > fabsf(si)) g->drawLine(x0, y0 + 1, x1, y1 + 1, COL_ACCESO);
+        else g->drawLine(x0 + 1, y0, x1 + 1, y1, COL_ACCESO);
+    }
+
+    // ---- la spia: rossa e lampeggiante mentre registra ----
+    if (stato == NASTRO_REGISTRA)
+        g->fillCircle(NASTRO_SPIA_X, NASTRO_SPIA_Y, 7, lampo ? COL_ROSSO : COL_SPENTO);
+    else
+        g->fillCircle(NASTRO_SPIA_X, NASTRO_SPIA_Y, 7, COL_SPENTO);
+
+    // ---- il motore: un disco pieno con l'ingranaggio, che gira ----
+    g->fillCircle(NASTRO_MOTORE_X, NASTRO_MOTORE_Y, NASTRO_MOTORE_R, COL_ACCESO);
+    g->fillCircle(NASTRO_MOTORE_X, NASTRO_MOTORE_Y, 9, COL_SFONDO);
+    for (int k = 0; k < 8; ++k)
+    {
+        float a = -th + k * (float)M_PI / 4.0f;
+        g->fillCircle(NASTRO_MOTORE_X + (int16_t)lroundf(cosf(a) * 11.0f),
+                      NASTRO_MOTORE_Y + (int16_t)lroundf(sinf(a) * 11.0f), 3, COL_SFONDO);
+    }
+    g->fillCircle(NASTRO_MOTORE_X, NASTRO_MOTORE_Y, 3, COL_ACCESO);
+
+    // ---- l'anello dei dodici punti ----
+    int accesi;
+    if (stato == NASTRO_REGISTRA)
+    {
+        // Il livello, in decibel e non in ampiezza: l'orecchio ragiona
+        // cosi', e un indicatore lineare starebbe fermo a un punto per
+        // tutto il parlato e schizzerebbe a dodici solo urlando. Da
+        // -50 dB, dove c'e' solo il fondo, a zero.
+        float db = 20.0f * log10f(nastroLivello + 1e-6f);
+        float v = (db + 50.0f) / 50.0f;
+        if (v < 0.0f) v = 0.0f;
+        if (v > 1.0f) v = 1.0f;
+        accesi = (int)lroundf(v * 12.0f);
+    }
+    else if (nastroLunghezza > 0)
+        accesi = (int)lroundf(nastroPosizione / (float)nastroLunghezza * 12.0f);
+    else
+        accesi = 0;
+
+    for (int k = 0; k < 12; ++k)
+    {
+        float a = (k * 30.0f - 90.0f) * (float)M_PI / 180.0f;
+        int16_t px = NASTRO_ANELLO_CX + (int16_t)lroundf(cosf(a) * NASTRO_ANELLO_R);
+        int16_t py = NASTRO_ANELLO_CY + (int16_t)lroundf(sinf(a) * NASTRO_ANELLO_R);
+        if (k < accesi) g->fillCircle(px, py, 4, COL_ACCESO);
+        else g->drawCircle(px, py, 4, COL_SPENTO);
+    }
+
+    // ---- i secondi, fra l'anello e il motore ----
+    char buf[24];
+    if (nastroLunghezza > 0 || stato == NASTRO_REGISTRA)
+    {
+        uint32_t pos = (uint32_t)(nastroPosizione / AUDIO_RATE);
+        uint32_t lun = nastroLunghezza / AUDIO_RATE;
+        if (stato == NASTRO_REGISTRA)
+            snprintf(buf, sizeof(buf), "%lu:%02lu", (unsigned long)(lun / 60), (unsigned long)(lun % 60));
+        else
+            snprintf(buf, sizeof(buf), "%lu:%02lu / %lu:%02lu",
+                     (unsigned long)(pos / 60), (unsigned long)(pos % 60),
+                     (unsigned long)(lun / 60), (unsigned long)(lun % 60));
+        dmTextCentered(g, 212, 358, buf, 2, 2,
+                       stato == NASTRO_FERMO ? COL_SECONDARIO : COL_ACCESO, 1);
+    }
+
+    if (nastroSalvando)
+        dmTextCentered(g, LCD_W / 2, 262, "SALVO", 2, 2, COL_ETICHETTA, 2);
+    else if (nastroLunghezza == 0 && stato != NASTRO_REGISTRA)
+        dmTextCentered(g, LCD_W / 2, 262, "TOCCA IL PUNTO ROSSO", 2, 2, COL_ETICHETTA, 2);
+}
+
+// ------------------------------------------------------------
 //  SCHEDA: LA MAPPA
 // ------------------------------------------------------------
 //  Le strade intorno a casa, disegnate sulla griglia del pannello.
@@ -3734,6 +3948,7 @@ static void ridisegna(int i)
     case SCHEDA_CRONO: disegnaCrono(scheda[i]);   break;
     case SCHEDA_TIMER: disegnaTimer(scheda[i]);   break;
     case SCHEDA_MAPPA: disegnaMappa(scheda[i]);   break;
+    case SCHEDA_NASTRO: disegnaNastro(scheda[i]); break;
     case SCHEDA_SOLE:  disegnaSole(scheda[i], t); break;
     case SCHEDA_METEO: disegnaMeteo(scheda[i]);   break;
     case SCHEDA_BARO:  disegnaBaro(scheda[i]);   break;
@@ -4379,9 +4594,11 @@ static void componi()
     indicatoreBatteria(comp);
     indicatoreRete(comp, BATT_CX, BATT_CY);
 
+#if PALLINI
     float opacita = palliniOpacita();
     disegnaPallini(comp, schedaCorrente + scorrimento / (float)LCD_W, opacita);
     palliniOpacitaDisegnata = opacita;
+#endif
     comp->flush();
     ++webVersione;
 
@@ -4663,6 +4880,26 @@ static void tapNelleSchede()
         // lo va a prendere e la scheda dice che sta scaricando.
         mappaChiediLivello(mappaLivello);
         daRidisegnare[SCHEDA_MAPPA] = true;
+        return;
+    }
+
+    if (schedaCorrente == SCHEDA_NASTRO)
+    {
+        // Il punto rosso registra e smette. Il motore - e la bobina
+        // stessa, che e' il bersaglio grande - fanno partire e fermano
+        // l'ascolto.
+        if (dentro(tapX, tapY, NASTRO_SPIA_X, NASTRO_SPIA_Y, 30))
+            nastroChiedi(nastroStato == NASTRO_REGISTRA ? NASTRO_FERMO : NASTRO_REGISTRA);
+        else if (dentro(tapX, tapY, NASTRO_MOTORE_X, NASTRO_MOTORE_Y, 30) ||
+                 dentro(tapX, tapY, NASTRO_SX_CX, NASTRO_CY, NASTRO_R + 8))
+        {
+            if (nastroStato == NASTRO_REGISTRA) return;
+            nastroChiedi(nastroInMoto() ? NASTRO_FERMO : NASTRO_SUONA);
+        }
+        else
+            return;
+
+        daRidisegnare[SCHEDA_NASTRO] = true;
         return;
     }
 
@@ -4968,6 +5205,7 @@ static void entraInStandby()
 {
     schermoAcceso = false;
     panel->displayOff();
+    nastroChiedi(NASTRO_FERMO);
     audioRiposo();
 
     // Spegnere l'immagine non spegne il circuito che alimenta il
@@ -5140,6 +5378,7 @@ static void controllaSveglie(const struct tm &t)
         allarmeUltimoMinuto = minuto;
         allarmeIndice = i;
         allarmeDalTimer = false;
+        nastroChiedi(NASTRO_FERMO);   // la sveglia ha la precedenza sul nastro
         vista = VISTA_ALLARME;
         vistaDaRidisegnare = true;
 
@@ -5174,6 +5413,7 @@ static void controllaTimer()
     timerResto = 0;
 
     allarmeDalTimer = true;
+    nastroChiedi(NASTRO_FERMO);
     vista = VISTA_ALLARME;
     vistaDaRidisegnare = true;
     daRidisegnare[SCHEDA_TIMER] = true;
@@ -5221,6 +5461,18 @@ static void gestisciTocco()
             timerSullAnello(tp.x, tp.y))
             timerRotazioneInizia(tp.x, tp.y);
 
+        // Sulla bobina sinistra del registratore, con un nastro da
+        // sentire, il dito prende la bobina.
+        nastroInPresa = false;
+        nastroInScratch = false;
+        if (schedaCorrente == SCHEDA_NASTRO && nastroLunghezza > 0 &&
+            nastroStato != NASTRO_REGISTRA &&
+            dentro(tp.x, tp.y, NASTRO_SX_CX, NASTRO_CY, NASTRO_R + 8))
+        {
+            nastroInPresa = true;
+            nastroAngoloPrec = atan2f((float)(tp.y - NASTRO_CY), (float)(tp.x - NASTRO_SX_CX));
+        }
+
         // Utile la prima volta: se lo scorrimento andasse storto,
         // qui si vede subito se le coordinate arrivano ruotate.
         Serial.printf("[touch] x=%d y=%d\n", tp.x, tp.y);
@@ -5236,6 +5488,37 @@ static void gestisciTocco()
     }
     else if (tp.premuto && ditoGiu)
     {
+        if (nastroInPresa)
+        {
+            if (abs(tp.x - ditoPartenzaX) > 8 || abs(tp.y - tapY) > 8)
+                eraTap = false;
+            if (eraTap) return;
+
+            if (!nastroInScratch)
+            {
+                nastroInScratch = true;
+                nastroScratchInizia();
+            }
+
+            float a = atan2f((float)(tp.y - NASTRO_CY), (float)(tp.x - NASTRO_SX_CX));
+            float passo = a - nastroAngoloPrec;
+            if (passo > (float)M_PI) passo -= 2.0f * (float)M_PI;
+            else if (passo < -(float)M_PI) passo += 2.0f * (float)M_PI;
+            nastroAngoloPrec = a;
+            nastroScratchMuovi(passo / (2.0f * (float)M_PI));
+
+            // Con il dito giu' il ciclo principale non ridisegna: lo si
+            // fa qui, a venti fotogrammi al secondo.
+            static uint32_t prossimoFotogramma = 0;
+            if ((int32_t)(millis() - prossimoFotogramma) >= 0)
+            {
+                prossimoFotogramma = millis() + 50;
+                ridisegna(SCHEDA_NASTRO);
+                componi();
+            }
+            return;
+        }
+
         if (timerInRotazione)
         {
             // Il dito sta caricando il quadrante: le schede non si
@@ -5291,6 +5574,19 @@ static void gestisciTocco()
     else if (!tp.premuto && ditoGiu)
     {
         ditoGiu = false;
+
+        if (nastroInPresa)
+        {
+            nastroInPresa = false;
+            if (nastroInScratch)
+            {
+                nastroInScratch = false;
+                nastroScratchFine();
+                daRidisegnare[SCHEDA_NASTRO] = true;
+                return;
+            }
+            // Se non si e' mosso e' un tocco sulla bobina: avvia o ferma.
+        }
 
         if (timerInRotazione)
         {
@@ -5408,6 +5704,143 @@ static void gestisciSecondoPulsante()
     }
 
     precedente = ora;
+}
+
+// Comandi dal seriale, per provare il registratore senza toccare lo
+// schermo: r registra, s ferma, p suona, l dice a che punto e'. Il
+// livello si stampa da solo mentre registra, cosi' si vede dal
+// computer se il microfono sente.
+static void gestisciSeriale()
+{
+    // Una riga che comincia con 'w' scrive un registro del codec:
+    // "w 0E 00". Con 'x' si leggono tutti i primi. Serve a trovare i
+    // valori giusti dell'ingresso senza ricompilare a ogni prova.
+    static char riga[24];
+    static int nRiga = 0;
+
+    while (Serial.available())
+    {
+        char c = (char)Serial.read();
+
+        if (nRiga > 0 || c == 'w' || c == 'x' || c == 'a' || c == 'A' || c == 'i' || c == 'j')
+        {
+            if (c == '\n' || c == '\r' || nRiga >= (int)sizeof(riga) - 1)
+            {
+                riga[nRiga] = '\0';
+                unsigned reg, val;
+                if (riga[0] == 'w' && sscanf(riga + 1, "%x %x", &reg, &val) == 2)
+                {
+                    esScrivi((uint8_t)reg, (uint8_t)val);
+                    Serial.printf("[nastro] reg %02X <- %02X (riletto %02X)\n", reg, val, esLeggi((uint8_t)reg));
+                }
+                // Lo stesso per il gestore di alimentazione: "a 90 FF"
+                // scrive un registro dell'AXP2101, "A" legge quelli dei
+                // regolatori. Serve a scoprire quale rail alimenta il
+                // microfono.
+                else if (riga[0] == 'a' && sscanf(riga + 1, "%x %x", &reg, &val) == 2)
+                {
+                    axpScrivi((uint8_t)reg, (uint8_t)val);
+                    Serial.printf("[axp] reg %02X <- %02X (riletto %02X)\n", reg, val, axpLeggi((uint8_t)reg));
+                }
+                else if (riga[0] == 'A')
+                {
+                    Serial.print("[axp] registri:");
+                    for (int r = 0x80; r <= 0x9A; ++r) Serial.printf(" %02X=%02X", r, axpLeggi((uint8_t)r));
+                    Serial.println();
+                }
+                // E per qualunque chip sul bus: "i 20 01 FF" scrive,
+                // "j 20 01" legge. L'expander TCA9554 sta a 0x20.
+                else if ((riga[0] == 'i' || riga[0] == 'j'))
+                {
+                    unsigned ind;
+                    int n = sscanf(riga + 1, "%x %x %x", &ind, &reg, &val);
+                    if (riga[0] == 'i' && n == 3)
+                    {
+                        Wire.beginTransmission((uint8_t)ind);
+                        Wire.write((uint8_t)reg);
+                        Wire.write((uint8_t)val);
+                        Wire.endTransmission();
+                    }
+                    if (n >= 2)
+                    {
+                        Wire.beginTransmission((uint8_t)ind);
+                        Wire.write((uint8_t)reg);
+                        Wire.endTransmission(false);
+                        int letto = -1;
+                        if (Wire.requestFrom((uint8_t)ind, (uint8_t)1) == 1) letto = Wire.read();
+                        Serial.printf("[i2c] %02X reg %02X = %02X\n", ind, reg, letto);
+                    }
+                }
+                else if (riga[0] == 'x')
+                {
+                    Serial.print("[nastro] registri:");
+                    for (int r = 0; r <= 0x1F; ++r) Serial.printf(" %02X=%02X", r, esLeggi((uint8_t)r));
+                    Serial.printf(" 44=%02X 45=%02X\n", esLeggi(0x44), esLeggi(0x45));
+                }
+                nRiga = 0;
+            }
+            else
+                riga[nRiga++] = c;
+            continue;
+        }
+
+        switch (c)
+        {
+        case 'r': nastroChiedi(NASTRO_REGISTRA); Serial.println("[nastro] registro"); break;
+        case 's': nastroChiedi(NASTRO_FERMO);    Serial.println("[nastro] fermo");    break;
+        case 'p': nastroChiedi(NASTRO_SUONA);    Serial.println("[nastro] suono");    break;
+        // Un nastro di prova: due secondi di la a 440 Hz, senza
+        // microfono. Serve a provare l'uscita e il ritorno digitale.
+        case 'k':
+            if (nastro && nastroStato == NASTRO_FERMO)
+            {
+                for (uint32_t i = 0; i < 2 * AUDIO_RATE; ++i)
+                    nastro[i] = (int16_t)(sinf(2.0f * (float)M_PI * 440.0f * i / AUDIO_RATE) * 9000.0f);
+                nastroLunghezza = 2 * AUDIO_RATE;
+                nastroPosizione = 0;
+                Serial.println("[nastro] nastro di prova: 2 s di 440 Hz");
+            }
+            break;
+        case 'l':
+            Serial.printf("[nastro] stato %u, %lu campioni, pos %.0f, livello %.5f/%.5f, grezzi c0 %d..%d c1 %d..%d\n",
+                          (unsigned)nastroStato, (unsigned long)nastroLunghezza,
+                          nastroPosizione, nastroLivello, nastroLivelloAltro,
+                          nastroMin0, nastroMax0, nastroMin1, nastroMax1);
+            break;
+        // La linea dati dal codec si muove? Si legge il piedino a raffica
+        // per venti millesimi e si contano i cambi: una linea ferma e'
+        // un codec che non manda niente, o il piedino sbagliato.
+        case 't':
+        {
+            const int pin[] = {AUDIO_DIN, AUDIO_DOUT, AUDIO_WS, AUDIO_BCLK};
+            for (int k = 0; k < 4; ++k)
+            {
+                uint32_t cambi = 0;
+                int prec = digitalRead(pin[k]);
+                uint32_t fine = micros() + 20000;
+                while ((int32_t)(micros() - fine) < 0)
+                {
+                    int ora = digitalRead(pin[k]);
+                    if (ora != prec) { ++cambi; prec = ora; }
+                }
+                Serial.printf("[nastro] gpio %d: %lu cambi in 20 ms\n", pin[k], (unsigned long)cambi);
+            }
+            break;
+        }
+        default: break;
+        }
+    }
+
+    static uint32_t prossimoLivello = 0;
+    static uint32_t byteVisti = 0;
+    if (nastroStato == NASTRO_REGISTRA && (int32_t)(millis() - prossimoLivello) >= 0)
+    {
+        prossimoLivello = millis() + 500;
+        Serial.printf("[nastro] %.1f s, livello %.4f (altro canale %.4f), %lu byte/0.5s, errori %lu\n",
+                      (float)nastroLunghezza / AUDIO_RATE, nastroLivello, nastroLivelloAltro,
+                      (unsigned long)(nastroByteLetti - byteVisti), (unsigned long)nastroErroriLettura);
+        byteVisti = nastroByteLetti;
+    }
 }
 
 static void gestisciPulsante()
@@ -5640,6 +6073,19 @@ void setup()
         Serial.printf("[axp] corrente di carica impostata: %d mA\n", mA);
     }
 
+    // Il rail analogico dell'audio, A3V3, e' l'uscita ALDO1 del gestore
+    // di alimentazione, e all'accensione e' spento. L'altoparlante
+    // suona lo stesso - il suo stadio finale prende corrente altrove -
+    // ma il microfono e il preamplificatore del codec no: senza
+    // questo rail il convertitore d'ingresso produce un piatto
+    // silenzio digitale, e ci sono volute tre ore e lo schema
+    // elettrico per capirlo. Tre virgola tre volt, e acceso prima del
+    // codec: il codec inizializza le sue polarizzazioni all'avvio, e
+    // deve trovarle alimentate.
+    axpScrivi(0x92, 0x1C);                    // ALDO1: 0,5 V + 28 x 0,1 V = 3,3 V
+    axpScrivi(0x90, axpLeggi(0x90) | 0x01);   // ALDO1 acceso
+    delay(30);
+
     ldoNormali = axpLeggi(0x90);
     Serial.printf("[axp] regolatori secondari: 0x%02X\n", ldoNormali);
 
@@ -5647,6 +6093,7 @@ void setup()
     Serial.printf("[sveglie] %d salvate, %d attive\n", nSveglie, sveglieAttive());
 
     audioBegin();
+    nastroBegin();
     imuPronto = imuBegin();
 
     // Schermata di attesa: la rete puo' prendersi qualche secondo
@@ -5768,6 +6215,9 @@ void loop()
     // l'aggancio e' a meta': sarebbe spegnere la radio proprio mentre
     // qualcuno ci sta parlando.
     bool reteAlLavoro = (vista == VISTA_RETI && (retePortaleAperto() || reteVoluta[0]));
+    // Ne' mentre il nastro gira: registrare o ascoltare e' attivita'
+    // anche se il dito sta fermo.
+    if (nastroInMoto()) ultimaAttivita = millis();
     if (!alimentato && vista != VISTA_ALLARME && !reteAlLavoro &&
         (millis() - ultimaAttivita) > SPEGNIMENTO_AUTO)
     {
@@ -5995,6 +6445,24 @@ void loop()
         }
     }
 
+    // Il registratore: finche' il nastro gira - o si sta salvando -
+    // venti fotogrammi al secondo, e comunque a ogni cambio di stato.
+    {
+        static uint32_t nastroVersioneVista = 0;
+        static uint32_t prossimoFotogramma = 0;
+        if (nastroVersione != nastroVersioneVista)
+        {
+            nastroVersioneVista = nastroVersione;
+            daRidisegnare[SCHEDA_NASTRO] = true;
+        }
+        if (schedaCorrente == SCHEDA_NASTRO && (nastroInMoto() || nastroSalvando) &&
+            (int32_t)(millis() - prossimoFotogramma) >= 0)
+        {
+            prossimoFotogramma = millis() + 50;
+            daRidisegnare[SCHEDA_NASTRO] = true;
+        }
+    }
+
     if (daRidisegnare[schedaCorrente] || numeriInMovimento)
     {
         numeriInMovimento = false;
@@ -6011,15 +6479,18 @@ void loop()
         ultimoSecondoInvolucro = t.tm_sec;
         componi();
     }
+#if PALLINI
     if (fabsf(palliniOpacita() - palliniOpacitaDisegnata) > 0.02f)
     {
         // I pallini si stanno spegnendo: basta ricomporre, le schede
         // sono gia' pronte e non serve ridisegnare niente.
         componi();
     }
+#endif
 
     gestisciPulsante();
     gestisciSecondoPulsante();
+    gestisciSeriale();
 
     delay(5);
 }

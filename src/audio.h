@@ -46,7 +46,7 @@
 #define AUDIO_BCLK 9
 #define AUDIO_WS 45
 #define AUDIO_DOUT 8    // dall'ESP32 al codec
-#define AUDIO_DIN 10    // dal codec all'ESP32, qui non serve
+#define AUDIO_DIN 10    // dal codec all'ESP32: il microfono
 #define AUDIO_PA 46     // accende l'amplificatore di potenza
 
 #define AUDIO_RATE 16000
@@ -75,6 +75,25 @@ static uint8_t esLeggi(uint8_t reg)
 // al risveglio: il codec resta senza corrente e dimentica tutto, ma
 // il bus e' del processore e non si e' mosso - reinstallarlo darebbe
 // errore.
+// L'ingresso: il microfono analogico sul primo ingresso, con il
+// preamplificatore a trenta decibel - un microfono MEMS da' pochi
+// millivolt - piu' diciotto di scala del convertitore, e il filtro
+// che toglie il soffio sotto i cento hertz. Sono i valori dell'esempio
+// del costruttore per questa board. Si scrivono sia all'avvio sia
+// quando il codec viene riconfigurato da capo.
+//
+// Tutto questo non serve a niente se il rail analogico A3V3 e' spento:
+// e' l'uscita ALDO1 del gestore di alimentazione, e lo accende main.cpp
+// prima di chiamare audioBegin.
+static void audioMicrofono()
+{
+    esScrivi(0x14, 0x1A);   // ingresso MIC1, preamplificatore a +30 dB
+    esScrivi(0x16, 0x03);   // scala del convertitore: +18 dB
+    esScrivi(0x17, 0xC8);   // volume digitale dell'ingresso: +4,5 dB
+    esScrivi(0x1B, 0x0A);   // filtro passa-alto
+    esScrivi(0x1C, 0x6A);
+}
+
 static void audioRiconfigura()
 {
     esScrivi(0x00, 0x1F);
@@ -97,6 +116,7 @@ static void audioRiconfigura()
     esScrivi(0x13, 0x10);
     esScrivi(0x32, 0xC0);
     esScrivi(0x37, 0x08);
+    audioMicrofono();
 }
 
 static bool audioBegin()
@@ -142,9 +162,12 @@ static bool audioBegin()
     esScrivi(0x13, 0x10);   // manda l'uscita all'amplificatore
     esScrivi(0x32, 0xC0);   // volume del convertitore
     esScrivi(0x37, 0x08);   // quanto e' morbida la rampa del volume
+    audioMicrofono();
 
     i2s_config_t cfg = {};
-    cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+    // In tutti e due i versi: il suono esce e la voce entra sullo
+    // stesso bus, con lo stesso orologio.
+    cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX);
     cfg.sample_rate = AUDIO_RATE;
     cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
     cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
@@ -167,7 +190,7 @@ static bool audioBegin()
     pin.bck_io_num = AUDIO_BCLK;
     pin.ws_io_num = AUDIO_WS;
     pin.data_out_num = AUDIO_DOUT;
-    pin.data_in_num = I2S_PIN_NO_CHANGE;
+    pin.data_in_num = AUDIO_DIN;
 
     if (i2s_set_pin(I2S_NUM_0, &pin) != ESP_OK)
     {
@@ -242,7 +265,6 @@ static void audioFerma()
 {
     if (!audioPronto) return;
     digitalWrite(AUDIO_PA, LOW);
-    i2s_zero_dma_buffer(I2S_NUM_0);
 }
 
 // Da chiamare spesso mentre suona: prepara il pezzo successivo e lo

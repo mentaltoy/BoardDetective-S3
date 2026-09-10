@@ -252,6 +252,13 @@ static void reteRaccogliScansione(int n)
         while (k >= 0 && reteViste[k].rssi < v.rssi) { reteViste[k + 1] = reteViste[k]; --k; }
         reteViste[k + 1] = v;
     }
+
+    // Sul seriale, per nome: quando una rete "non si vede" e' l'unico
+    // modo di sapere se e' la radio a non vederla o il telefono a non
+    // trasmetterla.
+    for (int i = 0; i < nReteViste; ++i)
+        Serial.printf("[rete]   %4d  %s%s\n", reteViste[i].rssi, reteViste[i].ssid,
+                      reteIndiceNota(reteViste[i].ssid) >= 0 ? "  (conosciuta)" : "");
 }
 
 static bool reteScansiona()
