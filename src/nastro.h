@@ -53,6 +53,7 @@
 #include <Arduino.h>
 #include <driver/i2s.h>
 #include <LittleFS.h>
+#include <Preferences.h>
 #include <math.h>
 
 #define NASTRO_SECONDI 60
@@ -91,7 +92,47 @@ static volatile int16_t nastroMin0 = 0, nastroMax0 = 0, nastroMin1 = 0, nastroMa
 static volatile uint32_t nastroVersione = 0;   // cresce a ogni cambio di stato
 static volatile bool nastroDaSalvare = false;
 static volatile bool nastroSalvando = false;
+static volatile bool nastroDaCancellare = false;
 static bool nastroRiprendi = false;   // dopo lo scratch si torna a suonare?
+
+// Il volume dell'ascolto, a tacche: si applica ai campioni prima di
+// mandarli fuori, cosi' la sveglia non ne sa niente. Resta in memoria.
+#define NASTRO_VOLUME_PASSI 10
+static volatile int nastroVolume = 7;
+static Preferences prefsNastro;
+
+static void nastroVolumeCarica()
+{
+    if (!prefsNastro.begin("nastro", true))
+    {
+        if (prefsNastro.begin("nastro", false)) prefsNastro.end();
+        return;
+    }
+    nastroVolume = prefsNastro.getInt("vol", 7);
+    prefsNastro.end();
+    if (nastroVolume < 0) nastroVolume = 0;
+    if (nastroVolume > NASTRO_VOLUME_PASSI) nastroVolume = NASTRO_VOLUME_PASSI;
+}
+
+static void nastroVolumeImposta(int passi)
+{
+    if (passi < 0) passi = 0;
+    if (passi > NASTRO_VOLUME_PASSI) passi = NASTRO_VOLUME_PASSI;
+    if (passi == nastroVolume) return;
+    nastroVolume = passi;
+    if (prefsNastro.begin("nastro", false))
+    {
+        prefsNastro.putInt("vol", passi);
+        prefsNastro.end();
+    }
+}
+
+// Butta via la nota: la memoria, e il file. Lo fa il compito, da
+// fermo, per non tirare via il nastro da sotto la testina.
+static void nastroCancella()
+{
+    nastroDaCancellare = true;
+}
 
 static void nastroSalva()
 {
@@ -251,6 +292,7 @@ static void nastroTask(void *)
             float pos = nastroPosizione;
             const float fine = (float)nastroLunghezza - 1.0f;
             float energia = 0;
+            const float volume = (float)nastroVolume / (float)NASTRO_VOLUME_PASSI;
 
             for (int i = 0; i < AUDIO_BLOCCO; ++i)
             {
@@ -259,7 +301,7 @@ static void nastroTask(void *)
                 {
                     uint32_t i0 = (uint32_t)pos;
                     float f = pos - (float)i0;
-                    c = (int16_t)((float)nastro[i0] * (1.0f - f) + (float)nastro[i0 + 1] * f);
+                    c = (int16_t)(((float)nastro[i0] * (1.0f - f) + (float)nastro[i0 + 1] * f) * volume);
                 }
                 blocco[i * 2] = c;
                 blocco[i * 2 + 1] = c;
@@ -289,6 +331,16 @@ static void nastroTask(void *)
         }
 
         default:
+            if (nastroDaCancellare)
+            {
+                nastroDaCancellare = false;
+                nastroDaSalvare = false;
+                nastroLunghezza = 0;
+                nastroPosizione = 0;
+                LittleFS.remove(NASTRO_FILE);
+                ++nastroVersione;
+                Serial.println("[nastro] cancellato");
+            }
             if (nastroDaSalvare)
             {
                 nastroDaSalvare = false;
@@ -391,6 +443,7 @@ static void nastroBegin()
     // compito parta: cosi' non se la contende con la mappa, che la
     // monta anche lei e la trova gia' pronta.
     LittleFS.begin(true);
+    nastroVolumeCarica();
 
     xTaskCreatePinnedToCore(nastroTask, "nastro", 8192, nullptr, 2, nullptr, 0);
     Serial.printf("[nastro] pronto: fino a %d secondi\n", NASTRO_SECONDI);

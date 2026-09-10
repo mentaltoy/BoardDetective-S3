@@ -310,7 +310,8 @@ enum Vista
     VISTA_EDITOR,     // imposta un orario
     VISTA_ALLARME,    // sta suonando
     VISTA_GIRI,       // l'elenco dei giri del cronografo
-    VISTA_RETI        // le reti WiFi intorno
+    VISTA_RETI,       // le reti WiFi intorno
+    VISTA_NASTRO_OPZIONI   // volume e cestino del registratore
 };
 
 static Vista vista = VISTA_SCHEDE;
@@ -2417,6 +2418,7 @@ static void disegnaTimer(Arduino_GFX *g)
 #define NASTRO_ANELLO_CX 96
 #define NASTRO_ANELLO_CY 366
 #define NASTRO_ANELLO_R 36
+#define NASTRO_RUOTA_PRESA (NASTRO_ANELLO_R + 18)   // quanto vicino alla ruota deve cadere il dito
 #define NASTRO_PASSO_PUNTI 7    // fra un punto e l'altro lungo il nastro
 #define NASTRO_PIXEL_AL_SECONDO 40   // quanto corre il nastro a schermo
 
@@ -2449,63 +2451,95 @@ static void disegnaNastro(Arduino_GFX *g)
 
     bool lampo = ((millis() / 420) % 2) == 0;
     uint8_t stato = nastroStato;
-    float giri = nastroGiri();
-    float th = giri * 2.0f * (float)M_PI;
+    float th = nastroGiri() * 2.0f * (float)M_PI;
 
-    // ---- il nastro: dalla bobina sinistra al motore, intorno al
-    //      motore, e su fino alla bobina destra ----
-    float ax, ay, bx, by, aA;   // sinistra -> motore
-    float cx, cy, dx, dy, aC;   // motore -> destra
-    nastroTangente(NASTRO_SX_CX, NASTRO_CY, NASTRO_R, NASTRO_MOTORE_X, NASTRO_MOTORE_Y, NASTRO_MOTORE_R,
+    // ---- il nastro: un anello chiuso che avvolge le due bobine, scende
+    //      al motore e risale. Corre appena fuori dal bordo delle bobine,
+    //      cosi' si vede che le avvolge invece di confondersi con il
+    //      loro contorno ----
+    const float rb = NASTRO_R + 5;            // il nastro sulle bobine
+    const float rm = NASTRO_MOTORE_R + 5;     // il nastro sul motore
+
+    float ax, ay, bx, by, aA;   // bobina sinistra -> motore
+    float cx, cy, dx, dy, aC;   // motore -> bobina destra
+    nastroTangente(NASTRO_SX_CX, NASTRO_CY, rb, NASTRO_MOTORE_X, NASTRO_MOTORE_Y, rm,
                    +1, ax, ay, bx, by, aA);
-    nastroTangente(NASTRO_DX_CX, NASTRO_CY, NASTRO_R, NASTRO_MOTORE_X, NASTRO_MOTORE_Y, NASTRO_MOTORE_R,
+    nastroTangente(NASTRO_DX_CX, NASTRO_CY, rb, NASTRO_MOTORE_X, NASTRO_MOTORE_Y, rm,
                    -1, dx, dy, cx, cy, aC);
-    // Intorno al motore si passa dal lato di fuori: dall'angolo di
-    // arrivo si scende fino a quello di partenza.
-    if (aC > aA) aC -= 2.0f * (float)M_PI;
+    if (aC > aA) aC -= 2.0f * (float)M_PI;   // intorno al motore dal lato di fuori
+    const float alto = -(float)M_PI_2;        // le dodici, dove il nastro passa sopra
+    const float aAsx = aA - 2.0f * (float)M_PI;   // lo stesso punto di A, contato scendendo dal lato sinistro
 
-    float l1 = sqrtf((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
-    float l2 = NASTRO_MOTORE_R * (aA - aC);
-    float l3 = sqrtf((dx - cx) * (dx - cx) + (dy - cy) * (dy - cy));
-    float totale = l1 + l2 + l3;
+    // I sei tratti, nell'ordine in cui il nastro li percorre: giu' dal
+    // lato sinistro della prima bobina, al motore, intorno al motore,
+    // su alla seconda bobina, sopra la seconda bobina fino alle dodici,
+    // e il pezzo orizzontale di ritorno sopra tutte e due.
+    const float l1 = rb * (alto - aAsx);
+    const float l2 = sqrtf((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
+    const float l3 = rm * (aA - aC);
+    const float l4 = sqrtf((dx - cx) * (dx - cx) + (dy - cy) * (dy - cy));
+    const float l5 = rb * (aC - alto);
+    const float l6 = (float)(NASTRO_DX_CX - NASTRO_SX_CX);
+    const float totale = l1 + l2 + l3 + l4 + l5 + l6;
 
-    // I punti scorrono con il nastro: la fase e' la posizione nel
-    // nastro tradotta in pixel, e ricomincia a ogni passo.
+    // Quanto nastro e' occupato: quella parte dell'anello e' rossa,
+    // dall'inizio. Con la fase che scorre i punti ci passano
+    // attraverso, e la zona rossa resta ferma: e' il nastro pieno.
+    const float pieno = totale * (float)nastroLunghezza / (float)NASTRO_MAX;
+
     float fase = fmodf(nastroPosizione / (float)AUDIO_RATE * NASTRO_PIXEL_AL_SECONDO,
                        (float)NASTRO_PASSO_PUNTI);
     if (fase < 0) fase += NASTRO_PASSO_PUNTI;
 
     for (float s = fase; s < totale; s += NASTRO_PASSO_PUNTI)
     {
-        float px, py;
-        if (s < l1)
+        float px, py, t = s;
+        if (t < l1)
         {
-            float f = s / l1;
-            px = ax + (bx - ax) * f;
-            py = ay + (by - ay) * f;
+            float a = alto - t / rb;
+            px = NASTRO_SX_CX + rb * cosf(a); py = NASTRO_CY + rb * sinf(a);
         }
-        else if (s < l1 + l2)
+        else if ((t -= l1) < l2)
         {
-            float a = aA - (s - l1) / NASTRO_MOTORE_R;
-            px = NASTRO_MOTORE_X + NASTRO_MOTORE_R * cosf(a);
-            py = NASTRO_MOTORE_Y + NASTRO_MOTORE_R * sinf(a);
+            float f = t / l2;
+            px = ax + (bx - ax) * f; py = ay + (by - ay) * f;
+        }
+        else if ((t -= l2) < l3)
+        {
+            float a = aA - t / rm;
+            px = NASTRO_MOTORE_X + rm * cosf(a); py = NASTRO_MOTORE_Y + rm * sinf(a);
+        }
+        else if ((t -= l3) < l4)
+        {
+            float f = t / l4;
+            px = cx + (dx - cx) * f; py = cy + (dy - cy) * f;
+        }
+        else if ((t -= l4) < l5)
+        {
+            float a = aC - t / rb;
+            px = NASTRO_DX_CX + rb * cosf(a); py = NASTRO_CY + rb * sinf(a);
         }
         else
         {
-            float f = (s - l1 - l2) / l3;
-            px = cx + (dx - cx) * f;
-            py = cy + (dy - cy) * f;
+            t -= l5;
+            px = NASTRO_DX_CX - t; py = NASTRO_CY - rb;
         }
-        dmDot(g, (int16_t)lroundf(px), (int16_t)lroundf(py), 3, COL_SECONDARIO);
+        dmDot(g, (int16_t)lroundf(px), (int16_t)lroundf(py), 3,
+              s < pieno ? COL_ROSSO : COL_SECONDARIO);
     }
 
     // ---- le bobine ----
     nastroCerchio(g, NASTRO_SX_CX, NASTRO_CY, NASTRO_R, COL_ACCESO);
     nastroCerchio(g, NASTRO_DX_CX, NASTRO_CY, NASTRO_R, COL_ACCESO);
+
+    // La destra e' il tasto di registrazione: il suo mozzo si riempie
+    // di rosso mentre registra, e lampeggia insieme alla spia.
+    if (stato == NASTRO_REGISTRA)
+        g->fillCircle(NASTRO_DX_CX, NASTRO_CY, 24, lampo ? COL_ROSSO : COL_SPENTO);
     nastroCerchio(g, NASTRO_DX_CX, NASTRO_CY, 24, COL_ACCESO);
 
-    // I raggi di quella sinistra girano con il nastro: e' quella che
-    // si prende in mano.
+    // I raggi della sinistra girano con il nastro. E' decorativa: gira
+    // perche' il nastro gira, non si prende in mano.
     const float L = 34.0f;
     for (int k = 0; k < 4; ++k)
     {
@@ -2514,19 +2548,16 @@ static void disegnaNastro(Arduino_GFX *g)
         int16_t x0 = NASTRO_SX_CX - (int16_t)lroundf(co * L), y0 = NASTRO_CY - (int16_t)lroundf(si * L);
         int16_t x1 = NASTRO_SX_CX + (int16_t)lroundf(co * L), y1 = NASTRO_CY + (int16_t)lroundf(si * L);
         g->drawLine(x0, y0, x1, y1, COL_ACCESO);
-        // Un secondo tratto accanto: a un pixel la linea sparisce
-        // sull'AMOLED, a due si vede.
         if (fabsf(co) > fabsf(si)) g->drawLine(x0, y0 + 1, x1, y1 + 1, COL_ACCESO);
         else g->drawLine(x0 + 1, y0, x1 + 1, y1, COL_ACCESO);
     }
 
     // ---- la spia: rossa e lampeggiante mentre registra ----
-    if (stato == NASTRO_REGISTRA)
-        g->fillCircle(NASTRO_SPIA_X, NASTRO_SPIA_Y, 7, lampo ? COL_ROSSO : COL_SPENTO);
-    else
-        g->fillCircle(NASTRO_SPIA_X, NASTRO_SPIA_Y, 7, COL_SPENTO);
+    g->fillCircle(NASTRO_SPIA_X, NASTRO_SPIA_Y, 7,
+                  (stato == NASTRO_REGISTRA && lampo) ? COL_ROSSO : COL_SPENTO);
 
-    // ---- il motore: un disco pieno con l'ingranaggio, che gira ----
+    // ---- il motore: il disco con l'ingranaggio, che gira. Toccarlo
+    //      apre le impostazioni ----
     g->fillCircle(NASTRO_MOTORE_X, NASTRO_MOTORE_Y, NASTRO_MOTORE_R, COL_ACCESO);
     g->fillCircle(NASTRO_MOTORE_X, NASTRO_MOTORE_Y, 9, COL_SFONDO);
     for (int k = 0; k < 8; ++k)
@@ -2537,55 +2568,94 @@ static void disegnaNastro(Arduino_GFX *g)
     }
     g->fillCircle(NASTRO_MOTORE_X, NASTRO_MOTORE_Y, 3, COL_ACCESO);
 
-    // ---- l'anello dei dodici punti ----
-    int accesi;
+    // ---- la ruota: dodici punti che girano con il nastro, con uno
+    //      pieno per vederla girare. E' quella che si prende con il
+    //      dito per lo scratch. Mentre registra i punti si riempiono
+    //      con il livello del microfono ----
+    int accesi = 1;
     if (stato == NASTRO_REGISTRA)
     {
-        // Il livello, in decibel e non in ampiezza: l'orecchio ragiona
-        // cosi', e un indicatore lineare starebbe fermo a un punto per
-        // tutto il parlato e schizzerebbe a dodici solo urlando. Da
-        // -50 dB, dove c'e' solo il fondo, a zero.
+        // In decibel: l'orecchio ragiona cosi'. Da -50 dB, dove c'e'
+        // solo il fondo, a zero.
         float db = 20.0f * log10f(nastroLivello + 1e-6f);
         float v = (db + 50.0f) / 50.0f;
         if (v < 0.0f) v = 0.0f;
         if (v > 1.0f) v = 1.0f;
         accesi = (int)lroundf(v * 12.0f);
     }
-    else if (nastroLunghezza > 0)
-        accesi = (int)lroundf(nastroPosizione / (float)nastroLunghezza * 12.0f);
-    else
-        accesi = 0;
-
     for (int k = 0; k < 12; ++k)
     {
-        float a = (k * 30.0f - 90.0f) * (float)M_PI / 180.0f;
+        float a = th + (k * 30.0f - 90.0f) * (float)M_PI / 180.0f;
         int16_t px = NASTRO_ANELLO_CX + (int16_t)lroundf(cosf(a) * NASTRO_ANELLO_R);
         int16_t py = NASTRO_ANELLO_CY + (int16_t)lroundf(sinf(a) * NASTRO_ANELLO_R);
         if (k < accesi) g->fillCircle(px, py, 4, COL_ACCESO);
-        else g->drawCircle(px, py, 4, COL_SPENTO);
+        else g->drawCircle(px, py, 4, COL_SECONDARIO);
     }
 
-    // ---- i secondi, fra l'anello e il motore ----
+    // ---- sopra le bobine, nella fascia libera sotto l'etichetta: i
+    //      secondi, o cosa fare se non c'e' niente ----
     char buf[24];
-    if (nastroLunghezza > 0 || stato == NASTRO_REGISTRA)
+    if (nastroSalvando)
+        dmTextCentered(g, LCD_W / 2, 74, "SALVO", 2, 2, COL_ETICHETTA, 2);
+    else if (stato == NASTRO_REGISTRA)
+    {
+        uint32_t lun = nastroLunghezza / AUDIO_RATE;
+        snprintf(buf, sizeof(buf), "%lu:%02lu", (unsigned long)(lun / 60), (unsigned long)(lun % 60));
+        dmTextCentered(g, LCD_W / 2, 74, buf, 2, 2, COL_ROSSO, 1);
+    }
+    else if (nastroLunghezza > 0)
     {
         uint32_t pos = (uint32_t)(nastroPosizione / AUDIO_RATE);
         uint32_t lun = nastroLunghezza / AUDIO_RATE;
-        if (stato == NASTRO_REGISTRA)
-            snprintf(buf, sizeof(buf), "%lu:%02lu", (unsigned long)(lun / 60), (unsigned long)(lun % 60));
-        else
-            snprintf(buf, sizeof(buf), "%lu:%02lu / %lu:%02lu",
-                     (unsigned long)(pos / 60), (unsigned long)(pos % 60),
-                     (unsigned long)(lun / 60), (unsigned long)(lun % 60));
-        dmTextCentered(g, 212, 358, buf, 2, 2,
+        snprintf(buf, sizeof(buf), "%lu:%02lu / %lu:%02lu",
+                 (unsigned long)(pos / 60), (unsigned long)(pos % 60),
+                 (unsigned long)(lun / 60), (unsigned long)(lun % 60));
+        dmTextCentered(g, LCD_W / 2, 74, buf, 2, 2,
                        stato == NASTRO_FERMO ? COL_SECONDARIO : COL_ACCESO, 1);
     }
-
-    if (nastroSalvando)
-        dmTextCentered(g, LCD_W / 2, 262, "SALVO", 2, 2, COL_ETICHETTA, 2);
-    else if (nastroLunghezza == 0 && stato != NASTRO_REGISTRA)
-        dmTextCentered(g, LCD_W / 2, 262, "TOCCA IL PUNTO ROSSO", 2, 2, COL_ETICHETTA, 2);
+    else
+        dmTextCentered(g, LCD_W / 2, 74, "BOBINA DESTRA: REGISTRA", 2, 2, COL_ETICHETTA, 1);
 }
+
+// ------------------------------------------------------------
+//  SCHERMATA: LE IMPOSTAZIONI DEL REGISTRATORE
+// ------------------------------------------------------------
+//  Si apre dal motore. Per ora due cose: il volume dell'ascolto e il
+//  cestino per la nota.
+
+#define OPZ_VOLUME_Y 176
+#define OPZ_CESTINO_Y 296
+
+static void disegnaNastroOpzioni(Arduino_GFX *g)
+{
+    telaio(g, "REGISTRATORE", ETICHETTA_PIENA);
+    disegnaGriglia(g, LCD_W - PADDING - MEZZA_ICONA, PADDING + 8, ICO_CHIUDI,
+                   ICONA_COMANDO, 4, 3, COL_SECONDARIO);
+
+    testoCentrato(g, 128, "VOLUME", 2, 2, COL_ETICHETTA, 2);
+
+    disegnaGriglia(g, PADDING + MEZZA_ICONA, OPZ_VOLUME_Y, ICO_MENO, ICONA_COMANDO, 4, 3,
+                   nastroVolume > 0 ? COL_SECONDARIO : COL_SPENTO);
+    disegnaGriglia(g, LCD_W - PADDING - MEZZA_ICONA, OPZ_VOLUME_Y, ICO_PIU, ICONA_COMANDO, 4, 3,
+                   nastroVolume < NASTRO_VOLUME_PASSI ? COL_SECONDARIO : COL_SPENTO);
+
+    // Dieci tacche fra il meno e il piu', piene fino al volume.
+    const int16_t x0 = PADDING + MEZZA_ICONA + 40;
+    const int16_t x1 = LCD_W - PADDING - MEZZA_ICONA - 40;
+    for (int k = 0; k < NASTRO_VOLUME_PASSI; ++k)
+    {
+        int16_t x = x0 + (x1 - x0) * k / (NASTRO_VOLUME_PASSI - 1);
+        if (k < nastroVolume) g->fillCircle(x, OPZ_VOLUME_Y, 4, COL_ACCESO);
+        else g->drawCircle(x, OPZ_VOLUME_Y, 4, COL_SPENTO);
+    }
+
+    // Il cestino: acceso solo se c'e' qualcosa da buttare.
+    uint16_t col = nastroLunghezza > 0 ? COL_ROSSO : COL_SPENTO;
+    disegnaGriglia(g, LCD_W / 2, OPZ_CESTINO_Y, ICO_CESTINO, ICONA_COMANDO, 5, 4, col);
+    testoCentrato(g, OPZ_CESTINO_Y + 36, "CANCELLA LA NOTA", 2, 2,
+                  nastroLunghezza > 0 ? COL_ETICHETTA : COL_SPENTO, 2);
+}
+
 
 // ------------------------------------------------------------
 //  SCHEDA: LA MAPPA
@@ -4885,16 +4955,23 @@ static void tapNelleSchede()
 
     if (schedaCorrente == SCHEDA_NASTRO)
     {
-        // Il punto rosso registra e smette. Il motore - e la bobina
-        // stessa, che e' il bersaglio grande - fanno partire e fermano
-        // l'ascolto.
-        if (dentro(tapX, tapY, NASTRO_SPIA_X, NASTRO_SPIA_Y, 30))
+        // La bobina destra - quella con il cerchio dentro - registra e
+        // smette. La ruota in basso fa partire e ferma l'ascolto, e si
+        // gira per lo scratch. Il motore apre le impostazioni. La
+        // bobina sinistra gira e basta.
+        if (dentro(tapX, tapY, NASTRO_DX_CX, NASTRO_CY, NASTRO_R + 6))
             nastroChiedi(nastroStato == NASTRO_REGISTRA ? NASTRO_FERMO : NASTRO_REGISTRA);
-        else if (dentro(tapX, tapY, NASTRO_MOTORE_X, NASTRO_MOTORE_Y, 30) ||
-                 dentro(tapX, tapY, NASTRO_SX_CX, NASTRO_CY, NASTRO_R + 8))
+        else if (dentro(tapX, tapY, NASTRO_ANELLO_CX, NASTRO_ANELLO_CY, NASTRO_RUOTA_PRESA))
         {
             if (nastroStato == NASTRO_REGISTRA) return;
             nastroChiedi(nastroInMoto() ? NASTRO_FERMO : NASTRO_SUONA);
+        }
+        else if (dentro(tapX, tapY, NASTRO_MOTORE_X, NASTRO_MOTORE_Y, 30))
+        {
+            if (nastroStato == NASTRO_REGISTRA) return;
+            vista = VISTA_NASTRO_OPZIONI;
+            vistaDaRidisegnare = true;
+            return;
         }
         else
             return;
@@ -5015,6 +5092,34 @@ static void tapNellaLista()
         }
         return;
     }
+}
+
+static void tapNelleOpzioniNastro()
+{
+    if (dentro(tapX, tapY, LCD_W - PADDING - MEZZA_ICONA, PADDING + 8, BERSAGLIO))
+    {
+        vista = VISTA_SCHEDE;
+        daRidisegnare[SCHEDA_NASTRO] = true;
+        componi();
+        return;
+    }
+
+    if (dentro(tapX, tapY, PADDING + MEZZA_ICONA, OPZ_VOLUME_Y, BERSAGLIO))
+        nastroVolumeImposta(nastroVolume - 1);
+    else if (dentro(tapX, tapY, LCD_W - PADDING - MEZZA_ICONA, OPZ_VOLUME_Y, BERSAGLIO))
+        nastroVolumeImposta(nastroVolume + 1);
+    else if (nastroLunghezza > 0 && dentro(tapX, tapY, LCD_W / 2, OPZ_CESTINO_Y + 12, 50))
+    {
+        nastroCancella();
+        vista = VISTA_SCHEDE;
+        daRidisegnare[SCHEDA_NASTRO] = true;
+        componi();
+        return;
+    }
+    else
+        return;
+
+    vistaDaRidisegnare = true;
 }
 
 static void tapNelleReti()
@@ -5152,6 +5257,7 @@ static void gestisciToccoModale()
         case VISTA_LISTA:  tapNellaLista(); break;
         case VISTA_EDITOR: tapNellEditor(); break;
         case VISTA_RETI:   tapNelleReti(); break;
+        case VISTA_NASTRO_OPZIONI: tapNelleOpzioniNastro(); break;
         default: break;
         }
     }
@@ -5176,6 +5282,7 @@ static void disegnaVista()
     case VISTA_EDITOR:  disegnaEditor(comp); break;
     case VISTA_ALLARME: disegnaAllarme(comp, t); break;
     case VISTA_RETI:    disegnaReti(comp); break;
+    case VISTA_NASTRO_OPZIONI: disegnaNastroOpzioni(comp); break;
     default: return;
     }
     comp->flush();
@@ -5461,16 +5568,16 @@ static void gestisciTocco()
             timerSullAnello(tp.x, tp.y))
             timerRotazioneInizia(tp.x, tp.y);
 
-        // Sulla bobina sinistra del registratore, con un nastro da
-        // sentire, il dito prende la bobina.
+        // Sulla ruota del registratore, con un nastro da sentire, il
+        // dito prende la ruota.
         nastroInPresa = false;
         nastroInScratch = false;
         if (schedaCorrente == SCHEDA_NASTRO && nastroLunghezza > 0 &&
             nastroStato != NASTRO_REGISTRA &&
-            dentro(tp.x, tp.y, NASTRO_SX_CX, NASTRO_CY, NASTRO_R + 8))
+            dentro(tp.x, tp.y, NASTRO_ANELLO_CX, NASTRO_ANELLO_CY, NASTRO_RUOTA_PRESA))
         {
             nastroInPresa = true;
-            nastroAngoloPrec = atan2f((float)(tp.y - NASTRO_CY), (float)(tp.x - NASTRO_SX_CX));
+            nastroAngoloPrec = atan2f((float)(tp.y - NASTRO_ANELLO_CY), (float)(tp.x - NASTRO_ANELLO_CX));
         }
 
         // Utile la prima volta: se lo scorrimento andasse storto,
@@ -5500,7 +5607,7 @@ static void gestisciTocco()
                 nastroScratchInizia();
             }
 
-            float a = atan2f((float)(tp.y - NASTRO_CY), (float)(tp.x - NASTRO_SX_CX));
+            float a = atan2f((float)(tp.y - NASTRO_ANELLO_CY), (float)(tp.x - NASTRO_ANELLO_CX));
             float passo = a - nastroAngoloPrec;
             if (passo > (float)M_PI) passo -= 2.0f * (float)M_PI;
             else if (passo < -(float)M_PI) passo += 2.0f * (float)M_PI;
