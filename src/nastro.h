@@ -98,7 +98,7 @@ static bool nastroRiprendi = false;   // dopo lo scratch si torna a suonare?
 // Il volume dell'ascolto, a tacche: si applica ai campioni prima di
 // mandarli fuori, cosi' la sveglia non ne sa niente. Resta in memoria.
 #define NASTRO_VOLUME_PASSI 10
-static volatile int nastroVolume = 7;
+static volatile int nastroVolume = NASTRO_VOLUME_PASSI;
 static Preferences prefsNastro;
 
 static void nastroVolumeCarica()
@@ -108,7 +108,7 @@ static void nastroVolumeCarica()
         if (prefsNastro.begin("nastro", false)) prefsNastro.end();
         return;
     }
-    nastroVolume = prefsNastro.getInt("vol", 7);
+    nastroVolume = prefsNastro.getInt("vol", NASTRO_VOLUME_PASSI);
     prefsNastro.end();
     if (nastroVolume < 0) nastroVolume = 0;
     if (nastroVolume > NASTRO_VOLUME_PASSI) nastroVolume = NASTRO_VOLUME_PASSI;
@@ -175,6 +175,64 @@ static void nastroCarica()
     Serial.printf("[nastro] dalla flash: %lu s\n", (unsigned long)(nastroLunghezza / AUDIO_RATE));
 }
 
+// Appena finita una registrazione la si porta a un livello pieno: si
+// cerca il picco e si alza tutto finche' il picco non sta a quattro
+// quinti del fondo scala. Al massimo otto volte - una nota di solo
+// fruscio non deve diventare un ruggito di fruscio. E' quello che fa
+// un tecnico del suono prima di consegnare, e qui costa un
+// centesimo di secondo.
+static void nastroNormalizza()
+{
+    if (nastroLunghezza == 0) return;
+
+    int32_t picco = 0;
+    for (uint32_t i = 0; i < nastroLunghezza; ++i)
+    {
+        int32_t v = nastro[i] < 0 ? -(int32_t)nastro[i] : (int32_t)nastro[i];
+        if (v > picco) picco = v;
+    }
+    if (picco == 0) return;
+
+    float guadagno = 0.8f * 32767.0f / (float)picco;
+    if (guadagno > 8.0f) guadagno = 8.0f;
+    if (guadagno < 1.0f) guadagno = 1.0f;
+
+    // La porta antirumore: si misura il nastro a blocchi di sedici
+    // millesimi, e i blocchi che stanno sotto un trentesimo del picco
+    // sono fruscio fra una parola e l'altra. Non si azzerano - un
+    // silenzio assoluto suona come un buco - si abbassano a un quinto,
+    // e il passaggio da un blocco all'altro e' sfumato, o si
+    // sentirebbe il cancello che sbatte.
+    const uint32_t blocco = AUDIO_BLOCCO;
+    const uint32_t nBlocchi = (nastroLunghezza + blocco - 1) / blocco;
+    const float soglia = (float)picco / 30.0f;
+    uint32_t chiusi = 0;
+
+    float fattorePrec = 1.0f;
+    for (uint32_t b = 0; b < nBlocchi; ++b)
+    {
+        uint32_t da = b * blocco;
+        uint32_t a = da + blocco;
+        if (a > nastroLunghezza) a = nastroLunghezza;
+
+        float energia = 0;
+        for (uint32_t i = da; i < a; ++i) energia += (float)nastro[i] * (float)nastro[i];
+        float rms = sqrtf(energia / (float)(a - da));
+        float fattore = (rms < soglia) ? 0.2f : 1.0f;
+        if (fattore < 1.0f) ++chiusi;
+
+        for (uint32_t i = da; i < a; ++i)
+        {
+            float f = fattorePrec + (fattore - fattorePrec) * (float)(i - da) / (float)blocco;
+            nastro[i] = (int16_t)((float)nastro[i] * guadagno * f);
+        }
+        fattorePrec = fattore;
+    }
+
+    Serial.printf("[nastro] normalizzato: picco %ld, guadagno x%.1f, porta chiusa su %lu blocchi di %lu\n",
+                  (long)picco, guadagno, (unsigned long)chiusi, (unsigned long)nBlocchi);
+}
+
 // Il passaggio da uno stato all'altro. Lo fa solo il compito, fra un
 // blocco e l'altro: cosi' nessuno cambia le carte mentre un blocco
 // sta ancora uscendo.
@@ -194,6 +252,8 @@ static void nastroApplica(uint8_t nuovo)
         break;
 
     case NASTRO_SUONA:
+        // Se la testina sta sul nastro vuoto si riparte dall'inizio
+        // della nota, invece di far correre il vuoto fino al giro.
         if (nastroPosizione >= (float)nastroLunghezza) nastroPosizione = 0;
         i2s_zero_dma_buffer(I2S_NUM_0);
         digitalWrite(AUDIO_PA, HIGH);
@@ -209,7 +269,11 @@ static void nastroApplica(uint8_t nuovo)
         digitalWrite(AUDIO_PA, LOW);
         i2s_zero_dma_buffer(I2S_NUM_0);
         nastroLivello = 0;
-        if (vecchio == NASTRO_REGISTRA) nastroDaSalvare = true;
+        if (vecchio == NASTRO_REGISTRA)
+        {
+            nastroNormalizza();
+            nastroDaSalvare = true;
+        }
         break;
     }
 
@@ -276,7 +340,12 @@ static void nastroTask(void *)
         case NASTRO_SUONA:
         case NASTRO_SCRATCH:
         {
-            float velocita = 1.0f;
+            // Il nastro e' un anello lungo quanto tutto lo spazio, e la
+            // nota ne occupa una parte. Suonando, la testina legge la
+            // nota a velocita' normale e poi corre otto volte piu'
+            // veloce sul nastro vuoto fino a ritrovare l'inizio: il
+            // giro continua finche' non lo fermi.
+            float velocita = (nastroPosizione < (float)nastroLunghezza) ? 1.0f : 8.0f;
             if (nastroStato == NASTRO_SCRATCH)
             {
                 // Da dov'e' a dove vuole il dito, spalmato sul blocco.
@@ -309,7 +378,11 @@ static void nastroTask(void *)
 
                 pos += velocita;
                 if (pos < 0.0f) pos = 0.0f;
-                if (pos > fine) pos = fine + 1.0f;
+                if (nastroStato == NASTRO_SUONA)
+                {
+                    if (pos >= (float)NASTRO_MAX) pos -= (float)NASTRO_MAX;   // l'anello si chiude
+                }
+                else if (pos > fine) pos = fine + 1.0f;
             }
             nastroPosizione = pos;
             nastroLivello = sqrtf(energia / (float)AUDIO_BLOCCO) / 32768.0f;
@@ -326,7 +399,6 @@ static void nastroTask(void *)
                 i2s_read(I2S_NUM_0, scarto, sizeof(scarto), &letti, 0);
             }
 
-            if (nastroStato == NASTRO_SUONA && pos > fine) nastroChiesto = NASTRO_FERMO;
             break;
         }
 

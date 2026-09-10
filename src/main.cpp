@@ -2420,7 +2420,6 @@ static void disegnaTimer(Arduino_GFX *g)
 #define NASTRO_ANELLO_R 36
 #define NASTRO_RUOTA_PRESA (NASTRO_ANELLO_R + 18)   // quanto vicino alla ruota deve cadere il dito
 #define NASTRO_PASSO_PUNTI 7    // fra un punto e l'altro lungo il nastro
-#define NASTRO_PIXEL_AL_SECONDO 40   // quanto corre il nastro a schermo
 
 // Un cerchio pulito, spesso due pixel: e' il segno delle bobine.
 static void nastroCerchio(Arduino_GFX *g, int16_t cx, int16_t cy, int16_t r, uint16_t colore)
@@ -2482,17 +2481,28 @@ static void disegnaNastro(Arduino_GFX *g)
     const float l6 = (float)(NASTRO_DX_CX - NASTRO_SX_CX);
     const float totale = l1 + l2 + l3 + l4 + l5 + l6;
 
-    // Quanto nastro e' occupato: quella parte dell'anello e' rossa,
-    // dall'inizio. Con la fase che scorre i punti ci passano
-    // attraverso, e la zona rossa resta ferma: e' il nastro pieno.
-    const float pieno = totale * (float)nastroLunghezza / (float)NASTRO_MAX;
+    // L'anello e' lungo quanto tutto lo spazio: sessanta secondi di
+    // nastro. La testina sta a meta' del tratto verticale di destra.
+    // Il campione che le passa sotto e' quello alla posizione di
+    // adesso; quelli dopo devono ancora arrivare e stanno piu'
+    // indietro lungo il percorso, quelli gia' letti sono oltre. La
+    // nota - i campioni da zero alla lunghezza - e' rossa, e si
+    // muove con il nastro: quando passa sotto la testina si sente.
+    const float scala = totale / (float)NASTRO_MAX;   // pixel per campione
+    const float sTestina = l1 + l2 + l3 + l4 * 0.5f;
+    const float posizione = nastroPosizione;
 
-    float fase = fmodf(nastroPosizione / (float)AUDIO_RATE * NASTRO_PIXEL_AL_SECONDO,
-                       (float)NASTRO_PASSO_PUNTI);
+    float fase = fmodf(posizione * scala, (float)NASTRO_PASSO_PUNTI);
     if (fase < 0) fase += NASTRO_PASSO_PUNTI;
 
     for (float s = fase; s < totale; s += NASTRO_PASSO_PUNTI)
     {
+        // Quale campione sta in questo punto del nastro.
+        float k = posizione + (sTestina - s) / scala;
+        k = fmodf(k, (float)NASTRO_MAX);
+        if (k < 0) k += (float)NASTRO_MAX;
+        bool rosso = k < (float)nastroLunghezza;
+
         float px, py, t = s;
         if (t < l1)
         {
@@ -2525,7 +2535,16 @@ static void disegnaNastro(Arduino_GFX *g)
             px = NASTRO_DX_CX - t; py = NASTRO_CY - rb;
         }
         dmDot(g, (int16_t)lroundf(px), (int16_t)lroundf(py), 3,
-              s < pieno ? COL_ROSSO : COL_SECONDARIO);
+              rosso ? COL_ROSSO : COL_SECONDARIO);
+    }
+
+    // La testina: una lineetta verticale a cavallo del nastro, sul
+    // tratto di destra. Il nastro le passa sotto.
+    {
+        float f = 0.5f;
+        int16_t hx = (int16_t)lroundf(cx + (dx - cx) * f);
+        int16_t hy = (int16_t)lroundf(cy + (dy - cy) * f);
+        g->fillRect(hx - 1, hy - 9, 3, 19, COL_ACCESO);
     }
 
     // ---- le bobine ----
@@ -2607,6 +2626,7 @@ static void disegnaNastro(Arduino_GFX *g)
     {
         uint32_t pos = (uint32_t)(nastroPosizione / AUDIO_RATE);
         uint32_t lun = nastroLunghezza / AUDIO_RATE;
+        if (pos > lun) pos = lun;   // sul nastro vuoto, in corsa verso l'inizio
         snprintf(buf, sizeof(buf), "%lu:%02lu / %lu:%02lu",
                  (unsigned long)(pos / 60), (unsigned long)(pos % 60),
                  (unsigned long)(lun / 60), (unsigned long)(lun % 60));

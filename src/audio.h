@@ -85,11 +85,17 @@ static uint8_t esLeggi(uint8_t reg)
 // Tutto questo non serve a niente se il rail analogico A3V3 e' spento:
 // e' l'uscita ALDO1 del gestore di alimentazione, e lo accende main.cpp
 // prima di chiamare audioBegin.
+//
+// Niente controllo automatico di livello: provato, alza il fondo di
+// rumore di quaranta volte per tenere il silenzio al livello del
+// parlato. Il livello lo si aggiusta dopo, sulla registrazione
+// intera, dove si sa qual e' il picco e cosa e' rumore (nastro.h).
 static void audioMicrofono()
 {
     esScrivi(0x14, 0x1A);   // ingresso MIC1, preamplificatore a +30 dB
-    esScrivi(0x16, 0x03);   // scala del convertitore: +18 dB
+    esScrivi(0x16, 0x04);   // scala del convertitore: +24 dB
     esScrivi(0x17, 0xC8);   // volume digitale dell'ingresso: +4,5 dB
+    esScrivi(0x18, 0x00);   // controllo automatico spento
     esScrivi(0x1B, 0x0A);   // filtro passa-alto
     esScrivi(0x1C, 0x6A);
 }
