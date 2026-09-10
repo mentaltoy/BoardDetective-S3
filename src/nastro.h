@@ -98,7 +98,7 @@ static bool nastroRiprendi = false;   // dopo lo scratch si torna a suonare?
 // Il volume dell'ascolto, a tacche: si applica ai campioni prima di
 // mandarli fuori, cosi' la sveglia non ne sa niente. Resta in memoria.
 #define NASTRO_VOLUME_PASSI 10
-static volatile int nastroVolume = NASTRO_VOLUME_PASSI;
+static volatile int nastroVolume = NASTRO_VOLUME_PASSI / 2;
 static Preferences prefsNastro;
 
 static void nastroVolumeCarica()
@@ -108,7 +108,7 @@ static void nastroVolumeCarica()
         if (prefsNastro.begin("nastro", false)) prefsNastro.end();
         return;
     }
-    nastroVolume = prefsNastro.getInt("vol", NASTRO_VOLUME_PASSI);
+    nastroVolume = prefsNastro.getInt("vol2", NASTRO_VOLUME_PASSI / 2);
     prefsNastro.end();
     if (nastroVolume < 0) nastroVolume = 0;
     if (nastroVolume > NASTRO_VOLUME_PASSI) nastroVolume = NASTRO_VOLUME_PASSI;
@@ -122,7 +122,7 @@ static void nastroVolumeImposta(int passi)
     nastroVolume = passi;
     if (prefsNastro.begin("nastro", false))
     {
-        prefsNastro.putInt("vol", passi);
+        prefsNastro.putInt("vol2", passi);
         prefsNastro.end();
     }
 }
@@ -176,8 +176,8 @@ static void nastroCarica()
 }
 
 // Appena finita una registrazione la si porta a un livello pieno: si
-// cerca il picco e si alza tutto finche' il picco non sta a quattro
-// quinti del fondo scala. Al massimo otto volte - una nota di solo
+// cerca il picco e si alza tutto finche' il picco non sta al
+// novantacinque per cento del fondo scala. Al massimo otto volte - una nota di solo
 // fruscio non deve diventare un ruggito di fruscio. E' quello che fa
 // un tecnico del suono prima di consegnare, e qui costa un
 // centesimo di secondo.
@@ -193,7 +193,7 @@ static void nastroNormalizza()
     }
     if (picco == 0) return;
 
-    float guadagno = 0.8f * 32767.0f / (float)picco;
+    float guadagno = 0.95f * 32767.0f / (float)picco;
     if (guadagno > 8.0f) guadagno = 8.0f;
     if (guadagno < 1.0f) guadagno = 1.0f;
 
@@ -341,11 +341,11 @@ static void nastroTask(void *)
         case NASTRO_SCRATCH:
         {
             // Il nastro e' un anello lungo quanto tutto lo spazio, e la
-            // nota ne occupa una parte. Suonando, la testina legge la
-            // nota a velocita' normale e poi corre otto volte piu'
-            // veloce sul nastro vuoto fino a ritrovare l'inizio: il
-            // giro continua finche' non lo fermi.
-            float velocita = (nastroPosizione < (float)nastroLunghezza) ? 1.0f : 8.0f;
+            // nota ne occupa una parte. Suonando, la testina va sempre
+            // alla stessa velocita': legge la nota, poi il nastro
+            // vuoto in silenzio, e ritrova l'inizio. Il giro continua
+            // finche' non lo fermi.
+            float velocita = 1.0f;
             if (nastroStato == NASTRO_SCRATCH)
             {
                 // Da dov'e' a dove vuole il dito, spalmato sul blocco.
@@ -361,7 +361,10 @@ static void nastroTask(void *)
             float pos = nastroPosizione;
             const float fine = (float)nastroLunghezza - 1.0f;
             float energia = 0;
-            const float volume = (float)nastroVolume / (float)NASTRO_VOLUME_PASSI;
+            // A meta' scala la nota esce com'e', a fondo scala; sopra si
+            // spinge fino al doppio, e un limitatore morbido piega le
+            // punte invece di tagliarle: piu' forte, non piu' sporco.
+            const float volume = (float)nastroVolume / (float)(NASTRO_VOLUME_PASSI / 2);
 
             for (int i = 0; i < AUDIO_BLOCCO; ++i)
             {
@@ -370,7 +373,10 @@ static void nastroTask(void *)
                 {
                     uint32_t i0 = (uint32_t)pos;
                     float f = pos - (float)i0;
-                    c = (int16_t)(((float)nastro[i0] * (1.0f - f) + (float)nastro[i0 + 1] * f) * volume);
+                    float v = ((float)nastro[i0] * (1.0f - f) + (float)nastro[i0 + 1] * f) * volume / 32767.0f;
+                    float m = fabsf(v);
+                    if (m > 0.7f) m = 0.7f + 0.3f * tanhf((m - 0.7f) / 0.3f);
+                    c = (int16_t)((v < 0 ? -m : m) * 32767.0f);
                 }
                 blocco[i * 2] = c;
                 blocco[i * 2 + 1] = c;
