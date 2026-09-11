@@ -136,6 +136,10 @@ static void nastroVolumeImposta(int passi)
 static void nastroCancella()
 {
     nastroDaCancellare = true;
+    // Se stava girando, prima si ferma: la cancellazione la fa il
+    // motore da fermo.
+    nastroChiestoA = millis();
+    nastroChiesto = NASTRO_FERMO;
 }
 
 static void nastroSalva()

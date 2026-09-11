@@ -2422,6 +2422,7 @@ static void disegnaTimer(Arduino_GFX *g)
 #define NASTRO_ANELLO_R 44
 #define NASTRO_RUOTA_PRESA (NASTRO_ANELLO_R + 18)   // quanto vicino alla ruota deve cadere il dito
 #define NASTRO_PASSO_PUNTI 7    // fra un punto e l'altro lungo il nastro
+#define NASTRO_TESTINA_GOBBA 20.0f   // per quanto il nastro si scosta passando alla testina
 
 // Un cerchio pulito, spesso due pixel: e' il segno delle bobine. Non
 // due cerchi di Bresenham affiancati - in diagonale i loro pixel si
@@ -2550,6 +2551,16 @@ static void disegnaNastro(Arduino_GFX *g)
         {
             float f = t / l4;
             px = cx + (dx - cx) * f; py = cy + (dy - cy) * f;
+
+            // Passando accanto alla testina il nastro fa una gobba verso
+            // l'interno, come se scavalcasse qualcosa che lo deforma:
+            // sei pixel nel punto piu' vicino, a sfumare in venti.
+            float dist = t - l4 * 0.5f;
+            if (fabsf(dist) < NASTRO_TESTINA_GOBBA)
+            {
+                float k = dist / NASTRO_TESTINA_GOBBA;
+                px -= 6.0f * (1.0f - k * k);
+            }
         }
         else if ((t -= l4) < l5)
         {
