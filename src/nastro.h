@@ -378,9 +378,27 @@ static void nastroTask(void *)
                 float scarto = nastroBersaglio - nastroPosizione;
                 if (scarto > (float)NASTRO_MAX / 2) scarto -= (float)NASTRO_MAX;
                 if (scarto < -(float)NASTRO_MAX / 2) scarto += (float)NASTRO_MAX;
+
+                // Il nastro non resta mai indietro rispetto al dito piu'
+                // di un blocco a tutta velocita': se il dito e' andato
+                // piu' in la', il pezzo in mezzo si salta. Prima
+                // l'anticipo si accumulava, e quando il dito tornava
+                // indietro il nastro finiva di inseguire il vecchio
+                // bersaglio prima di girarsi: mezzo secondo di ritardo
+                // al cambio di verso.
+                const float massimo = 6.0f;
+                const float limite = massimo * (float)AUDIO_BLOCCO;
+                if (scarto > limite)
+                {
+                    nastroPosizione = nastroBersaglio - limite;
+                    scarto = limite;
+                }
+                else if (scarto < -limite)
+                {
+                    nastroPosizione = nastroBersaglio + limite;
+                    scarto = -limite;
+                }
                 velocita = scarto / (float)AUDIO_BLOCCO;
-                if (velocita > 4.0f) velocita = 4.0f;
-                if (velocita < -4.0f) velocita = -4.0f;
                 if (fabsf(velocita) < 0.02f) velocita = 0.0f;
             }
 

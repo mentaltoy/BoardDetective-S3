@@ -2412,12 +2412,14 @@ static void disegnaTimer(Arduino_GFX *g)
 #define NASTRO_CY 172
 #define NASTRO_SPIA_X (LCD_W - PADDING - 12)
 #define NASTRO_SPIA_Y 118
-#define NASTRO_MOTORE_X (LCD_W - PADDING - MEZZA_ICONA)
+// Il motore sta esattamente sotto il bordo destro della bobina destra:
+// cosi' il nastro che sale dal motore alla bobina e' verticale.
+#define NASTRO_MOTORE_X (NASTRO_DX_CX + NASTRO_R - NASTRO_MOTORE_R)
 #define NASTRO_MOTORE_Y 386
 #define NASTRO_MOTORE_R 18
-#define NASTRO_ANELLO_CX 96
-#define NASTRO_ANELLO_CY 366
-#define NASTRO_ANELLO_R 36
+#define NASTRO_ANELLO_CX 100
+#define NASTRO_ANELLO_CY 360
+#define NASTRO_ANELLO_R 44
 #define NASTRO_RUOTA_PRESA (NASTRO_ANELLO_R + 18)   // quanto vicino alla ruota deve cadere il dito
 #define NASTRO_PASSO_PUNTI 7    // fra un punto e l'altro lungo il nastro
 
