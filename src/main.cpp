@@ -2422,7 +2422,14 @@ static void disegnaTimer(Arduino_GFX *g)
 #define NASTRO_ANELLO_R 44
 #define NASTRO_RUOTA_PRESA (NASTRO_ANELLO_R + 18)   // quanto vicino alla ruota deve cadere il dito
 #define NASTRO_PASSO_PUNTI 7    // fra un punto e l'altro lungo il nastro
-#define NASTRO_TESTINA_GOBBA 20.0f   // per quanto il nastro si scosta passando alla testina
+// La testina: una finestrella smussata attraverso cui il nastro passa.
+// Mezze misure del bordo esterno, e di quello interno: fra i due ci
+// stanno il tratto bianco e un filo di nero da ogni lato, dove il
+// nastro e' tagliato.
+#define NASTRO_TESTINA_W 9
+#define NASTRO_TESTINA_H 15
+#define NASTRO_TESTINA_WI 5
+#define NASTRO_TESTINA_HI 11
 
 // Un cerchio pulito, spesso due pixel: e' il segno delle bobine. Non
 // due cerchi di Bresenham affiancati - in diagonale i loro pixel si
@@ -2523,6 +2530,10 @@ static void disegnaNastro(Arduino_GFX *g)
     float fase = fmodf(posizione * scala, passo);
     if (fase < 0) fase += passo;
 
+    // Dove sta la testina: a meta' del tratto verticale.
+    const int16_t hx = (int16_t)lroundf(cx + (dx - cx) * 0.5f);
+    const int16_t hy = (int16_t)lroundf(cy + (dy - cy) * 0.5f);
+
     for (float s = fase; s < totale; s += passo)
     {
         // Quale campione sta in questo punto del nastro.
@@ -2551,16 +2562,6 @@ static void disegnaNastro(Arduino_GFX *g)
         {
             float f = t / l4;
             px = cx + (dx - cx) * f; py = cy + (dy - cy) * f;
-
-            // Passando accanto alla testina il nastro fa una gobba verso
-            // l'interno, come se scavalcasse qualcosa che lo deforma:
-            // sei pixel nel punto piu' vicino, a sfumare in venti.
-            float dist = t - l4 * 0.5f;
-            if (fabsf(dist) < NASTRO_TESTINA_GOBBA)
-            {
-                float k = dist / NASTRO_TESTINA_GOBBA;
-                px -= 6.0f * (1.0f - k * k);
-            }
         }
         else if ((t -= l4) < l5)
         {
@@ -2572,18 +2573,25 @@ static void disegnaNastro(Arduino_GFX *g)
             t -= l5;
             px = NASTRO_DX_CX - t; py = NASTRO_CY - rb;
         }
+        // Sotto il bordo della testina, e nel filo di nero intorno al
+        // bordo, il nastro non si disegna: e' tagliato. Dentro la
+        // finestra si vede passare.
+        float ex = fabsf(px - hx), ey = fabsf(py - hy);
+        if (ex <= NASTRO_TESTINA_W && ey <= NASTRO_TESTINA_H &&
+            !(ex <= NASTRO_TESTINA_WI && ey <= NASTRO_TESTINA_HI))
+            continue;
+
         dmDot(g, (int16_t)lroundf(px), (int16_t)lroundf(py), 3,
               rosso ? COL_ROSSO : COL_SECONDARIO);
     }
 
-    // La testina: una lineetta verticale a cavallo del nastro, sul
-    // tratto di destra. Il nastro le passa sotto.
-    {
-        float f = 0.5f;
-        int16_t hx = (int16_t)lroundf(cx + (dx - cx) * f);
-        int16_t hy = (int16_t)lroundf(cy + (dy - cy) * f);
-        g->fillRect(hx - 1, hy - 9, 3, 19, COL_ACCESO);
-    }
+    // La testina: una finestrella smussata, bordo bianco da due pixel,
+    // con il nastro che ci passa dentro. Il nero attorno al bordo lo
+    // fa il taglio dei punti qui sopra.
+    g->drawRoundRect(hx - NASTRO_TESTINA_W + 2, hy - NASTRO_TESTINA_H + 2,
+                     2 * NASTRO_TESTINA_W - 3, 2 * NASTRO_TESTINA_H - 3, 5, COL_ACCESO);
+    g->drawRoundRect(hx - NASTRO_TESTINA_W + 3, hy - NASTRO_TESTINA_H + 3,
+                     2 * NASTRO_TESTINA_W - 5, 2 * NASTRO_TESTINA_H - 5, 4, COL_ACCESO);
 
     // ---- le bobine ----
     nastroCerchio(g, NASTRO_SX_CX, NASTRO_CY, NASTRO_R, COL_ACCESO);
