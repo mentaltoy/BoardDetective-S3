@@ -2423,11 +2423,17 @@ static void disegnaTimer(Arduino_GFX *g)
 #define NASTRO_RUOTA_PRESA (NASTRO_ANELLO_R + 18)   // quanto vicino alla ruota deve cadere il dito
 #define NASTRO_PASSO_PUNTI 7    // fra un punto e l'altro lungo il nastro
 
-// Un cerchio pulito, spesso due pixel: e' il segno delle bobine.
-static void nastroCerchio(Arduino_GFX *g, int16_t cx, int16_t cy, int16_t r, uint16_t colore)
+// Un cerchio pulito, spesso due pixel: e' il segno delle bobine. Non
+// due cerchi di Bresenham affiancati - in diagonale i loro pixel si
+// toccano solo per l'angolo e la linea si assottiglia, si vedeva
+// sbiadita a quarantacinque gradi - ma un disco pieno con dentro un
+// disco nero: uniforme in ogni direzione. Quello che sta dentro va
+// disegnato dopo.
+static void nastroCerchio(Arduino_GFX *g, int16_t cx, int16_t cy, int16_t r, uint16_t colore,
+                          uint16_t dentro = COL_SFONDO)
 {
-    g->drawCircle(cx, cy, r, colore);
-    g->drawCircle(cx, cy, r - 1, colore);
+    g->fillCircle(cx, cy, r, colore);
+    g->fillCircle(cx, cy, r - 2, dentro);
 }
 
 // Il punto di tangenza fra due cerchi, sul lato scelto: e' dove il
@@ -2508,10 +2514,15 @@ static void disegnaNastro(Arduino_GFX *g)
     const float sTestina = l1 + l2 + l3 + l4 * 0.5f;
     const float posizione = nastroPosizione;
 
-    float fase = fmodf(posizione * scala, (float)NASTRO_PASSO_PUNTI);
-    if (fase < 0) fase += NASTRO_PASSO_PUNTI;
+    // Il passo fra i punti divide esattamente l'anello: se no dove la
+    // fila si chiude, in cima a sinistra, l'ultimo e il primo punto
+    // stavano a una distanza diversa dagli altri, e scorrendo quella
+    // cucitura sembrava un punto che lampeggia fuori riga.
+    const float passo = totale / roundf(totale / (float)NASTRO_PASSO_PUNTI);
+    float fase = fmodf(posizione * scala, passo);
+    if (fase < 0) fase += passo;
 
-    for (float s = fase; s < totale; s += NASTRO_PASSO_PUNTI)
+    for (float s = fase; s < totale; s += passo)
     {
         // Quale campione sta in questo punto del nastro.
         float k = posizione + (sTestina - s) / scala;
@@ -2569,9 +2580,8 @@ static void disegnaNastro(Arduino_GFX *g)
 
     // La destra e' il tasto di registrazione: il suo mozzo si riempie
     // di rosso mentre registra, e lampeggia insieme alla spia.
-    if (stato == NASTRO_REGISTRA)
-        g->fillCircle(NASTRO_DX_CX, NASTRO_CY, 24, lampo ? COL_ROSSO : COL_SPENTO);
-    nastroCerchio(g, NASTRO_DX_CX, NASTRO_CY, 24, COL_ACCESO);
+    nastroCerchio(g, NASTRO_DX_CX, NASTRO_CY, 24, COL_ACCESO,
+                  stato == NASTRO_REGISTRA ? (lampo ? COL_ROSSO : COL_SPENTO) : COL_SFONDO);
 
     // I raggi della sinistra girano con il nastro. E' decorativa: gira
     // perche' il nastro gira, non si prende in mano.
