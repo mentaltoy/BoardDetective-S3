@@ -269,9 +269,11 @@ static void nastroApplica(uint8_t nuovo)
         break;
 
     case NASTRO_SUONA:
-        // Se la testina sta sul nastro vuoto si riparte dall'inizio
-        // della nota, invece di far correre il vuoto fino al giro.
-        if (nastroPosizione >= (float)nastroLunghezza) nastroPosizione = 0;
+        // Si riparte da dove sta la testina, anche se e' sul nastro
+        // vuoto: il giro la riporta alla nota da solo. Riportarla
+        // all'inizio sarebbe comodo ma non naturale, e dopo aver
+        // girato la ruota a mano il nastro deve restare dove l'hai
+        // lasciato.
         i2s_zero_dma_buffer(I2S_NUM_0);
         digitalWrite(AUDIO_PA, HIGH);
         break;
