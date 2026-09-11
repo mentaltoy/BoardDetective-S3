@@ -83,6 +83,13 @@ enum NastroStato : uint8_t
 static int16_t *nastro = nullptr;
 static volatile uint32_t nastroLunghezza = 0;   // campioni registrati
 static volatile float nastroPosizione = 0;       // dove sta la testina, in campioni
+// Quanto nastro e' passato in tutto, con segno, da quando si e'
+// acceso: non si azzera mai, nemmeno quando l'anello si chiude. E'
+// da qui che il disegno ricava gli angoli di tutto quello che gira:
+// con la posizione, che al giro torna a zero, bobine e ruota
+// saltavano indietro di un pezzo di giro ogni volta che la nota
+// arrivava alla testina.
+static volatile float nastroPercorso = 0;
 static volatile float nastroBersaglio = 0;       // dove la vuole il dito
 static volatile uint8_t nastroStato = NASTRO_FERMO;
 static volatile uint8_t nastroChiesto = NASTRO_FERMO;   // cosa vuole lo schermo
@@ -359,6 +366,7 @@ static void nastroTask(void *)
                 nastroLivello = sqrtf(energia / (float)n) / 32768.0f;
                 nastroLivelloAltro = sqrtf(energiaAltro / (float)n) / 32768.0f;
             }
+            nastroPercorso += (float)nastroLunghezza - nastroPosizione;
             nastroPosizione = (float)nastroLunghezza;
 
             if (nastroLunghezza >= NASTRO_MAX) nastroChiesto = NASTRO_FERMO;   // nastro finito
@@ -438,6 +446,7 @@ static void nastroTask(void *)
                 if (pos < 0.0f) pos += (float)NASTRO_MAX;
             }
             nastroPosizione = pos;
+            nastroPercorso += velocita * (float)AUDIO_BLOCCO;
             nastroLivello = sqrtf(energia / (float)AUDIO_BLOCCO) / 32768.0f;
 
             size_t scritti = 0;
@@ -553,7 +562,7 @@ static void nastroScratchFine()
 // ricava di quanto ha girato ogni cosa che il nastro tocca.
 static float nastroSpostamentoPx()
 {
-    return nastroPosizione * nastroAnelloPx / (float)NASTRO_MAX;
+    return nastroPercorso * nastroAnelloPx / (float)NASTRO_MAX;
 }
 
 static void nastroBegin()

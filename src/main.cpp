@@ -5434,7 +5434,8 @@ static void entraInStandby()
 static void dormiFinoAlProssimoSecondo()
 {
     static uint32_t prossimoControlloAlimentazione = 0;
-    if ((int32_t)(millis() - prossimoControlloAlimentazione) >= 0)
+    if ((int32_t)(millis() - prossimoControlloAlimentazione) >= 0 &&
+        nastroStato != NASTRO_REGISTRA)   // niente I2C mentre il microfono ascolta
     {
         prossimoControlloAlimentazione = millis() + 30000UL;
         aggiornaBatteria();
@@ -5846,6 +5847,15 @@ static bool pwrPremuto()
 
 static void gestisciSecondoPulsante()
 {
+    // Mentre il microfono ascolta, sul bus I2C non parla nessuno.
+    // Ogni lettura dell'expander lasciava un clic nella
+    // registrazione, uno ogni quaranta millesimi, preciso come un
+    // metronomo: il bus passa accanto all'ingresso del microfono e
+    // ogni transazione ci entra. Trovato scaricando la nota sul
+    // computer e misurando la distanza fra i picchi, e confermato
+    // cambiando il periodo della lettura: i clic lo seguivano.
+    if (nastroStato == NASTRO_REGISTRA) return;
+
     static bool precedente = false;
     static uint32_t ultimoCambio = 0;
     static uint32_t prossimaLettura = 0;
@@ -5975,6 +5985,28 @@ static void gestisciSeriale()
                 Serial.println("[nastro] nastro di prova: 2 s di 440 Hz");
             }
             break;
+        // 'd' scarica la nota sul seriale, in esadecimale, per guardarla
+        // al computer campione per campione.
+        case 'd':
+        {
+            Serial.printf("[nastro] scarico %lu campioni\n", (unsigned long)nastroLunghezza);
+            static const char hex[] = "0123456789ABCDEF";
+            char riga[65];
+            for (uint32_t i = 0; i < nastroLunghezza; i += 16)
+            {
+                int o = 0;
+                for (uint32_t k = i; k < i + 16 && k < nastroLunghezza; ++k)
+                {
+                    uint16_t v = (uint16_t)nastro[k];
+                    riga[o++] = hex[(v >> 12) & 15]; riga[o++] = hex[(v >> 8) & 15];
+                    riga[o++] = hex[(v >> 4) & 15];  riga[o++] = hex[v & 15];
+                }
+                riga[o] = '\0';
+                Serial.println(riga);
+            }
+            Serial.println("[nastro] fine scarico");
+            break;
+        }
         case 'l':
             Serial.printf("[nastro] stato %u, %lu campioni, pos %.0f, livello %.5f/%.5f, grezzi c0 %d..%d c1 %d..%d, giro max %lu ms\n",
                           (unsigned)nastroStato, (unsigned long)nastroLunghezza,
@@ -6503,7 +6535,7 @@ void loop()
     // riga, insieme alla corrente di carica, da' la capacita'.
     {
         static uint32_t prossimaNota = 0;
-        if ((int32_t)(millis() - prossimaNota) >= 0)
+        if ((int32_t)(millis() - prossimaNota) >= 0 && nastroStato != NASTRO_REGISTRA)
         {
             prossimaNota = millis() + 60000UL;
             aggiornaBatteria();
@@ -6577,7 +6609,7 @@ void loop()
         {
             ultimoMinuto = t.tm_min;
             daRidisegnare[SCHEDA_SOLE] = true;
-            aggiornaBatteria();
+            if (nastroStato != NASTRO_REGISTRA) aggiornaBatteria();   // niente I2C mentre il microfono ascolta
             daRidisegnare[SCHEDA_METEO] = true;   // per l'indicatore di carica
         }
     }
