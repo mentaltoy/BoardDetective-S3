@@ -60,10 +60,13 @@
 #define NASTRO_MAX ((uint32_t)NASTRO_SECONDI * AUDIO_RATE)   // campioni
 #define NASTRO_FILE "/nota.pcm"
 
-// Quanto nastro passa in un giro di bobina: due secondi, che e'
-// circa quanto un disco a trentatre' fa in un giro. Con la mano
-// e' il rapporto giusto fra quanto giri e quanto senti.
-#define NASTRO_GIRO (2 * AUDIO_RATE)
+// Quanto nastro, in pixel di schermo, c'e' in tutto l'anello: lo
+// misura il disegno la prima volta che lo traccia, e da qui in poi
+// tutte le velocita' - bobine, motore, ruota - discendono da quel
+// numero e dalla posizione, come su una macchina vera in cui il
+// nastro tira tutto. Il dito sulla ruota sposta il nastro di quanto
+// la ruota ha girato, e le bobine seguono.
+static volatile float nastroAnelloPx = 950.0f;
 
 // Quale dei due canali I2S porta il microfono. Il codec e' mono e
 // mette il campione su uno solo dei due: l'altro e' zero.
@@ -88,6 +91,7 @@ static volatile float nastroLivello = 0;   // quanto e' forte il suono adesso, 0
 static volatile float nastroLivelloAltro = 0;   // lo stesso sull'altro canale: serve a scoprire su quale sta il microfono
 static volatile uint32_t nastroByteLetti = 0;    // diagnostica: quanti byte ha consegnato il ricevitore
 static volatile uint32_t nastroErroriLettura = 0;
+static volatile uint32_t nastroGiroMassimo = 0;   // diagnostica: il giro piu' lungo del compito mentre il nastro gira
 static volatile int16_t nastroMin0 = 0, nastroMax0 = 0, nastroMin1 = 0, nastroMax1 = 0;   // grezzi, ultimo blocco
 static volatile uint32_t nastroVersione = 0;   // cresce a ogni cambio di stato
 static volatile bool nastroDaSalvare = false;
@@ -198,17 +202,26 @@ static void nastroNormalizza()
     if (guadagno < 1.0f) guadagno = 1.0f;
 
     // La porta antirumore: si misura il nastro a blocchi di sedici
-    // millesimi, e i blocchi che stanno sotto un trentesimo del picco
-    // sono fruscio fra una parola e l'altra. Non si azzerano - un
-    // silenzio assoluto suona come un buco - si abbassano a un quinto,
-    // e il passaggio da un blocco all'altro e' sfumato, o si
-    // sentirebbe il cancello che sbatte.
+    // millesimi, e i blocchi che stanno sotto un quarantesimo del
+    // picco sono fruscio fra una parola e l'altra. Non si azzerano -
+    // un silenzio assoluto suona come un buco - si abbassano a un
+    // quarto.
+    //
+    // La porta si apre subito e si chiude piano: la chiusura scende
+    // di un quinto a blocco, un centinaio di millesimi per arrivare
+    // in fondo, e per riaprirsi vuole un livello piu' alto di quello
+    // a cui si e' chiusa. Senza queste due cose, sui suoni deboli -
+    // una consonante, un respiro - apriva e chiudeva a ogni blocco, e
+    // sotto la voce si sentiva un ricchettio.
     const uint32_t blocco = AUDIO_BLOCCO;
     const uint32_t nBlocchi = (nastroLunghezza + blocco - 1) / blocco;
-    const float soglia = (float)picco / 30.0f;
+    const float sogliaApre = (float)picco / 25.0f;
+    const float sogliaChiude = (float)picco / 50.0f;
+    const float chiusa = 0.25f;
     uint32_t chiusi = 0;
 
-    float fattorePrec = 1.0f;
+    bool aperta = true;
+    float fattore = 1.0f;
     for (uint32_t b = 0; b < nBlocchi; ++b)
     {
         uint32_t da = b * blocco;
@@ -218,15 +231,19 @@ static void nastroNormalizza()
         float energia = 0;
         for (uint32_t i = da; i < a; ++i) energia += (float)nastro[i] * (float)nastro[i];
         float rms = sqrtf(energia / (float)(a - da));
-        float fattore = (rms < soglia) ? 0.2f : 1.0f;
-        if (fattore < 1.0f) ++chiusi;
+        if (aperta && rms < sogliaChiude) aperta = false;
+        else if (!aperta && rms > sogliaApre) aperta = true;
+
+        float bersaglio = aperta ? 1.0f : chiusa;
+        float nuovo = (bersaglio > fattore) ? bersaglio : fattore + (bersaglio - fattore) * 0.2f;
+        if (!aperta) ++chiusi;
 
         for (uint32_t i = da; i < a; ++i)
         {
-            float f = fattorePrec + (fattore - fattorePrec) * (float)(i - da) / (float)blocco;
+            float f = fattore + (nuovo - fattore) * (float)(i - da) / (float)blocco;
             nastro[i] = (int16_t)((float)nastro[i] * guadagno * f);
         }
-        fattorePrec = fattore;
+        fattore = nuovo;
     }
 
     Serial.printf("[nastro] normalizzato: picco %ld, guadagno x%.1f, porta chiusa su %lu blocchi di %lu\n",
@@ -294,9 +311,14 @@ static void nastroTask(void *)
         // seriale, con lo stato in cui era.
         static uint32_t giroPrecedente = 0;
         uint32_t adesso = millis();
-        if (giroPrecedente && adesso - giroPrecedente > 200)
+        uint32_t giro = giroPrecedente ? adesso - giroPrecedente : 0;
+        if (giro > 200)
             Serial.printf("[nastro] giro lento: %lu ms nello stato %u\n",
-                          (unsigned long)(adesso - giroPrecedente), (unsigned)nastroStato);
+                          (unsigned long)giro, (unsigned)nastroStato);
+        // Mentre il nastro gira, un giro piu' lungo del buffer del DMA
+        // vuol dire che l'uscita e' rimasta a secco: si sente un buco,
+        // o un colpo.
+        if (nastroStato != NASTRO_FERMO && giro > nastroGiroMassimo) nastroGiroMassimo = giro;
         giroPrecedente = adesso;
 
         if (nastroChiesto != nastroStato)
@@ -351,8 +373,12 @@ static void nastroTask(void *)
                 // Da dov'e' a dove vuole il dito, spalmato sul blocco.
                 // Non piu' di quattro volte la velocita' normale: oltre
                 // non si sente piu' niente di riconoscibile, e il dito
-                // non e' cosi' preciso da volerlo davvero.
-                velocita = (nastroBersaglio - nastroPosizione) / (float)AUDIO_BLOCCO;
+                // non e' cosi' preciso da volerlo davvero. L'anello e'
+                // chiuso: la strada e' la piu' corta delle due.
+                float scarto = nastroBersaglio - nastroPosizione;
+                if (scarto > (float)NASTRO_MAX / 2) scarto -= (float)NASTRO_MAX;
+                if (scarto < -(float)NASTRO_MAX / 2) scarto += (float)NASTRO_MAX;
+                velocita = scarto / (float)AUDIO_BLOCCO;
                 if (velocita > 4.0f) velocita = 4.0f;
                 if (velocita < -4.0f) velocita = -4.0f;
                 if (fabsf(velocita) < 0.02f) velocita = 0.0f;
@@ -383,12 +409,9 @@ static void nastroTask(void *)
                 energia += (float)c * (float)c;
 
                 pos += velocita;
-                if (pos < 0.0f) pos = 0.0f;
-                if (nastroStato == NASTRO_SUONA)
-                {
-                    if (pos >= (float)NASTRO_MAX) pos -= (float)NASTRO_MAX;   // l'anello si chiude
-                }
-                else if (pos > fine) pos = fine + 1.0f;
+                // L'anello si chiude, in tutti e due i versi.
+                if (pos >= (float)NASTRO_MAX) pos -= (float)NASTRO_MAX;
+                if (pos < 0.0f) pos += (float)NASTRO_MAX;
             }
             nastroPosizione = pos;
             nastroLivello = sqrtf(energia / (float)AUDIO_BLOCCO) / 32768.0f;
@@ -484,12 +507,14 @@ static void nastroScratchInizia()
     nastroChiedi(NASTRO_SCRATCH);
 }
 
-// Il dito ha girato di tanti giri (frazione, con segno).
-static void nastroScratchMuovi(float giri)
+// Il dito ha spostato il nastro di tanti pixel di schermo (con
+// segno): e' la ruota che ha girato, per il suo raggio. Il nastro e'
+// un anello, e tutto l'anello e' a portata di dito, vuoto compreso.
+static void nastroScratchMuoviPixel(float pixel)
 {
-    float b = nastroBersaglio + giri * (float)NASTRO_GIRO;
-    if (b < 0.0f) b = 0.0f;
-    if (b > (float)nastroLunghezza) b = (float)nastroLunghezza;
+    float b = nastroBersaglio + pixel * (float)NASTRO_MAX / nastroAnelloPx;
+    while (b >= (float)NASTRO_MAX) b -= (float)NASTRO_MAX;
+    while (b < 0.0f) b += (float)NASTRO_MAX;
     nastroBersaglio = b;
 }
 
@@ -500,10 +525,11 @@ static void nastroScratchFine()
     nastroChiedi(nastroRiprendi ? NASTRO_SUONA : NASTRO_FERMO);
 }
 
-// A che punto del nastro siamo, in giri di bobina: serve al disegno.
-static float nastroGiri()
+// Quanto nastro e' passato, in pixel di schermo: da qui il disegno
+// ricava di quanto ha girato ogni cosa che il nastro tocca.
+static float nastroSpostamentoPx()
 {
-    return nastroPosizione / (float)NASTRO_GIRO;
+    return nastroPosizione * nastroAnelloPx / (float)NASTRO_MAX;
 }
 
 static void nastroBegin()

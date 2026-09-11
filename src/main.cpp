@@ -2450,7 +2450,6 @@ static void disegnaNastro(Arduino_GFX *g)
 
     bool lampo = ((millis() / 420) % 2) == 0;
     uint8_t stato = nastroStato;
-    float th = nastroGiri() * 2.0f * (float)M_PI;
 
     // ---- il nastro: un anello chiuso che avvolge le due bobine, scende
     //      al motore e risale. Corre appena fuori dal bordo delle bobine,
@@ -2480,6 +2479,21 @@ static void disegnaNastro(Arduino_GFX *g)
     const float l5 = rb * (aC - alto);
     const float l6 = (float)(NASTRO_DX_CX - NASTRO_SX_CX);
     const float totale = l1 + l2 + l3 + l4 + l5 + l6;
+    nastroAnelloPx = totale;
+
+    // Tutto quello che gira, gira perche' il nastro lo tira: l'angolo
+    // e' il nastro passato diviso il raggio, e il verso e' quello in
+    // cui il nastro corre su quel cerchio. Sulle bobine e sul motore
+    // il nastro scende dal lato sinistro e risale da quello destro,
+    // quindi girano in senso antiorario. La ruota non e' sul nastro:
+    // e' un ingranaggio che morde la bobina, e un ingranaggio gira al
+    // contrario del suo vicino - piu' in fretta, perche' e' piu'
+    // piccola. Cosi', quando la ruota va sotto il dito, bobine e
+    // motore seguono con il rapporto giusto, e all'indietro.
+    const float d = nastroSpostamentoPx();
+    const float thBobina = -d / rb;
+    const float thMotore = -d / rm;
+    const float thRuota = d / (float)NASTRO_ANELLO_R;
 
     // L'anello e' lungo quanto tutto lo spazio: sessanta secondi di
     // nastro. La testina sta a meta' del tratto verticale di destra.
@@ -2562,7 +2576,7 @@ static void disegnaNastro(Arduino_GFX *g)
     const float L = 34.0f;
     for (int k = 0; k < 4; ++k)
     {
-        float a = th + k * (float)M_PI / 4.0f;
+        float a = thBobina + k * (float)M_PI / 4.0f;
         float co = cosf(a), si = sinf(a);
         int16_t x0 = NASTRO_SX_CX - (int16_t)lroundf(co * L), y0 = NASTRO_CY - (int16_t)lroundf(si * L);
         int16_t x1 = NASTRO_SX_CX + (int16_t)lroundf(co * L), y1 = NASTRO_CY + (int16_t)lroundf(si * L);
@@ -2581,7 +2595,7 @@ static void disegnaNastro(Arduino_GFX *g)
     g->fillCircle(NASTRO_MOTORE_X, NASTRO_MOTORE_Y, 9, COL_SFONDO);
     for (int k = 0; k < 8; ++k)
     {
-        float a = -th + k * (float)M_PI / 4.0f;
+        float a = thMotore + k * (float)M_PI / 4.0f;
         g->fillCircle(NASTRO_MOTORE_X + (int16_t)lroundf(cosf(a) * 11.0f),
                       NASTRO_MOTORE_Y + (int16_t)lroundf(sinf(a) * 11.0f), 3, COL_SFONDO);
     }
@@ -2604,7 +2618,7 @@ static void disegnaNastro(Arduino_GFX *g)
     }
     for (int k = 0; k < 12; ++k)
     {
-        float a = th + (k * 30.0f - 90.0f) * (float)M_PI / 180.0f;
+        float a = thRuota + (k * 30.0f - 90.0f) * (float)M_PI / 180.0f;
         int16_t px = NASTRO_ANELLO_CX + (int16_t)lroundf(cosf(a) * NASTRO_ANELLO_R);
         int16_t py = NASTRO_ANELLO_CY + (int16_t)lroundf(sinf(a) * NASTRO_ANELLO_R);
         if (k < accesi) g->fillCircle(px, py, 4, COL_ACCESO);
@@ -5632,7 +5646,9 @@ static void gestisciTocco()
             if (passo > (float)M_PI) passo -= 2.0f * (float)M_PI;
             else if (passo < -(float)M_PI) passo += 2.0f * (float)M_PI;
             nastroAngoloPrec = a;
-            nastroScratchMuovi(passo / (2.0f * (float)M_PI));
+            // La ruota ha girato di "passo": il nastro si sposta di
+            // altrettanto per il raggio della ruota.
+            nastroScratchMuoviPixel(passo * (float)NASTRO_ANELLO_R);
 
             // Con il dito giu' il ciclo principale non ridisegna: lo si
             // fa qui, a venti fotogrammi al secondo.
@@ -5929,10 +5945,12 @@ static void gestisciSeriale()
             }
             break;
         case 'l':
-            Serial.printf("[nastro] stato %u, %lu campioni, pos %.0f, livello %.5f/%.5f, grezzi c0 %d..%d c1 %d..%d\n",
+            Serial.printf("[nastro] stato %u, %lu campioni, pos %.0f, livello %.5f/%.5f, grezzi c0 %d..%d c1 %d..%d, giro max %lu ms\n",
                           (unsigned)nastroStato, (unsigned long)nastroLunghezza,
                           nastroPosizione, nastroLivello, nastroLivelloAltro,
-                          nastroMin0, nastroMax0, nastroMin1, nastroMax1);
+                          nastroMin0, nastroMax0, nastroMin1, nastroMax1,
+                          (unsigned long)nastroGiroMassimo);
+            nastroGiroMassimo = 0;
             break;
         // La linea dati dal codec si muove? Si legge il piedino a raffica
         // per venti millesimi e si contano i cambi: una linea ferma e'

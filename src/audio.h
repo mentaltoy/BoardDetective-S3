@@ -179,7 +179,11 @@ static bool audioBegin()
     cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
     cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
     cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-    cfg.dma_buf_count = 6;
+    // Dodici blocchi da sedici millesimi: quasi due decimi di secondo
+    // di scorta in tutti e due i versi. Con sei, un compito che
+    // restava indietro di un attimo lasciava l'uscita a secco e il
+    // ricevitore a perdere campioni.
+    cfg.dma_buf_count = 12;
     cfg.dma_buf_len = AUDIO_BLOCCO;
     cfg.use_apll = false;
     cfg.tx_desc_auto_clear = true;
