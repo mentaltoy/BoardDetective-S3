@@ -27,13 +27,17 @@
 
 #include <Arduino.h>
 #include <HTTPClient.h>
+#include <WiFiUdp.h>
 
 struct Clima
 {
-    Clima(const char *indirizzo, const char *etichetta)
-        : ip(indirizzo), nome(etichetta) {}
+    Clima(const char *etichetta) : nome(etichetta) { ip[0] = '\0'; }
 
-    const char *ip;
+    // L'indirizzo lo si scopre in rete, per nome: non si scrive. Il
+    // router li ridistribuisce quando gli pare, e un giorno il
+    // condizionatore del salone era diventato il bridge delle
+    // lampadine.
+    char ip[16];
     const char *nome;
 
     bool valido = false;
@@ -56,11 +60,13 @@ struct Clima
     volatile bool daInviare = false;
 };
 
-// Le macchine di casa. Aggiungerne una e' una riga.
+// Le macchine di casa, con il nome che hanno nell'app Daikin: si
+// confrontano le iniziali, senza badare alle maiuscole, quindi
+// "CAMERA" trova "Camera da letto". Aggiungerne una e' una riga.
 #define N_CLIMI 2
 static Clima climi[N_CLIMI] = {
-    {"192.168.1.2", "SALONE"},
-    {"192.168.1.6", "CAMERA"},
+    {"SALONE"},
+    {"CAMERA"},
 };
 
 // Estrae un campo dalla riga di risposta.
@@ -78,8 +84,82 @@ static String climaCampo(const String &riga, const char *nome)
     return riga.substring(inizio, fine);
 }
 
+// I nomi arrivano con le lettere strane in %XX: "Salone" e' scritto
+// %53%61%6c%6f%6e%65. Si riportano a lettere.
+static String climaDecodifica(const String &s)
+{
+    String out;
+    for (unsigned i = 0; i < s.length(); ++i)
+    {
+        if (s[i] == '%' && i + 2 < s.length())
+        {
+            out += (char)strtol(s.substring(i + 1, i + 3).c_str(), nullptr, 16);
+            i += 2;
+        }
+        else out += s[i];
+    }
+    return out;
+}
+
+static bool climaNomeCorrisponde(const char *nostro, const String &loro)
+{
+    size_t n = strlen(nostro);
+    if (loro.length() < n) return false;
+    for (size_t i = 0; i < n; ++i)
+        if (toupper((unsigned char)nostro[i]) != toupper((unsigned char)loro[i])) return false;
+    return true;
+}
+
+// Chi c'e'? Si grida in broadcast sulla porta degli adattatori Daikin
+// e ognuno risponde con la sua scheda, nome compreso, dal suo
+// indirizzo. Un secondo e mezzo di ascolto basta a tutti. Torna
+// quanti dei nostri ha trovato.
+static int climaScopri()
+{
+    IPAddress mio = WiFi.localIP(), maschera = WiFi.subnetMask(), broadcast;
+    for (int i = 0; i < 4; ++i) broadcast[i] = mio[i] | ~maschera[i];
+
+    WiFiUDP udp;
+    if (!udp.begin(30000)) return 0;
+
+    const char *domanda = "DAIKIN_UDP/common/basic_info";
+    udp.beginPacket(broadcast, 30050);
+    udp.write((const uint8_t *)domanda, strlen(domanda));
+    udp.endPacket();
+
+    int trovati = 0;
+    uint32_t fine = millis() + 1500;
+    while ((int32_t)(millis() - fine) < 0)
+    {
+        int n = udp.parsePacket();
+        if (n <= 0) { delay(20); continue; }
+
+        char buf[512];
+        int letti = udp.read(buf, sizeof(buf) - 1);
+        buf[letti > 0 ? letti : 0] = '\0';
+        String risposta(buf);
+        if (!risposta.startsWith("ret=OK")) continue;
+
+        String nome = climaDecodifica(climaCampo(risposta, "name"));
+        String da = udp.remoteIP().toString();
+        for (int i = 0; i < N_CLIMI; ++i)
+            if (climaNomeCorrisponde(climi[i].nome, nome))
+            {
+                strncpy(climi[i].ip, da.c_str(), sizeof(climi[i].ip) - 1);
+                climi[i].ip[sizeof(climi[i].ip) - 1] = '\0';
+                ++trovati;
+                Serial.printf("[clima] %s trovato a %s (\"%s\")\n", climi[i].nome, climi[i].ip, nome.c_str());
+            }
+    }
+    udp.stop();
+    if (trovati < N_CLIMI) Serial.printf("[clima] trovati %d condizionatori su %d\n", trovati, N_CLIMI);
+    return trovati;
+}
+
 static bool climaChiama(const Clima &c, const char *percorso, String &risposta)
 {
+    if (!c.ip[0]) return false;   // non ancora trovato in rete
+
     HTTPClient http;
     http.setTimeout(3000);
     http.setConnectTimeout(2000);

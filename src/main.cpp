@@ -6191,6 +6191,19 @@ static void taskRete(void *)
         {
             prossimaLettura = millis() + 20000UL;
 
+            // Se uno manca all'appello lo si cerca di nuovo in rete,
+            // non piu' di una volta ogni due minuti: puo' essere
+            // spento, o il router puo' avergli cambiato indirizzo.
+            static uint32_t prossimaScoperta = 0;
+            bool manca = false;
+            for (int i = 0; i < N_CLIMI; ++i)
+                if (!climi[i].valido) manca = true;
+            if (manca && (int32_t)(millis() - prossimaScoperta) >= 0)
+            {
+                prossimaScoperta = millis() + 120000UL;
+                climaScopri();
+            }
+
             for (int i = 0; i < N_CLIMI; ++i)
             {
                 if (climi[i].daInviare) continue;   // ha la precedenza il comando
@@ -6360,6 +6373,7 @@ void setup()
     prossimoMeteo = millis() + (scaricaMeteo() ? 30UL * 60UL * 1000UL : 2UL * 60UL * 1000UL);
     scaricaAria();
 
+    if (retePresente) climaScopri();
     for (int i = 0; i < N_CLIMI; ++i)
     {
         if (climaLeggi(climi[i]))
